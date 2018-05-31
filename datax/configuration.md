@@ -79,7 +79,7 @@ private Configuration(final String json) {
 ### **查询规则** ###
 path 不能有空字符串
 
-* 去root元素（即最顶层），path设置为空字符串
+* 取root元素（即最顶层），path设置为空字符串
 * 查询列表中的某一项，必须以中括号[ ]包含索引值，索引值从0开始。
 
 例如：
@@ -457,3 +457,8 @@ public static Configuration parseOnePluginConfig(final String path, final String
     }
 
 ```
+
+### 总结 ###
+Datax里面最基础的组件Configuration已经介绍完了。它的本质就是使用fastJson解析出来的对象，支持常用的get，set方法。比较特殊的就是涉及到list的操作。
+
+Configuration的加载过程，涉及到环境变量替代，加密解密，插件加载。
