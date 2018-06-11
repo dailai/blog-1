@@ -43,3 +43,150 @@ doWriterSplit方法， 调用Writer.JOb的split方法，返回Writer.Task的Conf
 
 
 needChannelNumber最后取上面计算的出来的，与task的个数的最小值
+
+
+### Channel 原理 ###
+Channel是Reader和Writer的通信组件。Reader向channle写入数据，Writer从channel读取数据。channel还提供了限速的功能，支持数据大小（字节数）， 数据条数。
+
+Channel提供push方法，给Reader调用，写入数据。
+```java
+    public void push(final Record r) {
+        Validate.notNull(r, "record不能为空.");
+        // 子类实现doPush方法
+        this.doPush(r);
+        // statPush会进行限速
+        this.statPush(1L, r.getByteSize());
+    }
+    
+    public void pushAll(final Collection<Record> rs) {
+        Validate.notNull(rs);
+        Validate.noNullElements(rs);
+        // 子类实现doPush方法
+        this.doPushAll(rs);
+        // statPush会进行限速
+        this.statPush(rs.size(), this.getByteSize(rs));
+    }
+
+```
+statPush里面会对速度进行控制。它通过Communication记录总的写入数据大小和数据条数。然后每隔一段时间，检查速度。如果速度过快，就会sleep一段时间，来把速度降下来。
+
+CommunicationTool 提供方法，从Communication计算读取的字节数，条数
+```java
+public final class CommunicationTool {
+    public static long getTotalReadRecords(final Communication communication) {
+        return communication.getLongCounter(READ_SUCCEED_RECORDS) +
+                communication.getLongCounter(READ_FAILED_RECORDS);
+    }
+
+    public static long getTotalReadBytes(final Communication communication) {
+        return communication.getLongCounter(READ_SUCCEED_BYTES) +
+                communication.getLongCounter(READ_FAILED_BYTES);
+    }
+}
+```
+
+```java
+    private void statPush(long recordSize, long byteSize) {
+        // currentCommunication实时记录了Reader读取的总数据字节数和条数
+        currentCommunication.increaseCounter(CommunicationTool.READ_SUCCEED_RECORDS,
+                recordSize);
+        currentCommunication.increaseCounter(CommunicationTool.READ_SUCCEED_BYTES,
+                byteSize);
+        ......
+
+        // 判断是否会限速
+        boolean isChannelByteSpeedLimit = (this.byteSpeed > 0);
+        boolean isChannelRecordSpeedLimit = (this.recordSpeed > 0);
+        if (!isChannelByteSpeedLimit && !isChannelRecordSpeedLimit) {
+            return;
+        }
+        // lastCommunication记录最后一次的时间
+        long lastTimestamp = lastCommunication.getTimestamp();
+        long nowTimestamp = System.currentTimeMillis();
+        long interval = nowTimestamp - lastTimestamp;
+        // 每隔flowControlInterval一段时间，就会检查是否超速
+        if (interval - this.flowControlInterval >= 0) {
+            long byteLimitSleepTime = 0;
+            long recordLimitSleepTime = 0;
+            if (isChannelByteSpeedLimit) {
+                // 计算速度，(现在的字节数 - 上一次的字节数) / 过去的时间
+                long currentByteSpeed = (CommunicationTool.getTotalReadBytes(currentCommunication) -
+                        CommunicationTool.getTotalReadBytes(lastCommunication)) * 1000 / interval;
+                if (currentByteSpeed > this.byteSpeed) {
+                    // 计算根据byteLimit得到的休眠时间，
+                    // 这段时间传输的字节数 / 期望的限定速度 - 这段时间
+                    byteLimitSleepTime = currentByteSpeed * interval / this.byteSpeed
+                            - interval;
+                }
+            }
+
+            if (isChannelRecordSpeedLimit) {
+                long currentRecordSpeed = (CommunicationTool.getTotalReadRecords(currentCommunication) -
+                        CommunicationTool.getTotalReadRecords(lastCommunication)) * 1000 / interval;
+                if (currentRecordSpeed > this.recordSpeed) {
+                    // 计算根据recordLimit得到的休眠时间
+                    recordLimitSleepTime = currentRecordSpeed * interval / this.recordSpeed
+                            - interval;
+                }
+            }
+
+            // 休眠时间取较大值
+            long sleepTime = byteLimitSleepTime < recordLimitSleepTime ?
+                    recordLimitSleepTime : byteLimitSleepTime;
+            if (sleepTime > 0) {
+                try {
+                    Thread.sleep(sleepTime);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            // 保存读取字节数
+            lastCommunication.setLongCounter(CommunicationTool.READ_SUCCEED_BYTES,
+                    currentCommunication.getLongCounter(CommunicationTool.READ_SUCCEED_BYTES));
+            // 保存读取失败的字节数
+            lastCommunication.setLongCounter(CommunicationTool.READ_FAILED_BYTES,
+                    currentCommunication.getLongCounter(CommunicationTool.READ_FAILED_BYTES));
+            // 保存读取条数
+            lastCommunication.setLongCounter(CommunicationTool.READ_SUCCEED_RECORDS,
+                    currentCommunication.getLongCounter(CommunicationTool.READ_SUCCEED_RECORDS));
+            // 保存读取失败的条数
+            lastCommunication.setLongCounter(CommunicationTool.READ_FAILED_RECORDS,
+                    currentCommunication.getLongCounter(CommunicationTool.READ_FAILED_RECORDS));
+            // 记录保存的时间点
+            lastCommunication.setTimestamp(nowTimestamp);
+        }
+    }
+```
+
+Channel提供pull方法，给Writer调用，读取数据。
+```java
+    public Record pull() {
+        // 子类实现doPull方法，返回数据
+        Record record = this.doPull();
+        // 调用statPull方法，更新统计数据
+        this.statPull(1L, record.getByteSize());
+        return record;
+    }
+
+    public void pullAll(final Collection<Record> rs) {
+        Validate.notNull(rs);
+        // 子类实现doPullAll方法，返回数据
+        this.doPullAll(rs);
+        // 调用statPull方法，更新统计数据
+        this.statPull(rs.size(), this.getByteSize(rs));
+    }
+```
+statPull方法，并没有限速。因为数据的整个流程是Reader -》 Channle -》 Writer， Reader的push速度限制了，Writer的pull速度也就没必要限速
+```java
+    private void statPull(long recordSize, long byteSize) {
+        currentCommunication.increaseCounter(
+                CommunicationTool.WRITE_RECEIVED_RECORDS, recordSize);
+        currentCommunication.increaseCounter(
+                CommunicationTool.WRITE_RECEIVED_BYTES, byteSize);
+    }
+```
+
+### MemoryChannel 原理 ###
+目前Channel的子类只有MemoryChannel。MemoryChannel实现了doPush和doPull方法。它本质是将数据放进ArrayBlockingQueue。
+
