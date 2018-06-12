@@ -1,50 +1,3 @@
-
-
-
-
-### channel number ###
-
-adjustChannelNumber方法， byte计算channel数目， record计算channel数目， 或者指定channel数目
-
-doReaderSplit方法， 调用Reader.Job的split方法，返回Reader.Task的Configuration列表
-
-doWriterSplit方法， 调用Writer.JOb的split方法，返回Writer.Task的Configuration列表
-
-获取transformer的Configuration列表
-
-合并reader，writer，transformer配置列表
-
-生成整个Task的Configuration列表，格式为：
-
-```json
-{
-    "taskId": "",
-    "reader": {
-        "name": "",
-        "parameter": {
-            ......
-        }
-    },
-    "writer": {
-        "name": "",
-        "parameter": {
-            ......
-        }
-    },
-    "transformer": [
-        ......
-    ]
-
-}
-```
-
-
-更新JobContainer的Configuration， job.content元素
-
-
-needChannelNumber最后取上面计算的出来的，与task的个数的最小值
-
-
 ### Channel 原理 ###
 Channel是Reader和Writer的通信组件。Reader向channle写入数据，Writer从channel读取数据。channel还提供了限速的功能，支持数据大小（字节数）， 数据条数。
 
@@ -189,4 +142,135 @@ statPull方法，并没有限速。因为数据的整个流程是Reader -》 Cha
 
 ### MemoryChannel 原理 ###
 目前Channel的子类只有MemoryChannel。MemoryChannel实现了doPush和doPull方法。它本质是将数据放进ArrayBlockingQueue。
+
+先看看MemoryChannel的一些属性
+```java
+public class MemoryChannel extends Channel {
+    
+    // 等待Reader处理完的时间，也就是pull的时间，继承自Channel
+    protected volatile long waitReaderTime = 0;
+    // 等待Writer处理完的时间，也就是push的时间，继承自Channel
+    protected volatile long waitWriterTime = 0;
+
+    // Channel里面保存的数据大小
+	private AtomicInteger memoryBytes = new AtomicInteger(0);
+    // 存放记录的queue
+	private ArrayBlockingQueue<Record> queue = null;
+}
+```
+
+首先看push和pull单条的情况
+```java
+	protected void doPush(Record r) {
+		try {
+			long startTime = System.nanoTime();
+            // ArrayBlockingQueue提供了阻塞的put方法，写入数据
+			this.queue.put(r);
+            // 记录写入push花费的时间
+			waitWriterTime += System.nanoTime() - startTime;
+            // 更新Channle里数据的字节数
+            memoryBytes.addAndGet(r.getMemorySize());
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	protected Record doPull() {
+		try {
+			long startTime = System.nanoTime();
+            // ArrayBlockingQueue提供了阻塞的take方法，读取入数据
+			Record r = this.queue.take();
+            // 记录写入pull花费的时间
+			waitReaderTime += System.nanoTime() - startTime;
+            // 更新Channle里数据的字节数
+			memoryBytes.addAndGet(-r.getMemorySize());
+			return r;
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IllegalStateException(e);
+		}
+	}
+
+```
+
+再看看push和pull多条的情况，这种方法比起单条的效率更高。 因为ArrayBlockingQueue没有提供批量操作的阻塞方法，所以需要自己使用条件锁。
+
+先看看相关的一些属性
+```java
+public class MemoryChannel extends Channel {
+    // 递归锁
+    private ReentrantLock lock;
+    // 条件信号
+	private Condition notInsufficient, notEmpty;
+    // 一次从Channel的pull的数据条数
+	private int bufferSize = 0;
+    // 数据的字节数容量
+    protected int byteCapacity;
+
+	public MemoryChannel(final Configuration configuration) {
+        .......
+		this.bufferSize = configuration.getInt(CoreConstant.DATAX_CORE_TRANSPORT_EXCHANGER_BUFFERSIZE);
+        // 初始化锁
+		lock = new ReentrantLock();
+		notInsufficient = lock.newCondition();
+		notEmpty = lock.newCondition();
+	}
+
+```
+
+```java
+	protected void doPullAll(Collection<Record> rs) {
+		assert rs != null;
+		rs.clear();
+		try {
+			long startTime = System.nanoTime();
+            // 获取锁
+			lock.lockInterruptibly();
+            // 从queue里面取出数据，最多bufferSize条
+			while (this.queue.drainTo(rs, bufferSize) <= 0) {
+                // 如果queue里面没有数据，就等待notEmpty信号
+				notEmpty.await(200L, TimeUnit.MILLISECONDS);
+			}
+            // 更新pull的时间
+			waitReaderTime += System.nanoTime() - startTime;
+			int bytes = getRecordBytes(rs);
+            // 更新数据的字节数
+			memoryBytes.addAndGet(-bytes);
+            // 通知可以push数据的信号
+			notInsufficient.signalAll();
+		} catch (InterruptedException e) {
+			throw DataXException.asDataXException(
+					FrameworkErrorCode.RUNTIME_ERROR, e);
+		} finally {
+			lock.unlock();
+		}
+	}
+
+    protected void doPushAll(Collection<Record> rs) {
+		try {
+			long startTime = System.nanoTime();
+            // 获取锁
+			lock.lockInterruptibly();
+			int bytes = getRecordBytes(rs);
+            
+			while (memoryBytes.get() + bytes > this.byteCapacity || rs.size() > this.queue.remainingCapacity()) {
+                // 如果新增数据，会造成数据字节数超过指定容量， 或者超过了queue的容量，就会一直等待notInsufficient信号
+				notInsufficient.await(200L, TimeUnit.MILLISECONDS);
+            }
+            // 向queue里添加数据
+			this.queue.addAll(rs);
+            // 更新push的时间
+			waitWriterTime += System.nanoTime() - startTime;
+            // 更新数据的字节数
+			memoryBytes.addAndGet(bytes);
+            // 通知可以pull数据的信号
+			notEmpty.signalAll();
+		} catch (InterruptedException e) {
+			throw DataXException.asDataXException(
+					FrameworkErrorCode.RUNTIME_ERROR, e);
+		} finally {
+			lock.unlock();
+		}
+	}
+```
 
