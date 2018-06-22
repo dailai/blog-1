@@ -1,4 +1,4 @@
-## job 划分任务 ##
+## job 切分任务 ##
 
 ### JobContainer ###
 
@@ -28,10 +28,9 @@ JobContainer 负责任务划分，生成任务信息配置的列表
         // 合并任务的reader，writer，transformer配置
         List<Configuration> contentConfig = mergeReaderAndWriterTaskConfigs(
                 readerTaskConfigs, writerTaskConfigs, transformerList);
-
-
         LOG.debug("contentConfig configuration: "+ JSON.toJSONString(contentConfig));
-
+        
+        // 将配置结果保存在job.content路径下
         this.configuration.set(CoreConstant.DATAX_JOB_CONTENT, contentConfig);
 
         return contentConfig.size();
