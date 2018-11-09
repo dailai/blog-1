@@ -1,8 +1,13 @@
-spark rpc 原理
+# spark rpc 原理 #
 
-spark rpc是基于netty框架的。spark rpc的客户端是TransportClient表示。通过TransportClient的建立，可以看到它是如何封装netty。TransportClient的初始化，是由TransportClientFactory负责。
+
+
+## netty初始化 ##
+
+spark rpc是基于netty框架的, spark rpc的客户端是TransportClient表示。通过TransportClient的建立，可以看到它是netty的初始化过程。
 
 ```java
+public class TransportClientFactory  
   private TransportClient createClient(InetSocketAddress address)
       throws IOException, InterruptedException {
 	// 初始化BootStrap
@@ -28,9 +33,10 @@ spark rpc是基于netty框架的。spark rpc的客户端是TransportClient表示
 
 	.......
   }
+}
 ```
 
-接着进入TransportContex的方法
+接着进入TransportContex的initializePipeline方法
 
 ```java
 public class TransportContext {  
@@ -60,9 +66,27 @@ public class TransportContext {
 
 
 
-可以看到TransportClient添加了多个ChannelHandler，接下来按照顺序，了解这些Handler的作用
+netty的ChannelHandler调用链如图：
 
-TransportFrameDecoder
+```mermaid
+graph LR
+
+	Request --> TransportFrameDecoder
+	TransportFrameDecoder --> MessageDecoder
+	MessageDecoder --> IdleStateHandler
+	IdleStateHandler --> TransportChannelHandler
+	TransportChannelHandler --> MessageEncoder
+	MessageEncoder --> Response
+	
+```
+
+
+
+## Channel Handler介绍 ##
+
+接下来按照顺序，了解这些ChannelHandler的作用
+
+### TransportFrameDecoder ###
 
 数据的格式为
 
@@ -201,7 +225,7 @@ decodeFrameSize方法
 
 
 
-MessageDecoder
+### MessageDecoder ###
 
 MessageDecoder接收从TransportFrameDecoder解析完的Frame数据。然后将Frame解析成Message，最后给TransportChannelHandler处理。
 
@@ -239,4 +263,143 @@ public final class MessageDecoder extends MessageToMessageDecoder<ByteBuf> {
 ```
 
 
+
+### TransportChannelHandler ###
+
+它将消息分为两类，RequestMessage和ResponseMessage，分别分发给TransportRequestHandler和TransportResponseHandler处理。
+
+```java
+  private final Map<Long, RpcResponseCallback> outstandingRpcs;
+  public void handle(ResponseMessage message) throws Exception {
+    .......
+    if (message instanceof RpcResponse) {
+      RpcResponse resp = (RpcResponse) message;
+      RpcResponseCallback listener = outstandingRpcs.get(resp.requestId);
+      if (listener == null) {
+        logger.warn("Ignoring response for RPC {} from {} ({} bytes) since it is not outstanding",
+          resp.requestId, getRemoteAddress(channel), resp.body().size());
+      } else {
+        outstandingRpcs.remove(resp.requestId);
+        try {
+          listener.onSuccess(resp.body().nioByteBuffer());
+        } finally {
+          resp.body().release();
+        }
+      }
+    }
+```
+
+outstandingRpcs是由requestId和回调函数组成的Map。当接收响应时，会根据请求id找到相应的回调函数，然后调用它。
+
+
+
+### MessageEncoder ###
+
+它负责将消息编码成frame格式发送
+
+```shell
+----------------------------------------------------------
+frame size | message type | message header | message body
+----------------------------------------------------------
+8 byte     |  1 byte      |  变长           | 变长
+----------------------------------------------------------
+```
+
+message header和body部分，根据不同类型的，格式也不一样。注意body部分，有些Message没有。
+
+以RpcRequest消息为例, 它包含了body部分。它的header部分，分为requestId和body length。
+
+```shell
+----------------------------------------------------------------------------
+frame size | message type   |        message header      | message body
+----------------------------------------------------------------------------
+frame size |  message type  |  requestId  | body length  | message body
+----------------------------------------------------------------------------
+8 byte     |  1 byte        |  4 byte     |  变长         | 长度为body length
+----------------------------------------------------------------------------
+```
+
+以RpcFailure为例，它不包含body部分。他的header部分，分为requestId和错误信息
+
+```shell
+--------------------------------------------------------------------
+frame size | message type   |        message header      
+--------------------------------------------------------------------
+frame size |  message type  |  requestId  | error string
+--------------------------------------------------------------------
+8 byte     |  1 byte        |  4 byte     |  变长         
+--------------------------------------------------------------------
+```
+
+因为MessageEncoder原理比较简单，所以不做详细介绍。
+
+## 消息发送的过程 ##
+
+```mermaid
+sequenceDiagram
+	participant Outbox
+	participant RpcOutboxMessage
+	participant	TransportClient
+	participant	TransportResponseHandler
+    Outbox->>+RpcOutboxMessage: sendWith(client)
+    RpcOutboxMessage->>+TransportClient:sendRpc(message, this)
+    TransportClient->>+TransportResponseHandler: addRpcRequest(requestId, callback)
+    TransportResponseHandler-->>-TransportClient: 
+    TransportClient-->>-RpcOutboxMessage: requestId
+    RpcOutboxMessage-->>-Outbox: 
+    
+    
+	
+```
+
+RpcOutboxMessage调用TransportClient的sendRpc方法，并将自己注册为回调函数。
+
+```scala
+class RpcOutboxMessage(  
+  override def sendWith(client: TransportClient): Unit = {
+    this.client = client
+    this.requestId = client.sendRpc(content, this)
+  }
+}
+```
+
+TransportClient的sendRpc方法，随机生成requestId，然后在TransportResponseHandler注册回调函数，并且使用Channel发送请求。
+
+```java
+public long sendRpc(ByteBuffer message, RpcResponseCallback callback) {
+    long startTime = System.currentTimeMillis();
+    if (logger.isTraceEnabled()) {
+      logger.trace("Sending RPC to {}", getRemoteAddress(channel));
+    }
+	// 使用uuid生成requestId
+    long requestId = Math.abs(UUID.randomUUID().getLeastSignificantBits());
+    // 注册这个请求的回调函数
+    handler.addRpcRequest(requestId, callback);
+	// 调用Channel发送数据
+    channel.writeAndFlush(new RpcRequest(requestId, new NioManagedBuffer(message)))
+    	// 添加回调函数，当请求成功时，打印请求的耗时时间。
+        // 当失败时，关闭Channel，注销回调函数，调用回调函数的onFailure
+        .addListener(future -> {
+          if (future.isSuccess()) {
+            long timeTaken = System.currentTimeMillis() - startTime;
+            if (logger.isTraceEnabled()) {
+              logger.trace("Sending request {} to {} took {} ms", requestId,
+                getRemoteAddress(channel), timeTaken);
+            }
+          } else {
+            ......
+                
+            handler.removeRpcRequest(requestId);
+            channel.close();
+            try {
+              callback.onFailure(new IOException(errorMsg, future.cause()));
+            } catch (Exception e) {
+              logger.error("Uncaught exception in RPC response callback handler!", e);
+            }
+          }
+        });
+
+    return requestId;
+  }
+```
 
