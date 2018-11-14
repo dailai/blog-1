@@ -116,14 +116,18 @@ NettyRpcEnv包含Outbox列表，当发送消息时，如果发现没有对应的
 class NettyRpcEnv() {
   private def postToOutbox(receiver: NettyRpcEndpointRef, message: OutboxMessage): Unit = {
     if (receiver.client != null) {
+      // receiver.client非空，表示这是server在响应client
       message.sendWith(receiver.client)
     } else {
       require(receiver.address != null,
         "Cannot send message to client endpoint with no listen address.")
       val targetOutbox = {
+        // 根据发送地址，从outboxes取出对应的Outbox
         val outbox = outboxes.get(receiver.address)
         if (outbox == null) {
+          // 如果没有则实例化
           val newOutbox = new Outbox(this, receiver.address)
+          // 因为有多个线程同时发送消息，所以这里调用putIfAbsent方法，防止竞争
           val oldOutbox = outboxes.putIfAbsent(receiver.address, newOutbox)
           if (oldOutbox == null) {
             newOutbox
@@ -139,6 +143,7 @@ class NettyRpcEnv() {
         outboxes.remove(receiver.address)
         targetOutbox.stop()
       } else {
+        // 调用Outbox发送消息
         targetOutbox.send(message)
       }
     }
@@ -149,7 +154,76 @@ class NettyRpcEnv() {
 
 
 
+## 消息类型 ##
 
+Outbox提供了send方法，给调用方发送消息。从send方法的申明可以看到，它只接受OutboxMessage类型的消息。OutboxMessage表示发送消息，它有两个子类，OneWayOutboxMessage和RpcOutboxMessage。OneWayOutboxMessage表示，请求不需要返回结果。RpcOutboxMessage表示，需要返回结果。
+
+
+
+### OneWayOutboxMessage ###
+
+```scala
+private[netty] case class OneWayOutboxMessage(content: ByteBuffer) extends OutboxMessage
+  with Logging {
+
+  override def sendWith(client: TransportClient): Unit = {
+    client.send(content)
+  }
+
+  override def onFailure(e: Throwable): Unit = {
+    e match {
+      case e1: RpcEnvStoppedException => logWarning(e1.getMessage)
+      case e1: Throwable => logWarning(s"Failed to send one-way RPC.", e1)
+    }
+  }
+
+}
+```
+
+发送OneWayOutboxMessage，就直接调用TransportClient的send方法发送出去。
+
+
+
+### RpcOutboxMessage ###
+
+```scala
+private[netty] case class RpcOutboxMessage(
+    content: ByteBuffer,
+    _onFailure: (Throwable) => Unit,
+    _onSuccess: (TransportClient, ByteBuffer) => Unit)
+  extends OutboxMessage with RpcResponseCallback with Logging {
+        private var client: TransportClient = _
+  private var requestId: Long = _
+
+  override def sendWith(client: TransportClient): Unit = {
+    this.client = client
+    this.requestId = client.sendRpc(content, this)
+  }
+      
+  def onTimeout(): Unit = {
+    if (client != null) {
+      client.removeRpcRequest(requestId)
+    } else {
+      logError("Ask timeout before connecting successfully")
+    }
+  }
+      
+  override def onFailure(e: Throwable): Unit = {
+    _onFailure(e)
+  }
+
+  override def onSuccess(response: ByteBuffer): Unit = {
+    _onSuccess(client, response)
+  }
+```
+
+发送RpcOutboxMessage，首先保存了TransportClient， 然后将自身作为回调对象，通过TransportClient的sendRpc发送出去。
+
+这里有三个回调函数，onTimeout代表着超时，这里超时功能的实现，是由NettyRpcEnv的timeoutScheduler实现的。
+
+onSuccess代表着成功返回，是在TransportResponseHandler中，会被调用。
+
+onFailure代表着失败，当连接失败时，Outbox会调用这个方法。
 
 
 
