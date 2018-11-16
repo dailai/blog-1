@@ -1,8 +1,45 @@
 # 客户端介绍 #
 
-## 实例化客户端 ###
+## 概览
+
+客户端发送消息如下图：
+
+```mermaid
+sequenceDiagram
+	participant client
+	participant NettyRpcEndpointRef
+    participant NettyEnv
+    participant	Outbox
+    
+    client ->>+ NettyRpcEndpointRef: ask(message, timeout)
+    NettyRpcEndpointRef ->>+ NettyEnv: ask(message, timeout)
+    NettyEnv ->>+ Outbox: send(message)
+    Outbox ->>+ RpcOutboxMessage : sendWith(client)
+    RpcOutboxMessage ->>+ TransportClient : sendRpc(message, callback)
+    TransportClient ->>+ TransportResponseHandler : addRpcRequest(requestId, callback)
+    TransportResponseHandler -->>- TransportClient : 
+    TransportClient ->>+ Channel : writeAndFlush(object)
+    Channel -->>- TransportClient : 
+    TransportClient -->>- RpcOutboxMessage : 
+    RpcOutboxMessage -->>- Outbox : 
+    Outbox -->>- NettyEnv : 
+    NettyEnv -->>- NettyRpcEndpointRef : 
+    NettyRpcEndpointRef -->>- client : 
+
+    
+```
+
+
+
+
+
+## 客户端初始化 ###
+
+### NettyRpcEndpointRef初始化 ###
 
 spark rpc的客户端使用EndpointRef类表示，它的唯一实现类是NettyRpcEndpointRef。EndpointRef的实例化，是有RpcEnv负责，RpcEnv的唯一实现类是NettyRpcEnv。
+
+
 
 ```scala
 private[netty] class NettyRpcEnv(
@@ -10,18 +47,45 @@ private[netty] class NettyRpcEnv(
   def asyncSetupEndpointRefByURI(uri: String): Future[RpcEndpointRef] = {
     val addr = RpcEndpointAddress(uri)
     val endpointRef = new NettyRpcEndpointRef(conf, addr, this)
-    val verifier = new NettyRpcEndpointRef(
-      conf, RpcEndpointAddress(addr.rpcAddress, RpcEndpointVerifier.NAME), this)
-    verifier.ask[Boolean](RpcEndpointVerifier.CheckExistence(endpointRef.name)).flatMap { find =>
-      if (find) {
-        Future.successful(endpointRef)
-      } else {
-        Future.failed(new RpcEndpointNotFoundException(uri))
-      }
-    }(ThreadUtils.sameThread)
+    ......
   }
 
 ```
+
+### TransportClient初始化 ###
+
+TransportClient负责接收Outbox发送的消息，还有负责返回响应。它会对每一个消息，生成一个requestId。当服务器返回这个请求的响应时，它会调用请求的回调函数。TransportClient还支持权限控制，对应于AuthClientBootstrap类。TransportClient的实例化由TransportClientFactory负责创建，而TransportClientFactory的实例化由TransportContext负责。
+
+```scala
+private[netty] class NettyRpcEnv(
+  private def createClientBootstraps(): java.util.List[TransportClientBootstrap] = {
+    if (securityManager.isAuthenticationEnabled()) {
+      java.util.Arrays.asList(new AuthClientBootstrap(transportConf,
+        securityManager.getSaslUser(), securityManager))
+    } else {
+      java.util.Collections.emptyList[TransportClientBootstrap]
+    }
+  }
+
+  private val clientFactory =   transportContext.createClientFactory(createClientBootstraps())
+}
+    
+```
+
+这里注意到AuthClientBootstrap是作为权限身份验证用的，是TransportClientBootstrap的子类。
+
+然后再来看看TransportClientFactory怎么实例化TransportClient
+
+TransportClientFactory提供了对TransportClient的缓存。对于不同的服务，它都有一个对应的ClientPool。
+
+```scala
+  private static class ClientPool {
+    TransportClient[] clients;
+    Object[] locks;
+  }
+```
+
+
 
 
 
@@ -99,11 +163,45 @@ private[netty] def ask[T: ClassTag](message: RequestMessage, timeout: RpcTimeout
 
 
 
-## 消息序列化 ##
+## 接收响应 ##
+
+TransportChannelHandler是netty的处理消息入口，它包含TransportResponseHandler。当客户端收到服务器的响应时，会转发给TransportResponseHandler处理。
+
+TransportResponseHandler对于rpc类型的消息，都会存储在outstandingRpcs字段里，它是一个HashMap，key为请求的Id，value为回调函数 RpcResponseCallback。当收到消息后，就会调用它。
+
+```scala
+public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
+  @Override
+  public void handle(ResponseMessage message) throws Exception {
+  	  
+    ................
+      
+    if (message instanceof RpcResponse) {
+      RpcResponse resp = (RpcResponse) message;
+      // 根据requestId，找到对应的回调函数
+      RpcResponseCallback listener = outstandingRpcs.get(resp.requestId);
+      if (listener == null) {
+        logger.warn("Ignoring response for RPC {} from {} ({} bytes) since it is not outstanding",
+          resp.requestId, getRemoteAddress(channel), resp.body().size());
+      } else {
+        outstandingRpcs.remove(resp.requestId);
+        try {
+          // 调用 callback
+          listener.onSuccess(resp.body().nioByteBuffer());
+        } finally {
+          resp.body().release();
+        }
+      }
+    }
+```
+
+
+
+## 消息序列化
 
 远程调用意味着通信，通信需要制定好数据格式。spark序列化消息，也有统一的标准，RequestMessage就是负责这个。它的序列化是基于java本身的。
 
-### 消息格式 ###
+### 消息格式
 
 ```shell
 -----------------------------------------------------------------
@@ -138,7 +236,7 @@ Boolean   | string  |  int
 
 
 
-### RequestMessage ###
+### RequestMessage
 
 RequestMessage类比较简单，它的serialize方法负责序列化消息。也是使用DataOutputStream的方法，将java的对象转换为字节。
 
@@ -181,8 +279,3 @@ private[netty] class RequestMessage(
 
 
 
-
-
-## TransportContext初始化 ##
-
-TransportClient的实例化由TransportClientFactory负责创建，而TransportClientFactory的实例化由TransportContext负责。
