@@ -144,19 +144,6 @@ private[netty] def ask[T: ClassTag](message: RequestMessage, timeout: RpcTimeout
     val promise = Promise[Any]()
     val remoteAddr = message.receiver.address
 
-    def onFailure(e: Throwable): Unit = {
-      if (!promise.tryFailure(e)) {
-        logWarning(s"Ignored failure: $e")
-      }
-    }
-
-    def onSuccess(reply: Any): Unit = reply match {
-      case RpcFailure(e) => onFailure(e)
-      case rpcReply =>
-        if (!promise.trySuccess(rpcReply)) {
-          logWarning(s"Ignored message: $reply")
-        }
-    }
 
     try {
       if (remoteAddr == address) {
@@ -181,24 +168,11 @@ private[netty] def ask[T: ClassTag](message: RequestMessage, timeout: RpcTimeout
         }(ThreadUtils.sameThread)
       }
 
-      val timeoutCancelable = timeoutScheduler.schedule(new Runnable {
-        override def run(): Unit = {
-          onFailure(new TimeoutException(s"Cannot receive any reply from ${remoteAddr} " +
-            s"in ${timeout.duration}"))
-        }
-      }, timeout.duration.toNanos, TimeUnit.NANOSECONDS)
-      promise.future.onComplete { v =>
-        timeoutCancelable.cancel(true)
-      }(ThreadUtils.sameThread)
-    } catch {
-      case NonFatal(e) =>
-        onFailure(e)
-    }
     promise.future.mapTo[T].recover(timeout.addMessageIfTimeout)(ThreadUtils.sameThread)
   }
 ```
 
-
+这里注意到remoteAddr和address的判断条件，只有client和server在同一个进程，才会由dispather直接转发请求给Endpoint。否则，会将消息转发给Outbox，由Outbox通过网络传送给server。
 
 ## 接收响应 ##
 
