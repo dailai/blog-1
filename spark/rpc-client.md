@@ -31,15 +31,11 @@ sequenceDiagram
 
 
 
-
-
 ## 客户端初始化 ###
 
 ### NettyRpcEndpointRef初始化 ###
 
 spark rpc的客户端使用EndpointRef类表示，它的唯一实现类是NettyRpcEndpointRef。EndpointRef的实例化，是有RpcEnv负责，RpcEnv的唯一实现类是NettyRpcEnv。
-
-
 
 ```scala
 private[netty] class NettyRpcEnv(
@@ -51,6 +47,8 @@ private[netty] class NettyRpcEnv(
   }
 
 ```
+
+
 
 ### TransportClient初始化 ###
 
@@ -76,7 +74,7 @@ private[netty] class NettyRpcEnv(
 
 然后再来看看TransportClientFactory怎么实例化TransportClient
 
-TransportClientFactory提供了对TransportClient的缓存。对于不同的服务，它都有一个对应的ClientPool。
+TransportClientFactory实现了缓存池。对于不同的服务，它都有一个对应的ClientPool。
 
 ```scala
   private static class ClientPool {
@@ -85,7 +83,48 @@ TransportClientFactory提供了对TransportClient的缓存。对于不同的服�
   }
 ```
 
+连接池最开始都是空值。当创建TransportClient， 会从对应的连接池，随机的取出TransportClient，如果返回为空，会自动的创建连接，保存到连接池里。
 
+```java
+ TransportClient createClient(InetSocketAddress address)
+      throws IOException, InterruptedException {
+	// 使用Netty的Bootstrap初始化Client
+    Bootstrap bootstrap = new Bootstrap();
+    bootstrap.group(workerGroup)
+      .channel(socketChannelClass)
+      // Disable Nagle's Algorithm since we don't want packets to wait
+      .option(ChannelOption.TCP_NODELAY, true)
+      .option(ChannelOption.SO_KEEPALIVE, true)
+      .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, conf.connectionTimeoutMs())
+      .option(ChannelOption.ALLOCATOR, pooledAllocator);
+
+    final AtomicReference<TransportClient> clientRef = new AtomicReference<>();
+    final AtomicReference<Channel> channelRef = new AtomicReference<>();
+	// 初始化ChannelHandler，调用了TransportContext的initializePipeline
+    bootstrap.handler(new ChannelInitializer<SocketChannel>() {
+      @Override
+      public void initChannel(SocketChannel ch) {
+        TransportChannelHandler clientHandler = context.initializePipeline(ch);
+        clientRef.set(clientHandler.getClient());
+        channelRef.set(ch);
+      }
+    });
+
+    // 连接到服务器
+    long preConnect = System.nanoTime();
+    ChannelFuture cf = bootstrap.connect(address);
+     
+     // 执行连接后的动作，比如身份权限验证
+    for (TransportClientBootstrap clientBootstrap : clientBootstraps) {
+         clientBootstrap.doBootstrap(client, channel);
+    }
+
+
+    return client;
+  }
+```
+
+注意上面的workerGroup， 表示Netty的工作线程池。这个属性是TransportClientFactory的，所有TransportClient的消息处理都是共用这个线程池。
 
 
 
@@ -97,8 +136,6 @@ private[netty] class NettyRpcEndpointRef(
     nettyEnv.ask(new RequestMessage(nettyEnv.address, this, message), timeout)
   } 
 ```
-
-
 
 NettyEnv有两种模式，一个是server模式，一个是client模式。当使用client模式时，它的server属性为null，address属性也为null。
 
