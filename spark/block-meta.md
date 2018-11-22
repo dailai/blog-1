@@ -107,7 +107,7 @@ BlockManagerMaster负责和driver通信，
 
 BlockManager
 
-### 向block写入数据 ###
+### block写数据 ###
 
 ```scala
 private[spark] class BlockManager {
@@ -128,5 +128,48 @@ private[spark] class BlockManager {
     doPutBytes(blockId, bytes, level, implicitly[ClassTag[T]], tellMaster)
   }
 }
+```
+
+
+
+doPut方法主要是封装BlockInfoManager的锁，为写Block提供了方便。
+
+```scala
+ def doPut[T](
+      blockId: BlockId,
+      level: StorageLevel,
+      classTag: ClassTag[_],
+      tellMaster: Boolean,
+      keepReadLock: Boolean)(putBody: BlockInfo => Option[T]): Option[T] = {
+   // 构造BlockInfo， 获取写锁
+   val putBlockInfo = {
+      val newInfo = new BlockInfo(level, classTag, tellMaster)
+      if (blockInfoManager.lockNewBlockForWriting(blockId, newInfo)) {
+        newInfo
+      } else {
+        logWarning(s"Block $blockId already exists on this machine; not re-adding it")
+        if (!keepReadLock) {
+          // lockNewBlockForWriting returned a read lock on the existing block, so we must free it:
+          releaseLock(blockId)
+        }
+        return None
+      }
+    }
+    // 执行写入Block数据
+     val result: Option[T] = try {
+      val res = putBody(putBlockInfo)
+      exceptionWasThrown = false
+      if (res.isEmpty) {
+        // the block was successfully stored
+        if (keepReadLock) {
+          blockInfoManager.downgradeLock(blockId)
+        } else {
+          blockInfoManager.unlock(blockId)
+        }
+      } else {
+        removeBlockInternal(blockId, tellMaster = false)
+        logWarning(s"Putting block $blockId failed")
+      }
+ }
 ```
 
