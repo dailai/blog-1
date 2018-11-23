@@ -173,3 +173,5 @@ doPut方法主要是封装BlockInfoManager的锁，为写Block提供了方便。
  }
 ```
 
+#### 写入字节数据 ####
+

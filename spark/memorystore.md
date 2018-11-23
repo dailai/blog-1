@@ -77,7 +77,7 @@ def blockIsEvictable(blockId: BlockId, entry: MemoryEntry[_]): Boolean = {
 
 
 
-## 数据写入 ##
+## 写入数据 ##
 
 MemoryStore支持两种输入格式，一个是ChunkedByteBuffer，另一个是Iterator[T]。
 
@@ -220,7 +220,57 @@ while (values.hasNext && keepUnrolling) {
 
 
 
+###  返回结果 ###
+
+上面写入数据都会返回PartiallyUnrolledIterator对象，表示是否失败和具体的信息。
+
+PartiallyUnrolledIterator有下列字段：
+
+* memoryStore
+* memoryMode， 内存位置
+* unrollMemory， 已解析的数据大小
+* unrolled， 已解析的数据迭代器
+* rest， 剩余没有解析的数据迭代器
+
+它支持遍历unrolled和rest迭代器，并且有close方法支持释放数据。
 
 
 
+## 读取数据 ##
+
+根据返回结果的类型，MemoryStore提供了两个方法，getBytes返回字节，getValues返回数组。
+
+
+
+getBytes只支持从SerializedMemoryEntry提取数据
+
+```scala
+  def getBytes(blockId: BlockId): Option[ChunkedByteBuffer] = {
+    val entry = entries.synchronized { entries.get(blockId) }
+    entry match {
+      case null => None
+      case e: DeserializedMemoryEntry[_] =>
+        throw new IllegalArgumentException("should only call getBytes on serialized blocks")
+      case SerializedMemoryEntry(bytes, _, _) => Some(bytes)
+    }
+  }
+```
+
+
+
+getValues只支持从DeserializedMemoryEntry提取数据
+
+```scala
+  def getValues(blockId: BlockId): Option[Iterator[_]] = {
+    val entry = entries.synchronized { entries.get(blockId) }
+    entry match {
+      case null => None
+      case e: SerializedMemoryEntry[_] =>
+        throw new IllegalArgumentException("should only call getValues on deserialized blocks")
+      case DeserializedMemoryEntry(values, _, _) =>
+        val x = Some(values)
+        x.map(_.iterator)
+    }
+  }
+```
 
