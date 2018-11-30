@@ -287,11 +287,136 @@ spillMemoryIteratorToDisk负责将排序后的结果，写到磁盘。它生成T
 
 ## 读取spill文件 ##
 
-spill的文件读取由SpillReader负责，
+spill文件首先根据partition分片，每个partitioin分片又被切分成多个batch分片。每个batch分片，才是存储了record。
+
+```shell
+------------------------------------------------------------------------------------
+                     parition 0                                  |     ......
+------------------------------------------------------------------------------------
+                batch 0              |  batch 1     |   .....    |
+-------------------------------------------------------------------------------------
+record 0   |  record 2  | ....       |
+```
+
+
+
+spill的文件读取由SpillReader负责，SpillReader有几个属性比较重要：
+
+* partitionId， 当前读取record的所在partition
+* indexInPartition， 当前读取的record在partition的索引
+* batchId， 当前读取的record的所在batch
+
+* lastPartitionId，下一个record所在的partition
+* nextPartitionToRead， 要读取的下一个partition
+
+访问数据，也是按照partition的顺序遍历的。通过readNextPartition方法，返回partition的数据迭代器。
+
+```scala
+def readNextPartition(): Iterator[Product2[K, C]] = new Iterator[Product2[K, C]] {
+  // 记录当前Iterator的所在partition
+  val myPartition = nextPartitionToRead
+  nextPartitionToRead += 1
+
+  override def hasNext: Boolean = {
+    if (nextItem == null) {
+      // 调用SpillReader的readNextItem方法，返回record
+      nextItem = readNextItem()
+      if (nextItem == null) {
+        return false
+      }
+    }
+    assert(lastPartitionId >= myPartition)
+    // 如果下一个要读取的record所在的partition，不在等于当前Iterator的所在partition，
+    // 也就是当前partition的数据都已经读完
+    lastPartitionId == myPartition
+  }
+
+  override def next(): Product2[K, C] = {
+    if (!hasNext) {
+      throw new NoSuchElementException
+    }
+    val item = nextItem
+    nextItem = null
+    item
+  }
+}
+```
+
+
+
+## 合并排序结果 ##
+
+从上面的spill介绍，可以看到对于一个输入，可能会被切分，生成多个spill文件，和最后一部分存在内存的结果。目前只能切片是有序的，所以这里需要将结果合并。
+
+```sacla
+private def merge(spills: Seq[SpilledFile], inMemory: Iterator[((Int, K), C)])
+    : Iterator[(Int, Iterator[Product2[K, C]])] = {
+  // 为每个spill file 生成 SpillReader
+  val readers = spills.map(new SpillReader(_))
+  val inMemBuffered = inMemory.buffered
+  // 按照partition顺序，遍历各个切片
+  (0 until numPartitions).iterator.map { p =>
+    val inMemIterator = new IteratorForPartition(p, inMemBuffered)
+    // 合并切片为一个iterators
+    val iterators = readers.map(_.readNextPartition()) ++ Seq(inMemIterator)
+    if (aggregator.isDefined) {
+      // 指定了聚合，调用mergeWithAggregation排序
+      (p, mergeWithAggregation(
+        iterators, aggregator.get.mergeCombiners, keyComparator, ordering.isDefined))
+    } else if (ordering.isDefined) {
+      // 指定了order，调用mergeSort合并排序
+      (p, mergeSort(iterators, ordering.get))
+    } else {
+      // 因为这里已经保证了iterators是按照partition排序
+      (p, iterators.iterator.flatten)
+    }
+  }
+}
+```
+
+
+
+### 指定聚合 ###
 
 
 
 
 
-从上面的spill介绍，可以看到对于一个输入，可能会被切分，生成多个spill文件。目前只能每个spill文件是有序的。所以这里需要将spill文件进行合并。
+### 指定order ###
+
+这里使用了合并排序的算法。实现使用了PriorityQueue。PriorityQueue存储Iterator，比较大小是将Iterator的第一个数据。每次从最小的Iterator取出数据后，然后将iterator重新插入到PriorityQueue，这样PriorityQueue就会将Iterator重新排序。
+
+```
+private def mergeSort(iterators: Seq[Iterator[Product2[K, C]]], comparator: Comparator[K])
+    : Iterator[Product2[K, C]] =
+{
+  val bufferedIters = iterators.filter(_.hasNext).map(_.buffered)
+  type Iter = BufferedIterator[Product2[K, C]]
+  val heap = new mutable.PriorityQueue[Iter]()(new Ordering[Iter] {
+    // Use the reverse of comparator.compare because PriorityQueue dequeues the max
+    override 
+    def compare(x: Iter, y: Iter): Int = -comparator.compare(x.head._1, y.head._1)
+  })
+  // 添加所有的iterator
+  heap.enqueue(bufferedIters: _*)  // Will contain only the iterators with hasNext = true
+  new Iterator[Product2[K, C]] {
+    override def hasNext: Boolean = !heap.isEmpty
+
+    override def next(): Product2[K, C] = {
+      if (!hasNext) {
+        throw new NoSuchElementException
+      }
+      // 取出最小的iterator
+      val firstBuf = heap.dequeue()
+      // 从iterator中取第一个数据
+      val firstPair = firstBuf.next()
+      if (firstBuf.hasNext) {
+        // 重新插入到PriorityQueue， 让PriorityQueue重新排序
+        heap.enqueue(firstBuf)
+      }
+      firstPair
+    }
+  }
+}
+```
 
