@@ -108,7 +108,7 @@ def reduceByKey(partitioner: Partitioner, func: (V, V) => V): RDD[(K, V)] = self
   // mergeCombiners函数，也还是传入的func函数
   combineByKeyWithClassTag[V]((v: V) => v, func, func, partitioner)
 }
-
+ 
 def reduceByKey(func: (V, V) => V, numPartitions: Int): RDD[(K, V)] = self.withScope {
   reduceByKey(new HashPartitioner(numPartitions), func)
 }

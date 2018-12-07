@@ -15,7 +15,7 @@ abstract class Partitioner extends Serializable {
 
 ## HashPartitioner ##
 
-HashPartitioner的原理很简单，只是计算key的hashcode，然后以分区数目取余数。
+HashPartitioner的原理很简单，只是计算key的hashcode，然后以分区数目取余数。注意HashPartition而不能支持key为数组类型。
 
 ```scala
 def getPartition(key: Any): Int = key match {
