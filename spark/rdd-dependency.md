@@ -21,7 +21,7 @@ class OneToOneDependency[T](rdd: RDD[T]) extends NarrowDependency[T](rdd) {
 
 父RDD的分区索引与子RDD的分区索引，存在线性关系，比如union操作
 
-```
+```scala
 // inStart表示父RDD的起始索引，一般是0
 // outStart表示父RDD对应子RDD的起始索引
 // length表示父RDD的分区数目
@@ -35,6 +35,30 @@ class RangeDependency[T](rdd: RDD[T], inStart: Int, outStart: Int, length: Int)
       Nil
     }
   }
+  
+```
+
+### PruneDependency ###
+
+子RDD的分区数目小于父RDD的分区数目，但子RDD的分区与只对应于父RDD的一个分区。 
+
+```
+// rdd表示父RDD
+// partitionFilterFunc表示需要保留那些分区
+class PruneDependency[T](rdd: RDD[T], partitionFilterFunc: Int => Boolean)
+  extends NarrowDependency[T](rdd) {
+
+  // 从父RDD提取需要保留的分区
+  val partitions: Array[Partition] = rdd.partitions
+    .filter(s => partitionFilterFunc(s.index)).zipWithIndex
+    // split表示父RDD的分区索引
+    // idx表示子RDD的分区索引
+    .map { case(split, idx) => new PartitionPruningRDDPartition(idx, split) : Partition }
+
+  override def getParents(partitionId: Int): List[Int] = {
+    List(partitions(partitionId).asInstanceOf[PartitionPruningRDDPartition].parentSplit.index)
+  }
+}
 ```
 
 
@@ -48,8 +72,7 @@ class RangeDependency[T](rdd: RDD[T], inStart: Int, outStart: Int, length: Int)
 * keyClassName， key值类型
 * valueClassName， value值类型
 * aggregator， 聚合
-
-
+* 
 
 ## RDD的种类 ##
 
@@ -70,7 +93,7 @@ spark支持读取不同的数据源，如下：
 
 当rdd调用map或filter操作时，会返回MapPartitionsRDD。MapPartitionsRDD对应的依赖关系是OneToOneDependency。
 
-很明显MapPartitionsRDD的compute方法，调用父RDD的iterator方法获取数据，然后调用函数f计算值。
+很明显MapPartitionsRDD的compute方法，调用父RDD的iterator方法获取数据，然后调用函数 f 计算值。
 
 ```scala
 override def compute(split: Partition, context: TaskContext): Iterator[U] =
@@ -85,6 +108,21 @@ override def compute(split: Partition, context: TaskContext): Iterator[(K, C)] =
   SparkEnv.get.shuffleManager.getReader(dep.shuffleHandle, split.index, split.index + 1, context)
     .read()
     .asInstanceOf[Iterator[(K, C)]]
+}
+```
+
+当rdd调用groupby或reduce操作时，会返回ShuffledRDD。ShuffledRDD对应的关系是ShuffleDependency。它计算分区的数据时，是调用了ShuffleReader读取上一步rdd产生的数据。
+
+### PartitionPruningRDD ###
+
+PartitionPruningRDD只是简单的从对应的父分区读取数据
+
+```
+override def compute(split: Partition, context: TaskContext): Iterator[T] = {
+  // split的类型是PartitionPruningRDDPartition， 
+  // 它有parentSplit，表示父RDD的分区
+  firstParent[T].iterator(
+    split.asInstanceOf[PartitionPruningRDDPartition].parentSplit, context)
 }
 ```
 
