@@ -16,10 +16,6 @@ override def findMissingPartitions(): Seq[Int] = {
 }
 ```
 
-
-
-
-
 ### MapStatus ###
 
 MapStatus 是 ShuffleMapTask的执行结果。它有两个方法，location指明数据存放位置，getSizeForBlock返回指定reduceID的数据大小，注意这个大小是有一定差值的。MapStatus有两个子类，CompressedMapStatus 和 HighlyCompressedMapStatus。当reduceId超过了2000， 就使用HighlyCompressedMapStatus。否则使用CompressedMapStatus 。
@@ -93,7 +89,7 @@ private[spark] class HighlyCompressedMapStatus private (
 
 ## ResultStage ##
 
-
+当触发save或collect操作时，都会生成ResultStage。ResultStage都是最后一个Stage。它有一个属性func，用于处理分区的数据，比如返回给driver，或者存储到hdfs。
 
 ## Stage 生成 Task ##
 
@@ -103,20 +99,24 @@ private[spark] class HighlyCompressedMapStatus private (
 
 ```scala
 private def submitMissingTasks(stage: Stage, jobId: Int) {
+    // 获取当前stage有哪些分区需要计算
     val partitionsToCompute: Seq[Int] = stage.findMissingPartitions()
     val taskBinaryBytes: Array[Byte] = stage match {
+        // 如果是ShuffleMapStage类型，则序列化rdd和dependency
         case stage: ShuffleMapStage =>
         	JavaUtils.bufferToArray(
                 closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
+        // 如果是ResultStage类型，则序列化rdd和func
         case stage: ResultStage =>
         	JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
     }
-    
+    // 转换成broadcast类型
     taskBinary = sc.broadcast(taskBinaryBytes)
     
     val tasks: Seq[Task[_]] = try {
         val serializedTaskMetrics = closureSerializer.serialize(stage.latestInfo.taskMetrics).array()
         stage match {
+            // 为每一个分区生成一个Task
             case stage: ShuffleMapStage =>
             	partitionsToCompute.map { id =>
                     val part = stage.rdd.partitions(id)
@@ -136,7 +136,7 @@ private def submitMissingTasks(stage: Stage, jobId: Int) {
                 }
         }
     }
-    
+    // 提交给taskScheduler
     taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptId, jobId, properties))
         
