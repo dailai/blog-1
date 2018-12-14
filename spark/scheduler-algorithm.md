@@ -140,7 +140,7 @@ private[spark] class FairSchedulableBuilder() {
 
 当添加完任务后，需要调用Pool的getSortedTaskSetQueue方法，返回排序后的任务列表。
 
-Pool会先对子节点排序，然后依次获取子节点的排序结果。它的终止条件是遇到叶子节点TaskSetManager
+Pool会先对子节点排序，然后依次获取子节点的排序结果，然后合并结果。它的终止条件是遇到叶子节点TaskSetManager
 
 ```scala
 override def getSortedTaskSetQueue: ArrayBuffer[TaskSetManager] = {
@@ -166,8 +166,6 @@ override def getSortedTaskSetQueue(): ArrayBuffer[TaskSetManager] = {
 
 注意到上面的taskSetSchedulingAlgorithm，这里定义了排序的规则。
 
-
-
 FIFO调度的比较原理，首先比较priority值，priority越小，则优先执行。如果priority相同，则比较stageId，stageId越小，则优先执行。
 
 ```scala
@@ -191,6 +189,10 @@ Fair调度相对来说比较复杂，它的中心思想是，根据资源的使�
 资源的饱和度 = runningTasks /  minShare。当在资源充足时， 这个值越大，说明资源越紧张。
 
 资源的使用率 = runningTasks /  weight，表示每个资源正在跑的任务数。当资源缺乏时， 这个值越大，说明资源越紧张。
+
+当两者Schedulable的资源都空闲时，则资源饱和度越小，则优先执行
+
+当两者Schedulable的资源使用率时，则资源使用率低的，则优先执行
 
 ```scala
 private[spark] class FairSchedulingAlgorithm extends SchedulingAlgorithm {
