@@ -166,3 +166,32 @@ AMEndpoint 继承 RpcEndpoint, 表示Rpc服务，它接收下列请求：
 * KillExecutors， 杀死Container
 * GetExecutorLossReason， 获取Executor运行的错误信息
 
+
+
+## YarnAllocator ##
+
+AMEndpoint关于资源的请求，都会转发给YarnAllocator处理。YarnAllocator主要负责ApplicationMaster和ResourceManager的通信。
+
+首先简单的介绍下AMRMClient的使用，它是Yarn库里的类，提供了与ResourceManager通信的api。
+
+```java
+// 实例化AMRMClient
+AMRMClient<ContainerRequest> amClient = AMRMClient.createAMRMClient();
+// 指定请求资源大小，内存和cpu
+Resource resource = Resource.newInstance(memory, cores);
+// 希望请求所在的主机
+String[] nodes = {"node1", "node2"};
+// 希望请求所在的机架，如果没有要求，则设为null
+String[] rack = null;
+// 指定优先值
+Priority priority = Priority.newInstance(1);
+// 当资源不满足时，是否可以降级要求。比如指定主机node1不满足时，可以降级到node1所在机架的其它主机
+Boolean relaxLocality = True;
+// 实例化 ContainerRequest
+ContainerRequest request = new ContainerRequest(resources, nodes, rack, priority);
+// 添加 ContainerRequest 到 amClient里，等待allocate函数发出申请
+amClient.addContainerRequest(request);
+// allocate会将ContainerRequest请求发送给ResourceManager，同时也会维持心跳
+amClient.allocate(0.1);
+```
+
