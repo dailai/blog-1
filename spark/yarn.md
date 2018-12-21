@@ -1,26 +1,44 @@
 # Spark 运行在 Yarn 的原理 #
 
-# 申请资源 #
+## Rpc 服务 ##
 
-```mermaid
-sequenceDiagram
-	participant CoarseGrainedSchedulerBackend
-	participant YarnSchedulerBackend
-	participant YarnSchedulerEndpoint
-	participant AmEndpoint
-	participant YarnAllocator
-	
-	CoarseGrainedSchedulerBackend ->>+ YarnSchedulerBackend : doRequestTotalExecutors(requestedTotal)
-	YarnSchedulerBackend ->>+ YarnSchedulerEndpoint : ask(RequestExecutors)
-	YarnSchedulerEndpoint ->>+ AmEndpoint : ask(RequestExecutors)
-	AmEndpoint ->>+ YarnAllocator : requestTotalExecutorsWithPreferredLocalities
-	YarnAllocator -->>- AmEndpoint : 
-	AmEndpoint -->>- YarnSchedulerEndpoint : 
-	YarnSchedulerEndpoint -->>- YarnSchedulerBackend : 
-	YarnSchedulerBackend -->>- CoarseGrainedSchedulerBackend : 
-```
+Spark运行在Yarn上，会涉及到下列Rpc 服务。YarnDriverEndpoint和YarnSchedulerEndpoint运行在同一个进程
 
-## Yarn 运行模式 ##
+* YarnDriverEndpoint， 继承DriverEndpoint，主要负责与Executor的通信
+
+* YarnSchedulerEndpoint， 负责与AMEndpoint沟通
+
+* AMEndpoint， 运行在ApplicationMaster上，主要负责Yarn的资源请求
+
+
+### YarnDriverEndpoint ###
+
+YarnDriverEndpoint继承DriverEndpoint， 只是修改了onDisconnected方法，增加了当Executor断开连接时，会去AMEndpoint获取失败日志这一步。
+
+### YarnSchedulerEndpoint ###
+
+YarnSchedulerEndpoint接收下列请求：
+
+来自AMEndpoint的请求
+
+* RegisterClusterManager，请求包含AMEndpoint客户端。
+* AddWebUIFilter， 通过它可以做一些控制访问spark web ui 的操作
+
+来自SchedulerBackend的请求， 这些请求都会转发给AMEndpoint
+
+* RequestExecutors， 请求资源
+* KillExecutors， 杀死Container
+* GetExecutorLossReason， 获取Executor运行的错误信息 
+
+### AMEndpoint ###
+
+AMEndpoint的所有请求都是来自YarnSchedulerEndpoint，接收下列请求：
+
+- RequestExecutors， 请求资源
+- KillExecutors， 杀死Container
+- GetExecutorLossReason， 获取Executor运行的错误信息 
+
+## Yarn 运行原理 ##
 
 ### ApplicationMaster启动 ###
 
@@ -50,7 +68,7 @@ cluster模式下，ApplicationMaster会首先启动一个线程，执行用户�
 
 然后会运行AMEndpoint服务，对外提供资源请求的Rpc接口。主线程会一直等待用户程序执行完，才退出。
 
-这里可以看到，DriverEndpoint和Application的AmEndpoint运行在同一个进程里面。
+这里可以看到，DriverEndpoint和AmEndpoint运行在同一个进程里面。
 
 ```scala
 def runDriver(securityMgr: SecurityManager): Unit = {
@@ -106,7 +124,7 @@ def startUserApplication(): Thread = {
 
 client模式下，用户的程序是运行在spark-submit提交的那台主机上，所以SparkContext和DriverEndpoint都是运行在这台主机上。而ApplicationMaster运行在yarn上的container里。ApplicationMaster这里仅仅是运行AMEndpoint的Rpc服务。
 
-所以在client模式下，DriverEndpoint和Application的AmEndpoint 是不在同一个进程里面的。
+所以在client模式下，DriverEndpoint和AmEndpoint 是不在同一个进程里面的。
 
 ```scala
 def runExecutorLauncher(securityMgr: SecurityManager): Unit = {
@@ -160,38 +178,31 @@ def waitForSparkDriver(): RpcEndpointRef = {
 
 ## AMEndpoint 服务 ##
 
-AMEndpoint 继承 RpcEndpoint, 表示Rpc服务，它接收下列请求：
+AMEndpoint是只和YarnSchedulerEndpoint通信，它在启动之后会发送RegisterClusterManager消息给YarnSchedulerEndpoint，消息会携带AMEndpoint客户端。这样YarnSchedulerEndpoint就可以通过它与AMEndpoint通信了。
 
-* RequestExecutors， 请求资源
-* KillExecutors， 杀死Container
-* GetExecutorLossReason， 获取Executor运行的错误信息
+```scala
+class ApplicationMaster(.... ) {
+  private def runAMEndpoint(
+      host: String,
+      port: String,
+      isClusterMode: Boolean): RpcEndpointRef = {
+    // 注意这里实例化的是YarnSchedulerEndpoint
+    // AMEndpoint的driverEndpoint是指YarnSchedulerEndpoint， 而不是DriverEndpoint
+    val driverEndpoint = rpcEnv.setupEndpointRef(
+      RpcAddress(host, port.toInt),
+      YarnSchedulerBackend.ENDPOINT_NAME)
+    amEndpoint =
+      rpcEnv.setupEndpoint("YarnAM", new AMEndpoint(rpcEnv, driverEndpoint, isClusterMode))
+    driverEndpoint
+  }
+}
 
-
-
-## YarnAllocator ##
-
-AMEndpoint关于资源的请求，都会转发给YarnAllocator处理。YarnAllocator主要负责ApplicationMaster和ResourceManager的通信。
-
-首先简单的介绍下AMRMClient的使用，它是Yarn库里的类，提供了与ResourceManager通信的api。
-
-```java
-// 实例化AMRMClient
-AMRMClient<ContainerRequest> amClient = AMRMClient.createAMRMClient();
-// 指定请求资源大小，内存和cpu
-Resource resource = Resource.newInstance(memory, cores);
-// 希望请求所在的主机
-String[] nodes = {"node1", "node2"};
-// 希望请求所在的机架，如果没有要求，则设为null
-String[] rack = null;
-// 指定优先值
-Priority priority = Priority.newInstance(1);
-// 当资源不满足时，是否可以降级要求。比如指定主机node1不满足时，可以降级到node1所在机架的其它主机
-Boolean relaxLocality = True;
-// 实例化 ContainerRequest
-ContainerRequest request = new ContainerRequest(resources, nodes, rack, priority);
-// 添加 ContainerRequest 到 amClient里，等待allocate函数发出申请
-amClient.addContainerRequest(request);
-// allocate会将ContainerRequest请求发送给ResourceManager，同时也会维持心跳
-amClient.allocate(0.1);
+class AMEndpoint(override val rpcEnv: RpcEnv, driver: RpcEndpointRef, isClusterMode: Boolean)
+  	extends RpcEndpoint with Logging {
+  	override def onStart(): Unit = {
+    	// 向YarnSchedulerEndpoint发送 注册信息
+    	driver.send(RegisterClusterManager(self))
+  	}
+}
 ```
 
