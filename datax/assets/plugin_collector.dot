@@ -1,0 +1,23 @@
+digraph G {
+    rankdir=BT
+    fontname = "Courier New"
+    fontsize = 8
+    nodesep=1.5
+
+    node [fontname="Courier New",fontsize=8,shape="record", fixedsize=true， width=3]
+    edge [arrowhead = "empty",fontname = "Courier New", fontsize = 8]
+
+    PluginCollector [label="{PluginCollector||}"]
+    JobPluginCollector [label="{JobPluginCollector|
+        + getMessage() : Map\<String, List\<String\>\>\l|
+        + getMessage(String key) : List\<String\>\l
+    }"]
+    DefaultJobPluginCollector[label="{DefaultJobPluginCollector||}"]
+    AbstractContainerCommunicator[label="{AbstractContainerCommunicator||}"]
+
+    JobPluginCollector -> PluginCollector
+    DefaultJobPluginCollector -> JobPluginCollector
+    DefaultJobPluginCollector -> AbstractContainerCommunicator[arrowhead=diamond]
+    {rank=same; DefaultJobPluginCollector, AbstractContainerCommunicator}
+    
+}

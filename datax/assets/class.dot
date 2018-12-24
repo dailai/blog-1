@@ -1,0 +1,35 @@
+digraph G {
+
+    rankdir=BT
+    fontname = "Courier New"
+    fontsize = 8
+
+    node [fontname="Courier New",fontsize=8,shape = "record"]
+
+    edge [fontname = "Courier New", fontsize = 8]
+
+    AbstractContainerCommunicator [label = "{AbstractContainerCommunicatorimal|
+        + collector : AbstractCollector\l
+        + reporter : AbstractReporter\l|
+        + registerCommunication(List\<Configuration\>) : void\l
+        + collect() : Communication\l
+        + report(Communication communication) : void\l
+        }"]
+
+    StandAloneJobContainerCommunicator [label = "{
+            StandAloneJobContainerCommunicator||}"]
+
+    AbstractTGContainerCommunicator [label = "{
+            AbstractTGContainerCommunicator||}"]
+    
+    StandaloneTGContainerCommunicator [label = "{
+            StandaloneTGContainerCommunicator||}"]
+    
+    edge [
+            arrowhead = "empty"
+    ]
+
+    StandAloneJobContainerCommunicator -> AbstractContainerCommunicator
+    AbstractTGContainerCommunicator -> AbstractContainerCommunicator
+    StandaloneTGContainerCommunicator -> AbstractTGContainerCommunicator
+}
