@@ -104,7 +104,7 @@ path 不能有空字符串
 
 ### 查询原理 ###
 Configuration 类是主要通过get方法获取值，返回Object对象。Object可以是Json下的数据类型，比如int， string， map，list
- 
+
 ``` java
 public Object get(final String path) {
         // 检查path合法性，不能包含空字符
@@ -331,7 +331,7 @@ Configuration加载支持http get请求，和本地文件，由ConfigParser类�
 ```
 例如：mysql的用户名需要加密，下面的job.content[0].reader.parameter.**username, 和job.content[0].reader.parameter.**password
 
-``` json
+​``` json
 {
     "job": {
         "content": [
