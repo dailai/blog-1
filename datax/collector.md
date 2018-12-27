@@ -32,7 +32,7 @@ Map<String, List<String>> message;
 
 
 
-如果多个Communication需要汇总，Communication提供了mergeFrom方法。根据不同的数据类型，对应着不同的操作
+如果需要汇总多个Communication的数据，Communication提供了mergeFrom方法。根据不同的数据类型，对应着不同的操作
 
 * 计数器类型，相同的key的数值累加
 * 合并异常，当自身的异常为null，才合并别的异常
@@ -43,19 +43,19 @@ Map<String, List<String>> message;
 
 ## Communication管理
 
-对于每个task组都有单独的Communication，这里LocalTGCommunicationManager类实现了Communication的集中管理。接下来看看LocalTGCommunicationManager的原理
+对于每个task组都有一个单独的Communication，用来存储这个组的统计数据。对于这些Communication，LocalTGCommunicationManager类实现了集中管理。接下来看看LocalTGCommunicationManager的原理。
 
-LocalTGCommunicationManager有个重要的属性 taskGroupCommunicationMap， 它是一个Map，保存了每个task的统计数据。
+LocalTGCommunicationManager有个重要的属性 taskGroupCommunicationMap， 它是一个Map，保存了每个task组的统计数据。
 
 ```java
 public final class LocalTGCommunicationManager {
-    // Key为taskId， Value为task对应的Communication
+    // Key为task group id， Value为对应的Communication
     private static Map<Integer, Communication> taskGroupCommunicationMap =
         new ConcurrentHashMap<Integer, Communication>();
 }
 ```
 
-task在使用Communication的时候，必须先向LocalTGCommunicationManager这里注册。
+当task组在初始化的时候，都会向LocalTGCommunicationManager这里注册。
 
 ```java
 // 这里只是简单保存到taskGroupCommunicationMap变量里
@@ -65,7 +65,7 @@ public static void registerTaskGroupCommunication(
 }
 ```
 
-当需要统计所有task的数据时，getJobCommunication实现了这个功能
+当需要统计所有的数据时，getJobCommunication实现了这个功能
 
 ```java
     public static Communication getJobCommunication() {
@@ -86,7 +86,7 @@ public static void registerTaskGroupCommunication(
 
 ## 注册Communication ##
 
-AbstractScheduler会根据切分后的任务，为每个task组注册一个Communication。registerCommunication接收t配置列表，里面每个配置都包含了task group id。
+AbstractScheduler会根据切分后的任务，为每个task组注册一个Communication。registerCommunication接收task配置列表，里面每个配置都包含了task group id。
 
 ```mermaid
 sequenceDiagram
@@ -111,7 +111,7 @@ sequenceDiagram
 
 每个任务执行都会对应着Channel，Channel当每处理一条数据时，都会更新对应Communication的统计信息。
 
-下面的pull方法是Writer从Channel拉取数据，每次pull的时候，都会调用statPull函数，会更新写入数据条数和字节数的信息。
+比如下面的pull方法是Writer从Channel拉取数据，每次pull的时候，都会调用statPull函数，会更新写入数据条数和字节数的信息。
 
 ```java
 public abstract class Channel {
@@ -140,7 +140,7 @@ public abstract class Channel {
 
 2. StandAloneJobContainerCommunicator继承AbstractContainerCommunicator，实现了collect方法，
 
-   会调用AbstractCollector的collectFromTaskGroup方法获取数据
+   它会调用AbstractCollector的collectFromTaskGroup方法获取数据
 
 3. ProcessInnerCollector实现了AbstractCollector的collectFromTaskGroup方法，它会调用LocalTGCommunicationManager的getJobCommunication方法
 

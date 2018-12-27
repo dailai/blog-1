@@ -4,15 +4,15 @@
 
 ## 加载配置 ##
 
-Datax启动是从Engine类开始的。Engine会读取配置文件，并且初始化JobContainer。
+Datax启动是从Engine类开始的。Engine会读取配置文件，并且初始化和运行JobContainer。
 
 ```java
 public class Engine {
 	public static void entry(final String[] args) throws Throwable {
-    // .....
-	Configuration configuration = ConfigParser.parse(jobPath);
-	Engine engine = new Engine();
-	engine.start(configuration);
+    	// .....
+        Configuration configuration = ConfigParser.parse(jobPath);
+        Engine engine = new Engine();
+        engine.start(configuration);
 	}
     
     public void start(Configuration allConf) {
@@ -25,11 +25,11 @@ public class Engine {
 
 
 
-## 运行JobContainer ##
+## JobContainer原理 ##
 
-JobContaier的源码涉及到插件的加载，可以参考此篇博客。
+JobContaier的源码涉及到插件的动态加载，可以参考此篇博客。
 
-JobContainer的start方法如下
+首先看看JobContainer的start方法，它将任务的执行分为多个阶段。
 
 ```java
 public class JobContainer extends AbstractContainer {
@@ -46,7 +46,6 @@ public class JobContainer extends AbstractContainer {
         this.schedule();
         LOG.debug("jobContainer starts to do post ...");
         this.post();
-        
         LOG.debug("jobContainer starts to do postHandle ...");
         this.postHandle();
         LOG.info("DataX jobId [{}] completed successfully.", this.jobId);
@@ -235,7 +234,9 @@ private void postHandle() {
 
 ## 扩展 handler 插件 ##
 
-如果有个需求，需要将任务的完成情况，记录下来。这个时候需要自定义handler。因为目前Datax只支持reader和writer两种类型的插件，所以这里去修改datax的源码。
+如果有个需求，需要将任务的完成情况，记录下来。这个时候需要自定义handler。
+
+### 修改插件加载 ###
 
 首先需要修改读取插件配置的源码，因为从ConfigParser的源码可以看到，datax已经从配置文件中，提取了posthandler的插件名称，但是在寻找插件的时候，只是从reader和writer目录下去寻找，所以需要增加从handler目录的寻找。
 
@@ -261,6 +262,10 @@ public final class ConfigParser {
 }
      
 ```
+
+
+
+### 自定义Handler类 ###
 
 因为postHandler是属于Job运行类型的插件，所有必须在里面新建一个名称为Job的类，这个Job类必须继承AbstractJobPlugin。下面就是自定义插件的JobResultCollector的基本雏形
 
@@ -288,6 +293,8 @@ public class JobResultCollector {
     }
 }
 ```
+
+### 增加结果数据读取功能 ###
 
 因为这个插件需要记录任务完成结果，所以需要了解下怎么获取统计数据。关于统计数据的原理，可以参见此篇文章
 
