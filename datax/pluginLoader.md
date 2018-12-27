@@ -1,4 +1,4 @@
-# Datax 插件原理
+# Datax 插件加载原理
 
 
 
@@ -9,7 +9,7 @@ Datax有好几种类型的插件，每个插件都有不同的作用。
 - reader， 读插件。Reader就是属于这种类型的
 - writer， 写插件。Writer就是属于这种类型的
 - transformer， 目前还未知
-- handler， 主要用于任务执行前的准备工作和完成的收尾工作。比如当任务完成时，实现自定义handler，记录任务的完成情况
+- handler， 主要用于任务执行前的准备工作和完成的收尾工作。
 
 插件类型由PluginType枚举表示
 
@@ -136,7 +136,7 @@ ConfigParser首先会读取配置文件，提取需要使用的reader，writer�
 
  
 
-## 插件加载原理 ##
+## 动态加载插件 ##
 
 插件的加载都是使用ClassLoader动态加载。 为了避免类的冲突，对于每个插件的加载，对应着独立的加载器。加载器由JarLoader实现，插件的加载接口由LoadUtil类负责。当要加载一个插件时，需要实例化一个JarLoader，然后切换thread class loader之后，才加载插件。
 
