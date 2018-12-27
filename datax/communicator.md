@@ -98,3 +98,8 @@ public class StandaloneTGContainerCommunicator extends AbstractTGContainerCommun
     }
 
 ```
+
+
+
+## AbstractCollector ##
+

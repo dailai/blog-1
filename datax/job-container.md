@@ -233,6 +233,179 @@ private void postHandle() {
 
 
 
-## 扩展插件 ##
+## 扩展 handler 插件 ##
 
-如果有个需求，需要将任务的完成情况，记录下来。这个时候需要自定义handler。
+如果有个需求，需要将任务的完成情况，记录下来。这个时候需要自定义handler。因为目前Datax只支持reader和writer两种类型的插件，所以这里去修改datax的源码。
+
+首先需要修改读取插件配置的源码，因为从ConfigParser的源码可以看到，datax已经从配置文件中，提取了posthandler的插件名称，但是在寻找插件的时候，只是从reader和writer目录下去寻找，所以需要增加从handler目录的寻找。
+
+```java
+public class CoreConstant {
+	public static String DATAX_PLUGIN_HANDLER_HOME = StringUtils.join(
+			new String[] { DATAX_HOME, "plugin", "handler" }, File.separator);
+}
+
+public final class ConfigParser {
+    public static Configuration parsePluginConfig(List<String> wantPluginNames) {
+        .......
+         for(final String each : ConfigParser
+             	.getDirAsList(CoreConstant.DATAX_PLUGIN_HANDLER_HOME)) {
+             Configuration eachHandlerConfig = ConfigParser.parseOnePluginConfig(each, 
+                  		"handler", replicaCheckPluginSet, wantPluginNames);
+             if (eachHandlerConfig != null) {
+                 configuration.merge(eachHandlerConfig, true);
+                 complete += 1;
+             }
+         }
+    }
+}
+     
+```
+
+因为postHandler是属于Job运行类型的插件，所有必须在里面新建一个名称为Job的类，这个Job类必须继承AbstractJobPlugin。下面就是自定义插件的JobResultCollector的基本雏形
+
+```java
+public class JobResultCollector {
+
+    private static final Logger LOG = LoggerFactory.getLogger(Collector.class);
+
+    public static class Job extends AbstractJobPlugin {
+
+        @Override
+        public void init() {
+            LOG.info("plugin Collector start init");
+        }
+
+        @Override
+        public void destroy() {
+            LOG.info("plugin Collector destroy");
+        }
+
+        @Override
+        public void postHandler(Configuration jobConfiguration) {
+            LOG.info("plugin Collector post handler");
+        }
+    }
+}
+```
+
+因为这个插件需要记录任务完成结果，所以需要了解下怎么获取统计数据。关于统计数据的原理，可以参见此篇文章
+
+因为自定义Handler属于Job运行类型的插件，所以需要继承AbstractJobPlugin。AbstractJobPlugin有一个重要属性jobPluginCollector，通过它可以获得需要的数据。
+
+```java
+public abstract class AbstractJobPlugin extends AbstractPlugin {
+    
+    private JobPluginCollector jobPluginCollector;
+
+    public JobPluginCollector getJobPluginCollector() {
+        return jobPluginCollector;
+    }
+    
+    public void setJobPluginCollector(
+            JobPluginCollector jobPluginCollector) {
+		this.jobPluginCollector = jobPluginCollector;
+	}   
+}
+```
+
+
+
+通过加载posthandler的源码中，可以看到jobPluginCollector变量的初始化，实质上是DefaultJobPluginCollector的实例。并且每个插件都有着独立的JobPluginCollector， 但这些JobPluginCollector都共享者同一个AbstractContainerCommunicator
+
+```java
+public class JobContainer extends AbstractContainer {
+
+	private void postHandle() {
+        ........
+        // 加载和实例化handler
+        AbstractJobPlugin handler = LoadUtil.loadJobPlugin(
+                handlerPluginType, handlerPluginName);
+		// 实例化DefaultJobPluginCollector
+        JobPluginCollector jobPluginCollector = new DefaultJobPluginCollector(
+                this.getContainerCommunicator());
+        // 设置handler的jobPluginCollector
+        handler.setJobPluginCollector(jobPluginCollector);
+        ........
+        handler.postHandler(configuration);
+}
+```
+
+接下来看看DefaultJobPluginCollector的源码，可以看到它只提供了关于返回消息的方法，却没有提供别的数据的访问。感觉像是阿里这边的源码并没有开放完全。所以如果想访问到其他的数据，就需要修改源码了。
+
+```java
+public final class DefaultJobPluginCollector implements JobPluginCollector {
+    private AbstractContainerCommunicator jobCollector;
+
+    public DefaultJobPluginCollector(AbstractContainerCommunicator containerCollector) {
+        this.jobCollector = containerCollector;
+    }
+
+    @Override
+    public Map<String, List<String>> getMessage() {
+        Communication totalCommunication = this.jobCollector.collect();
+        return totalCommunication.getMessage();
+    }
+
+    @Override
+    public List<String> getMessage(String key) {
+        Communication totalCommunication = this.jobCollector.collect();
+        return totalCommunication.getMessage(key);
+    }
+}
+```
+
+原本我是想增加一个方法返回Communication。这样根据返回的Communication，可以查看里面任何的数据。因为DefaultJobPluginCollector实现JobPluginCollector接口，所以也需要加上。 代码如下：
+
+```java
+public final class DefaultJobPluginCollector implements JobPluginCollector {
+    
+    public Communication getCommunication() {
+        return this.jobCollector.collect();
+    }
+}
+
+public interface JobPluginCollector extends PluginCollector {
+    Communication getCommunication();
+}
+```
+
+但是行不通，因为DefaultJobPluginCollector是属于datax-core模块的类，JobPluginCollector属于datax-common模块的类。datax-core是依赖于datax-common的。而Communication是属于datax-core模块的类，如果在JobPluginCollector引用Communication，就会产生循环依赖。
+
+所以增加方法必须考虑依赖关系，因为Communication的数据类型比较简单，这样接口只需要返回简单的数据类型即可
+
+```java
+public final class DefaultJobPluginCollector implements JobPluginCollector {
+    
+    @Override
+    public Map<String, Number> getCounter() {
+        return this.jobCollector.collect().getCounter();
+    }
+}
+
+public interface JobPluginCollector extends PluginCollector {
+    Map<String, Number> getCounter();
+}
+```
+
+
+
+现在解决了读取数据的需求了，接下来实现JobResultCollector的postHandler方法。可以结合CommunicationTool里面的变量，获取对应的数据。
+
+```java
+@Override
+public void postHandler(Configuration jobConfiguration) {
+    LOG.info("plugin Collector post handler");
+    Map<String, Number> counter = getJobPluginCollector().getCounter();
+    long successReadRecords = getLongCounter(counter, CommunicationTool.READ_SUCCEED_RECORDS);
+    long failedReadRecords = getLongCounter(counter, CommunicationTool.READ_FAILED_RECORDS);
+    long totalReadRecords = successReadRecords - failedReadRecords;
+    LOG.info("total records : " + totalReadRecords);
+}
+
+private long getLongCounter(Map<String, Number> counter, String key) {
+    Number value = counter.get(key);
+    return value == null ? 0 : value.longValue();
+}
+```
+

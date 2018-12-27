@@ -1,123 +1,172 @@
-## collector ##
-datax需要收集两个地方的运行数据，TaskGroup的数据和Task的数据。关于collector这个模块的类设计，是比较奇怪的。按照常理是先设计一个抽象类或接口AbstractCollector,然后设计两个子类，比如TaskColletor和TaskGroupCollector。但是datax却只有一个抽象类AbstractCollector和一个子类ProcessInnerCollector。
+## Datax 数据统计原理 ##
+根据datax的运行模式的区别， 数据的收集是不一样的，这篇文章都是讲的在standalone模式下。
 
-### task的数据收集 ###
-Task的数据收集的所有方法，都是由AbstractCollector负责。它使用Map<Integer, Communication> 保存Task的数据。
+## 统计数据类
+
+DataX所有的统计信息都会保存到Communication类里面。Communication支持下列数据的统计
+
+- 计数器，比如读取的字节速度，写入成功的数据条数
+- 统计的时间点
+- 字符串类型的消息
+- 执行时的异常
+- 执行的状态， 比如成功或失败
+
+Communication有下列属性保存统计数据
+
 ```java
-public abstract class AbstractCollector {
+// 计数器
+private Map<String, Number> counter;
 
-    private Map<Integer, Communication> taskCommunicationMap = new ConcurrentHashMap<Integer, Communication>();
+// 执行状态
+private State state;
 
-    // 返回HashMap
-    public Map<Integer, Communication> getTaskCommunicationMap() {
-        return taskCommunicationMap;
-    }
-    
-    // 注册Task和Communication
-    public void registerTaskCommunication(List<Configuration> taskConfigurationList) {
-        for (Configuration taskConfig : taskConfigurationList) {
-            int taskId = taskConfig.getInt(CoreConstant.TASK_ID);
-            this.taskCommunicationMap.put(taskId, new Communication());
-        }
-    }
+// 异常记录 
+private Throwable throwable;
 
-    // 收集Task的数据，并且汇总
-    public Communication collectFromTask() {
-        Communication communication = new Communication();
-        communication.setState(State.SUCCEEDED);
+//在哪个时间点统计数据
+private long timestamp;
 
-        for (Communication taskCommunication :
-                this.taskCommunicationMap.values()) {
-            communication.mergeFrom(taskCommunication);
-        }
-
-        return communication;
-    }
-
-    // 返回task id 对应的数据
-    public Communication getTaskCommunication(Integer taskId) {
-        return this.taskCommunicationMap.get(taskId);
-    }
-}
+// 消息集合
+Map<String, List<String>> message;
 ```
 
 
-### task group的数据收集 ###
-TaskGroup的收集相关的方法，都是由AbstractCollector转发给LocalTGCommunicationManager负责。
-#### LocalTGCommunicationManager ####
-LocalTGCommunicationManager 负责所有TaskGroup的Communication的管理。Communication是保存一些数据的容器，详细介绍可以参考这篇博客。
 
-LocalTGCommunicationManager的原理，是使用ConcurrentHashMap来保存所有的Communication，Key为task_group_id, Value为对应的Communication。
+如果多个Communication需要汇总，Communication提供了mergeFrom方法。根据不同的数据类型，对应着不同的操作
+
+* 计数器类型，相同的key的数值累加
+* 合并异常，当自身的异常为null，才合并别的异常
+* 合并状态，如果有任意一个的状态失败了，那么返回失败的状态。如果有任意一个的状态正在运行，那么返回正在运行的状态
+* 合并消息， 相同的key的消息添加到同一个列表
+
+ 
+
+## Communication管理
+
+对于每个task组都有单独的Communication，这里LocalTGCommunicationManager类实现了Communication的集中管理。接下来看看LocalTGCommunicationManager的原理
+
+LocalTGCommunicationManager有个重要的属性 taskGroupCommunicationMap， 它是一个Map，保存了每个task的统计数据。
+
 ```java
 public final class LocalTGCommunicationManager {
-    // HashMap保存所有的Communication
+    // Key为taskId， Value为task对应的Communication
     private static Map<Integer, Communication> taskGroupCommunicationMap =
-            new ConcurrentHashMap<Integer, Communication>();
+        new ConcurrentHashMap<Integer, Communication>();
+}
+```
 
-    // 新增 communication
-    public static void registerTaskGroupCommunication(
-            int taskGroupId, Communication communication) {
-        taskGroupCommunicationMap.put(taskGroupId, communication);
-    }
+task在使用Communication的时候，必须先向LocalTGCommunicationManager这里注册。
 
-    // 获取所有的communication，汇总的数据
+```java
+// 这里只是简单保存到taskGroupCommunicationMap变量里
+public static void registerTaskGroupCommunication(
+        int taskGroupId, Communication communication) {
+    taskGroupCommunicationMap.put(taskGroupId, communication);
+}
+```
+
+当需要统计所有task的数据时，getJobCommunication实现了这个功能
+
+```java
     public static Communication getJobCommunication() {
+        // 初始一个新的Communication，然后更新它的数据
         Communication communication = new Communication();
         communication.setState(State.SUCCEEDED);
-
+        // 遍历所有任务的Communication， 调用mergeFrom合并统计结果
         for (Communication taskGroupCommunication :
                 taskGroupCommunicationMap.values()) {
-            // 遍历Communication， 将数据相加汇总
             communication.mergeFrom(taskGroupCommunication);
         }
 
         return communication;
     }
-}
 ```
 
 
-#### AbstractCollector的原理 ####
+
+## 注册Communication ##
+
+AbstractScheduler会根据切分后的任务，为每个task组注册一个Communication。registerCommunication接收t配置列表，里面每个配置都包含了task group id。
+
+```mermaid
+sequenceDiagram
+	participant AbstractScheduler
+    participant StandAloneJobContainerCommunicator
+    participant AbstractCollector
+    participant LocalTGCommunicationManager
+    
+	AbstractScheduler ->>+ StandAloneJobContainerCommunicator : registerCommunication(configurationList)
+	StandAloneJobContainerCommunicator ->>+ AbstractCollector : registerTGCommunication(configurationList)
+	AbstractCollector ->>+ LocalTGCommunicationManager : registerTaskGroupCommunication(taskGroupId, communication)
+	
+	LocalTGCommunicationManager -->>- AbstractCollector : #
+	AbstractCollector -->>- StandAloneJobContainerCommunicator : #
+	StandAloneJobContainerCommunicator -->>- AbstractScheduler : #
+
+```
+
+
+
+## 更新统计数据 ##
+
+每个任务执行都会对应着Channel，Channel当每处理一条数据时，都会更新对应Communication的统计信息。
+
+下面的pull方法是Writer从Channel拉取数据，每次pull的时候，都会调用statPull函数，会更新写入数据条数和字节数的信息。
 
 ```java
-public abstract class AbstractCollector {
-    // 注册taskgroup
-    public void registerTGCommunication(List<Configuration> taskGroupConfigurationList) {
-        for (Configuration config : taskGroupConfigurationList) {
-            int taskGroupId = config.getInt(
-                    CoreConstant.DATAX_CORE_CONTAINER_TASKGROUP_ID);
-            LocalTGCommunicationManager.registerTaskGroupCommunication(taskGroupId, new Communication());
-        }
+public abstract class Channel {
+
+	private Communication currentCommunication;
+    
+    public Record pull() {
+        Record record = this.doPull();
+        this.statPull(1L, record.getByteSize());
+        return record;
     }
 
-    // 收集和汇总所有TaskGroup的数据
-    public abstract Communication collectFromTaskGroup();
-
-    // 获取TaskGroup和Communication的HashMap
-    public Map<Integer, Communication> getTGCommunicationMap() {
-        return LocalTGCommunicationManager.getTaskGroupCommunicationMap();
+    private void statPull(long recordSize, long byteSize) {
+        currentCommunication.increaseCounter(
+                CommunicationTool.WRITE_RECEIVED_RECORDS, recordSize);
+        currentCommunication.increaseCounter(
+                CommunicationTool.WRITE_RECEIVED_BYTES, byteSize);
     }
-
-    // 获取对应taskGroupId的Communication
-    public Communication getTGCommunication(Integer taskGroupId) {
-        return LocalTGCommunicationManager.getTaskGroupCommunication(taskGroupId);
-    }
-}
-
-public class ProcessInnerCollector extends AbstractCollector {
-
-    public ProcessInnerCollector(Long jobId) {
-        super.setJobId(jobId);
-    }
-
-    @Override
-    public Communication collectFromTaskGroup() {
-        return LocalTGCommunicationManager.getJobCommunication();
-    }
-
-}
 ```
 
+
+
+## 收集数据 ##
+
+1. AbstractScheduler想统计汇总后的数据，需要调用AbstractContainerCommunicator的collect方法
+
+2. StandAloneJobContainerCommunicator继承AbstractContainerCommunicator，实现了collect方法，
+
+   会调用AbstractCollector的collectFromTaskGroup方法获取数据
+
+3. ProcessInnerCollector实现了AbstractCollector的collectFromTaskGroup方法，它会调用LocalTGCommunicationManager的getJobCommunication方法
+
+4. getJobCommunication方法会统计所有task的数据，然后返回。
+
+```mermaid
+sequenceDiagram
+	participant AbstractScheduler
+	participant AbstractContainerCommunicator
+	participant StandAloneJobContainerCommunicator
+	participant AbstractCollector
+	participant ProcessInnerCollector
+	participant LocalTGCommunicationManager
+	
+	AbstractScheduler ->>+ AbstractContainerCommunicator : collect
+	AbstractContainerCommunicator ->>+ StandAloneJobContainerCommunicator : collect
+	StandAloneJobContainerCommunicator ->>+ AbstractCollector : collectFromTaskGroup
+	AbstractCollector ->>+ ProcessInnerCollector : collectFromTaskGroup
+	ProcessInnerCollector ->>+ LocalTGCommunicationManager : getJobCommunication
+	
+	LocalTGCommunicationManager -->>- ProcessInnerCollector : communication
+	ProcessInnerCollector -->>- AbstractCollector : communication
+	AbstractCollector -->>- StandAloneJobContainerCommunicator : communication
+	StandAloneJobContainerCommunicator -->>- AbstractContainerCommunicator : communication
+	AbstractContainerCommunicator -->>- AbstractScheduler : communication
+```
 
 
 

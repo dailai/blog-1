@@ -40,7 +40,6 @@ Communication的方法很简单，使用synchronized同步访问。比如下面�
 ```java
     public synchronized Long getLongCounter(final String key) {
         Number value = this.counter.get(key);
-
         return value == null ? 0 : value.longValue();
     }
 
@@ -56,8 +55,6 @@ Communication的方法很简单，使用synchronized同步访问。比如下面�
 
         this.counter.put(key, value + deltaValue);
     }
-
-
 
     public List<String> getMessage(final String key) {
         return message.get(key);
