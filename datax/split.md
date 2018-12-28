@@ -1,50 +1,127 @@
-# Datax 分配任务原理 #
+# Datax 任务分配原理 #
 
-Datax根据配置文件，将整个job分成一个个小的task，然后分发成各个task组。
+Datax根首先据配置文件，确定好channel的并发数目。然后将整个job分成一个个小的task，然后分发成各个task组。
 
 ## 确定channel数目 ##
 
-adjustChannelNumber方法， byte计算channel数目， record计算channel数目， 或者指定channel数目
+如果指定字节数限速，则计算字节限速后的并发数目。如果指定记录数限速，则计算记录数限速后的并发数目。再取两者中最小的channel并发数目。如果两者限速都没指定，则看是否配置文件指定了channel并发数目。
 
-doReaderSplit方法， 调用Reader.Job的split方法，返回Reader.Task的Configuration列表
-
-doWriterSplit方法， 调用Writer.JOb的split方法，返回Writer.Task的Configuration列表
-
-获取transformer的Configuration列表
-
-合并reader，writer，transformer配置列表
-
-生成整个Task的Configuration列表，格式为：
+比如以下面这个配置为例：
 
 ```json
 {
-    "taskId": "",
-    "reader": {
-        "name": "",
-        "parameter": {
-            ......
-        }
+    "core": {
+       "transport" : {
+          "channel": {
+             "speed": {
+                "record": 100,
+                "byte": 100
+             }
+          }
+       }
     },
-    "writer": {
-        "name": "",
-        "parameter": {
-            ......
+    "job": {
+      "setting": {
+        "speed": {
+          "record": 500,
+          "byte": 1000,
+          "channel" : 1
         }
-    },
-    "transformer": [
-        ......
-    ]
-
+      }
+    }
 }
 ```
 
-更新JobContainer的Configuration， job.content元素
+首先计算按照字节数限速，channel的数目应该为 500 / 100 = 5
 
-needChannelNumber最后取上面计算的出来的，与task的个数的最小值
+然后按照记录数限速， channel的数目应该为 1000 ／ 100 = 10
 
-## 划分任务 ##
+最后返回两者的最小值 5。虽然指定了channel的1， 但只有在没有限速的条件下，才会使用。
 
-JobContainer 负责任务划分，生成任务信息配置的列表
+adjustChannelNumber方法，实现了上述功能
+
+```java
+private void adjustChannelNumber() {
+    int needChannelNumberByByte = Integer.MAX_VALUE;
+    int needChannelNumberByRecord = Integer.MAX_VALUE;
+
+    // 是否指定字节数限速
+    boolean isByteLimit = (this.configuration.getInt(
+            CoreConstant.DATAX_JOB_SETTING_SPEED_BYTE, 0) > 0);
+    if (isByteLimit) {
+        // 总的限速字节数
+        long globalLimitedByteSpeed = this.configuration.getInt(
+                CoreConstant.DATAX_JOB_SETTING_SPEED_BYTE, 10 * 1024 * 1024);
+
+        // 单个Channel的字节数
+        Long channelLimitedByteSpeed = this.configuration
+                .getLong(CoreConstant.DATAX_CORE_TRANSPORT_CHANNEL_SPEED_BYTE);
+        if (channelLimitedByteSpeed == null || channelLimitedByteSpeed <= 0) {
+            DataXException.asDataXException(
+                    FrameworkErrorCode.CONFIG_ERROR,
+                    "在有总bps限速条件下，单个channel的bps值不能为空，也不能为非正数");
+        }
+		// 计算所需要的channel数目
+        needChannelNumberByByte =
+                (int) (globalLimitedByteSpeed / channelLimitedByteSpeed);
+        needChannelNumberByByte =
+                needChannelNumberByByte > 0 ? needChannelNumberByByte : 1;
+    }
+	// 是否指定记录数限速
+    boolean isRecordLimit = (this.configuration.getInt(
+            CoreConstant.DATAX_JOB_SETTING_SPEED_RECORD, 0)) > 0;
+    if (isRecordLimit) {
+        // 总的限速记录数
+        long globalLimitedRecordSpeed = this.configuration.getInt(
+                CoreConstant.DATAX_JOB_SETTING_SPEED_RECORD, 100000);
+		// 获取单个channel的限定的记录数
+        Long channelLimitedRecordSpeed = this.configuration.getLong(
+                CoreConstant.DATAX_CORE_TRANSPORT_CHANNEL_SPEED_RECORD);
+        if (channelLimitedRecordSpeed == null || channelLimitedRecordSpeed <= 0) {
+            DataXException.asDataXException(FrameworkErrorCode.CONFIG_ERROR,
+                    "在有总tps限速条件下，单个channel的tps值不能为空，也不能为非正数");
+        }
+		// 计算所需要的channel数目
+        needChannelNumberByRecord =
+                (int) (globalLimitedRecordSpeed / channelLimitedRecordSpeed);
+        needChannelNumberByRecord =
+                needChannelNumberByRecord > 0 ? needChannelNumberByRecord : 1;
+        LOG.info("Job set Max-Record-Speed to " + globalLimitedRecordSpeed + " records.");
+    }
+
+    // 取较小值
+    this.needChannelNumber = needChannelNumberByByte < needChannelNumberByRecord ?
+            needChannelNumberByByte : needChannelNumberByRecord;
+
+    // 返回最小值
+    if (this.needChannelNumber < Integer.MAX_VALUE) {
+        return;
+    }
+
+    // 是否指定了channel数目
+    boolean isChannelLimit = (this.configuration.getInt(
+            CoreConstant.DATAX_JOB_SETTING_SPEED_CHANNEL, 0) > 0);
+    if (isChannelLimit) {
+        this.needChannelNumber = this.configuration.getInt(
+                CoreConstant.DATAX_JOB_SETTING_SPEED_CHANNEL);
+
+        LOG.info("Job set Channel-Number to " + this.needChannelNumber
+                + " channels.");
+
+        return;
+    }
+
+    throw DataXException.asDataXException(
+            FrameworkErrorCode.CONFIG_ERROR,
+            "Job运行速度必须设置");
+}
+```
+
+
+
+## 切分任务 ##
+
+JobContainer 的split负责将整个job切分成多个task，生成task配置的列表
 
 ```java
     private int split() {
@@ -81,6 +158,8 @@ JobContainer 负责任务划分，生成任务信息配置的列表
 
 ### Reader ###
 
+doReaderSplit方法， 调用Reader.Job的split方法，返回Reader.Task的Configuration列表
+
 ```java
     /**
     * adviceNumber, 建议的数目
@@ -106,6 +185,8 @@ JobContainer 负责任务划分，生成任务信息配置的列表
 
 ### Writer ###
 
+doWriterSplit方法， 调用Writer.JOb的split方法，返回Writer.Task的Configuration列表
+
 ```java
     private List<Configuration> doWriterSplit(int readerTaskNumber) {
         // 切换ClassLoader
@@ -128,6 +209,8 @@ JobContainer 负责任务划分，生成任务信息配置的列表
 ```
 
 ### 合并配置 ###
+
+合并reader，writer，transformer配置列表。并将任务列表，保存在配置job.content的值里。
 
 ```java
     private List<Configuration> mergeReaderAndWriterTaskConfigs(
@@ -176,8 +259,59 @@ JobContainer 负责任务划分，生成任务信息配置的列表
 ### 分配算法
 
 1. 首先根据指定的channel数目和每个Taskgroup的拥有channel数目，计算出Taskgroup的数目
-2. 将任务根据reader.parameter.loadBalanceResourceMark和writer.parameter.loadBalanceResourceMark来讲任务分组
-3. 轮询任务组，依次轮询的向各个TaskGroup添加一个，直到所有任务都被分配完
+2. 根据每个任务的reader.parameter.loadBalanceResourceMark将任务分组
+3. 根据每个任务writer.parameter.loadBalanceResourceMark来讲任务分组
+4. 根据上面两个任务分组的组数，挑选出大的那个组
+5. 轮询上面步骤的任务组，依次轮询的向各个TaskGroup添加一个，直到所有任务都被分配完
+
+#### 任务分配
+
+这里举个实例：
+
+目前有7个task，channel有20个，每个Taskgroup的拥有5个channel。
+
+首先计算出Taskgroup的数目， 20 ／ 5 =  4 。
+
+根据reader.parameter.loadBalanceResourceMark，将任务分组如下：
+
+```json
+{
+    "database_a" : [task_id_1, task_id_2],
+    "database_b" : [task_id_3, task_id_4, task_id_5],
+    "database_c" : [task_id_6, task_id_7]
+}
+```
+
+根据writer.parameter.loadBalanceResourceMark，将任务分组如下：
+
+```json
+{
+    "database_dst_d" : [task_id_1, task_id_2],
+    "database_dst_e" : [task_id_3, task_id_4, task_id_5, task_id_6, task_id_7]
+}
+```
+
+因为readerResourceMarkAndTaskIdMap有三个组，而writerResourceMarkAndTaskIdMap只有两个组。从中选出组数最多的，所以这里按照readerResourceMarkAndTaskIdMap将任务分配。
+
+执行过程是，轮询database_a, database_b, database_c，取出第一个。循环上一步
+
+1. 取出task_id_1 放入 taskGroup_1
+2. 取出task_id_3 放入 taskGroup_2
+3. 取出task_id_6 放入 taskGroup_3
+4. 取出task_id_2 放入 taskGroup_4
+5. 取出task_id_4 放入 taskGroup_1
+6. .........
+
+最后返回的结果为
+
+```json
+{
+    "taskGroup_1": [task_id_1, task_id_4],
+    "taskGroup_2": [task_id_3, task_id_7],
+    "taskGroup_3": [task_id_6, task_id_5],
+    "taskGroup_4": [task_id_2]
+}
+```
 
 ### 代码解释
 
@@ -253,39 +387,7 @@ public final class JobAssignUtil {
     }
 ```
 
-#### 任务分配
-
-这里举个实例：
-taskGroupNumber为4
-
-resourceMarkAndTaskIdMap的数据
-
-```json
-{
-    "database_a" : [task_id_1, task_id_2],
-    "database_b" : [task_id_3, task_id_4, task_id_5],
-    "database_c" : [task_id_6, task_id_7]
-}
-```
-
-执行过程是，轮询database_a, database_b, database_c，取出第一个。循环上一步
-
-1. 取出task_id_1 放入 taskGroup_1
-2. 取出task_id_3 放入 taskGroup_2
-3. 取出task_id_6 放入 taskGroup_3
-4. 取出task_id_2 放入 taskGroup_4
-5. .........
-
-最后返回的结果为
-
-```json
-{
-    "taskGroup_1": [task_id_1, task_id_4],
-    "taskGroup_2": [task_id_3, task_id_7],
-    "taskGroup_3": [task_id_6, task_id_5],
-    "taskGroup_4": [task_id_2]
-}
-```
+### 分配任务 ###
 
 ```java
     private static List<Configuration> doAssign(LinkedHashMap<String, List<Integer>> resourceMarkAndTaskIdMap, Configuration jobConfiguration, int taskGroupNumber) {
@@ -346,9 +448,11 @@ resourceMarkAndTaskIdMap的数据
     }
 ```
 
-#### 分配channel
+#### 为组分配channel
 
-分配能够保证尽量平均的分配Channel。算法原理是，当channel总的数目，不能整除TaskGroup的数目时。多的余数个channel，从中挑选出余数个TaskGroup，每个多分配一个。
+上面已经把任务划分成多个组，为了每个组能够均匀的分配channel，还需要调整。算法原理是，当channel总的数目，不能整除TaskGroup的数目时。多的余数个channel，从中挑选出余数个TaskGroup，每个多分配一个。
+
+比如现在有13个channel，然后taskgroup确有5个。那么首先每个组先分 13 / 5 = 2 个。那么还剩下多的3个chanel，分配给前面个taskgroup。
 
 ```java
     private static void adjustChannelNumPerTaskGroup(List<Configuration> taskGroupConfig, int channelNumber) {
