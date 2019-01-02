@@ -38,9 +38,7 @@ AMEndpoint的所有请求都是来自YarnSchedulerEndpoint，接收下列请求�
 - KillExecutors， 杀死Container
 - GetExecutorLossReason， 获取Executor运行的错误信息 
 
-## Yarn 运行原理 ##
-
-### ApplicationMaster启动 ###
+## ApplicationMaster启动 ##
 
 当yarn的客户端申请到第一个container后，会在这个container启动ApplicationMaster的进程。
 
@@ -62,6 +60,10 @@ class ApplicationMaster(
 					
 ```
 
+
+
+## Yarn运行模式 ##
+
 ### cluster模式 ###
 
 cluster模式下，ApplicationMaster会首先启动一个线程，执行用户的程序，里面就包含了sparkContext的初始化。sparkContext在初始化的时候，会运行DriverEndpoint服务。
@@ -69,6 +71,39 @@ cluster模式下，ApplicationMaster会首先启动一个线程，执行用户�
 然后会运行AMEndpoint服务，对外提供资源请求的Rpc接口。主线程会一直等待用户程序执行完，才退出。
 
 这里可以看到，DriverEndpoint和AmEndpoint运行在同一个进程里面。
+
+```graphviz
+digraph G {
+    rankdir = TB;
+    nodesep=1;
+    ranksep=2;
+
+    subgraph cluster_yarn_applicationmaster {
+        bgcolor=palegreen1;
+        label = "yarn application master";
+        YarnDriverEndpoint;
+        YarnSchedulerEndpoint;
+        AMEndpoint;
+    };
+
+    subgraph cluster_yarn_container {
+        bgcolor=pink;
+        label = "yarn container";
+        CoarseGrainedExecutorBackend;
+    };
+
+    YarnDriverEndpoint -> YarnSchedulerEndpoint;
+    YarnSchedulerEndpoint -> YarnDriverEndpoint;
+
+    YarnSchedulerEndpoint -> AMEndpoint;
+    AMEndpoint -> YarnSchedulerEndpoint;
+
+    YarnDriverEndpoint -> CoarseGrainedExecutorBackend;
+    CoarseGrainedExecutorBackend -> YarnDriverEndpoint;
+}
+```
+
+
 
 ```scala
 def runDriver(securityMgr: SecurityManager): Unit = {
@@ -126,6 +161,43 @@ client模式下，用户的程序是运行在spark-submit提交的那台主机�
 
 所以在client模式下，DriverEndpoint和AmEndpoint 是不在同一个进程里面的。
 
+```graphviz
+digraph G {
+    nodesep=1;
+    ranksep=2;
+    
+    subgraph cluster_yarn_client {
+        bgcolor=lightskyblue1;
+        label = "yarn client";
+        YarnDriverEndpoint;
+        YarnSchedulerEndpoint;
+    };
+
+    subgraph cluster_yarn_applicationmaster {
+        bgcolor=palegreen1;
+        label = "yarn application master";
+        AMEndpoint;
+    };
+
+    subgraph cluster_yarn_container {
+        bgcolor=pink;
+        label = "yarn container";
+        CoarseGrainedExecutorBackend;
+    };
+
+    YarnDriverEndpoint -> YarnSchedulerEndpoint;
+    YarnSchedulerEndpoint -> YarnDriverEndpoint;
+
+    YarnSchedulerEndpoint -> AMEndpoint;
+    AMEndpoint -> YarnSchedulerEndpoint;
+
+    YarnDriverEndpoint -> CoarseGrainedExecutorBackend;
+    CoarseGrainedExecutorBackend -> YarnDriverEndpoint;
+}
+```
+
+
+
 ```scala
 def runExecutorLauncher(securityMgr: SecurityManager): Unit = {
   val port = sparkConf.get(AM_PORT)
@@ -176,7 +248,7 @@ def waitForSparkDriver(): RpcEndpointRef = {
 
 
 
-## AMEndpoint 服务 ##
+## AMEndpoint 启动 ##
 
 AMEndpoint是只和YarnSchedulerEndpoint通信，它在启动之后会发送RegisterClusterManager消息给YarnSchedulerEndpoint，消息会携带AMEndpoint客户端。这样YarnSchedulerEndpoint就可以通过它与AMEndpoint通信了。
 
