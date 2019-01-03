@@ -1,6 +1,6 @@
-# RDD之间的联系 #
+# RDD之间的依赖 #
 
-当RDD执行transform操作时(比如map，filter，groupby)，就会创造新的RDD。RDD之间的联系类型，就是由Dependency表示。根据rdd的分区情况，可以分为两大类，窄依赖NarrowDependency， 宽依赖ShuffleDependency。
+当RDD执行transform操作时(比如map，filter，groupby)，就会创造新的RDD。RDD之间的联系类型，就是由Dependency表示。根据rdd分区之间的联系，可以分为两大类，窄依赖NarrowDependency， 宽依赖ShuffleDependency。
 
 ## 窄依赖 ##
 
@@ -40,7 +40,7 @@ class RangeDependency[T](rdd: RDD[T], inStart: Int, outStart: Int, length: Int)
 
 ### PruneDependency ###
 
-子RDD的分区数目小于父RDD的分区数目，但子RDD的分区与只对应于父RDD的一个分区。 
+子RDD的分区数目小于父RDD的分区数目，但子RDD的分区与只对应于父RDD的一个分区。 比如从一个有序的rdd，提取出指定范围内的记录
 
 ```
 // rdd表示父RDD
@@ -65,20 +65,21 @@ class PruneDependency[T](rdd: RDD[T], partitionFilterFunc: Int => Boolean)
 
 ## 宽依赖 ##
 
-当子RDD的分区数据来源于父RDD的多个分区时，两者之间的依赖关系就是宽依赖。ShuffleDependency有以下属性：
+当子RDD的分区数据来源于父RDD的多个分区时，两者之间的依赖关系就是宽依赖。宽依赖由ShuffleDependency表示，它有以下属性：
 
 * rdd， 指向父RDD
 * partitioner， 子RDD的分区器
 * keyClassName， key值类型
 * valueClassName， value值类型
 * aggregator， 聚合
-* 
+
+
 
 ## RDD的种类 ##
 
-### RDD的基本方法 ###
+RDD的种类对应着不停的的依赖关系，它们的区别在于怎么计算出分区数据。RDD有两个重要的方法，关于计算分区数据
 
-iterator，返回指定分区的数据，如果没有则调用compute方法
+iterator，返回RDD中指定分区的数据，如果没有则调用compute方法
 
 compute， 计算指定分区的数据
 
