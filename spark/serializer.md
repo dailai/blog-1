@@ -197,8 +197,159 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
 
 ## Kryo 序列化 ##
 
-
-
 ### kryo 初始化 ###
 
-kryo的初始化，在KryoSerializer类里。
+kryo的初始化，在KryoSerializer类里。这里主要是Kryo预先注册需要序列化的类。
+
+```scala
+// 是够需要注册类，才能序列化对应的实例
+private val registrationRequired = conf.getBoolean("spark.kryo.registrationRequired", false)
+
+def newKryo(): Kryo = {
+  // 这里通过EmptyScalaKryoInstantiator工厂，实例化Kryo
+  val instantiator = new EmptyScalaKryoInstantiator
+  val kryo = instantiator.newKryo()
+  kryo.setRegistrationRequired(registrationRequired)
+
+  // 如果没有ClassLoader，则使用当前线程的ClassLoader
+  val oldClassLoader = Thread.currentThread.getContextClassLoader
+  val classLoader = defaultClassLoader.getOrElse(Thread.currentThread.getContextClassLoader)
+
+
+  // 注册类
+  .........
+  
+  kryo.setClassLoader(classLoader)
+  kryo
+}
+```
+
+
+
+serialize方法实现了序列化一个对象，
+
+```scala
+class KryoSerializer(conf: SparkConf) {
+  // 默认分配的缓存初始大小
+  private val bufferSizeKb = conf.getSizeAsKb("spark.kryoserializer.buffer", "64k")
+  // 默认分配的缓存最大值
+  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
+  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
+  private val maxBufferSize = ByteUnit.MiB.toBytes(maxBufferSizeMb).toInt
+    
+    
+  // 实例化KryoOutput， 使用默认的配置
+  def newKryoOutput(): KryoOutput =
+    if (useUnsafe) {
+      new KryoUnsafeOutput(bufferSize, math.max(bufferSize, maxBufferSize))
+    } else {
+      new KryoOutput(bufferSize, math.max(bufferSize, maxBufferSize))
+    }
+  }
+}
+
+
+private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boolean)
+  extends SerializerInstance {
+  // 缓存的Kryo
+  @Nullable private[this] var cachedKryo: Kryo = borrowKryo()
+  
+  // 调用KryoSerializer的newKryoOutput，实例化Kryo的缓存
+  private lazy val output = ks.newKryoOutput()
+
+  override def serialize[T: ClassTag](t: T): ByteBuffer = {
+    // 清除数据
+    output.clear()
+    // 获取Kryo， 如果有缓存，则直接返回。否则需要创建Kryo
+    val kryo = borrowKryo()
+    try {
+      // 序列化数据
+      kryo.writeClassAndObject(output, t)
+    } catch {
+      case e: KryoException if e.getMessage.startsWith("Buffer overflow") =>
+        throw new SparkException(s"Kryo serialization failed: ${e.getMessage}. To avoid this, " +
+          "increase spark.kryoserializer.buffer.max value.", e)
+    } finally {
+      releaseKryo(kryo)
+    }
+    // 返回序列化后的数据，注意output.toBytes会返回新的数组
+    ByteBuffer.wrap(output.toBytes)
+  }
+```
+
+ 
+
+serializeStream方法返回KryoSerializationStream
+
+```scala
+class KryoSerializationStream(
+    serInstance: KryoSerializerInstance,
+    outStream: OutputStream,
+    useUnsafe: Boolean) extends SerializationStream {
+
+  // 通过outStream，来实例化KryoOutput
+  private[this] var output: KryoOutput =
+    if (useUnsafe) new KryoUnsafeOutput(outStream) else new KryoOutput(outStream)
+
+  private[this] var kryo: Kryo = serInstance.borrowKryo()
+
+  override def writeObject[T: ClassTag](t: T): SerializationStream = {
+    // 调用kryo的方法，序列化数据，写入outStream
+    kryo.writeClassAndObject(output, t)
+    this
+  }
+}
+```
+
+
+
+## SerializerManager ##
+
+SerializerManager会自动选择选用哪种序列化。SerializerManager对于使用Kryo序列化的条件比较苛刻，需要数据类型为原始类型或其对应的数组。
+
+getSerializer 会 根据条件挑选出序列化方式。首先需要支持autoPick为true，然后需要对应的类型可以支持kryo。
+
+支持kryo的类型，有字符串类型，基本数据类型和其对应的数组类型。
+
+```scala
+def getSerializer(ct: ClassTag[_], autoPick: Boolean): Serializer = {
+  // 如果允许自动挑选，并且这种类型的数据支持kryo
+  if (autoPick && canUseKryo(ct)) {
+    kryoSerializer
+  } else {
+    // 否则返回默认序列化
+    defaultSerializer
+  }
+}
+
+// 字符串类型
+private[this] val stringClassTag: ClassTag[String] = implicitly[ClassTag[String]]
+
+private[this] val primitiveAndPrimitiveArrayClassTags: Set[ClassTag[_]] = {
+  // 基本类型
+  val primitiveClassTags = Set[ClassTag[_]](
+      ClassTag.Boolean,
+      ClassTag.Byte,
+      ClassTag.Char,
+      ClassTag.Double,
+      ClassTag.Float,
+      ClassTag.Int,
+      ClassTag.Long,
+      ClassTag.Null,
+      ClassTag.Short
+    )
+    // 基本类型对应的数组
+    val arrayClassTags = primitiveClassTags.map(_.wrap)
+    // 合并类型
+    primitiveClassTags ++ arrayClassTags
+}
+
+def canUseKryo(ct: ClassTag[_]): Boolean = {
+  primitiveAndPrimitiveArrayClassTags.contains(ct) || ct == stringClassTag
+}
+```
+
+
+
+## 
+
