@@ -1,4 +1,4 @@
-# 序列化 #
+# Spark的序列化与压缩 #
 
 spark计算任务，是由不同的节点上共同计算完成的，其中还有中间数据的保存。这些都涉及到了数据的序列化。
 
@@ -8,13 +8,327 @@ spark计算任务，是由不同的节点上共同计算完成的，其中还有
 
 
 
-## UML 类图 ##
 
-这里spark使用了抽象工厂模式。SerializerInstance代表着抽象工厂，SerializationStream代表着序列化流，DeserializationStream代表着反序列化流。这里有两种实现方法，java和kryo。
+
+
+
+## Kryo 序列化 ##
+
+### kryo 初始化 ###
+
+kryo的初始化，在KryoSerializer类里。这里主要是Kryo预先注册需要序列化的类。
+
+```scala
+// 是够需要注册类，才能序列化对应的实例
+private val registrationRequired = conf.getBoolean("spark.kryo.registrationRequired", false)
+
+def newKryo(): Kryo = {
+  // 这里通过EmptyScalaKryoInstantiator工厂，实例化Kryo
+  val instantiator = new EmptyScalaKryoInstantiator
+  val kryo = instantiator.newKryo()
+  kryo.setRegistrationRequired(registrationRequired)
+
+  // 如果没有ClassLoader，则使用当前线程的ClassLoader
+  val oldClassLoader = Thread.currentThread.getContextClassLoader
+  val classLoader = defaultClassLoader.getOrElse(Thread.currentThread.getContextClassLoader)
+
+
+  // 注册类
+  .........
+  
+  kryo.setClassLoader(classLoader)
+  kryo
+}
+```
+
+
+
+serialize方法实现了序列化一个对象，
+
+```scala
+class KryoSerializer(conf: SparkConf) {
+  // 默认分配的缓存初始大小
+  private val bufferSizeKb = conf.getSizeAsKb("spark.kryoserializer.buffer", "64k")
+  // 默认分配的缓存最大值
+  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
+  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
+  private val maxBufferSize = ByteUnit.MiB.toBytes(maxBufferSizeMb).toInt
+    
+    
+  // 实例化KryoOutput， 使用默认的配置
+  def newKryoOutput(): KryoOutput =
+    if (useUnsafe) {
+      new KryoUnsafeOutput(bufferSize, math.max(bufferSize, maxBufferSize))
+    } else {
+      new KryoOutput(bufferSize, math.max(bufferSize, maxBufferSize))
+    }
+  }
+}
+
+
+private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boolean)
+  extends SerializerInstance {
+  // 缓存的Kryo
+  @Nullable private[this] var cachedKryo: Kryo = borrowKryo()
+  
+  // 调用KryoSerializer的newKryoOutput，实例化Kryo的缓存
+  private lazy val output = ks.newKryoOutput()
+
+  override def serialize[T: ClassTag](t: T): ByteBuffer = {
+    // 清除数据
+    output.clear()
+    // 获取Kryo， 如果有缓存，则直接返回。否则需要创建Kryo
+    val kryo = borrowKryo()
+    try {
+      // 序列化数据
+      kryo.writeClassAndObject(output, t)
+    } catch {
+      case e: KryoException if e.getMessage.startsWith("Buffer overflow") =>
+        throw new SparkException(s"Kryo serialization failed: ${e.getMessage}. To avoid this, " +
+          "increase spark.kryoserializer.buffer.max value.", e)
+    } finally {
+      releaseKryo(kryo)
+    }
+    // 返回序列化后的数据，注意output.toBytes会返回新的数组
+    ByteBuffer.wrap(output.toBytes)
+  }
+```
+
+ 
+
+serializeStream方法返回KryoSerializationStream
+
+```scala
+class KryoSerializationStream(
+    serInstance: KryoSerializerInstance,
+    outStream: OutputStream,
+    useUnsafe: Boolean) extends SerializationStream {
+
+  // 通过outStream，来实例化KryoOutput
+  private[this] var output: KryoOutput =
+    if (useUnsafe) new KryoUnsafeOutput(outStream) else new KryoOutput(outStream)
+
+  private[this] var kryo: Kryo = serInstance.borrowKryo()
+
+  override def writeObject[T: ClassTag](t: T): SerializationStream = {
+    // 调用kryo的方法，序列化数据，写入outStream
+    kryo.writeClassAndObject(output, t)
+    this
+  }
+}
+```
+
+
+
+## SerializerManager ##
+
+### 选择序列化方式 ###
+
+SerializerManager提供了getSerializer接口， 会自动选择选用哪种序列化方式。对于使用Kryo序列化的条件比较苛刻，需要数据类型为原始类型或其对应的数组，并且支持autoPick对应的block不是StreamBlock类型）。
+
+从getSerializer的源码可以看到，目前能够支持kryo序列化的类型，有字符串类型，基本数据类型和其对应的数组类型这几种。
+
+```scala
+def getSerializer(ct: ClassTag[_], autoPick: Boolean): Serializer = {
+  // 如果允许自动挑选，并且这种类型的数据支持kryo
+  if (autoPick && canUseKryo(ct)) {
+    kryoSerializer
+  } else {
+    // 否则返回默认序列化
+    defaultSerializer
+  }
+}
+
+// 字符串类型
+private[this] val stringClassTag: ClassTag[String] = implicitly[ClassTag[String]]
+
+private[this] val primitiveAndPrimitiveArrayClassTags: Set[ClassTag[_]] = {
+  // 基本类型
+  val primitiveClassTags = Set[ClassTag[_]](
+      ClassTag.Boolean,
+      ClassTag.Byte,
+      ClassTag.Char,
+      ClassTag.Double,
+      ClassTag.Float,
+      ClassTag.Int,
+      ClassTag.Long,
+      ClassTag.Null,
+      ClassTag.Short
+    )
+    // 基本类型对应的数组
+    val arrayClassTags = primitiveClassTags.map(_.wrap)
+    // 合并类型
+    primitiveClassTags ++ arrayClassTags
+}
+
+def canUseKryo(ct: ClassTag[_]): Boolean = {
+  primitiveAndPrimitiveArrayClassTags.contains(ct) || ct == stringClassTag
+}
+```
+
+
+
+### 序列化数据到内存 ###
+
+dataSerialize方法提供了将数据序列化，然后存到内存中。这里使用了ChunkedByteBufferOutputStream存储序列化的数据。使用了BufferedOutputStream在外层提供了缓存功能。在BufferedOutputStream之外，添加了压缩和序列化的功能。
+
+```scala
+/** Serializes into a chunked byte buffer. */
+def dataSerialize[T: ClassTag](
+    blockId: BlockId,
+    values: Iterator[T]): ChunkedByteBuffer = {
+  // 调用dataSerializeWithExplicitClassTag方法序列化
+  dataSerializeWithExplicitClassTag(blockId, values, implicitly[ClassTag[T]])
+}
+
+/** Serializes into a chunked byte buffer. */
+def dataSerializeWithExplicitClassTag(
+    blockId: BlockId,
+    values: Iterator[_],
+    classTag: ClassTag[_]): ChunkedByteBuffer = {
+  // 实例化ChunkedByteBufferOutputStream，保存序列化数据
+  val bbos = new ChunkedByteBufferOutputStream(1024 * 1024 * 4, ByteBuffer.allocate)
+  // 为bbos装饰为缓冲输出流
+  val byteStream = new BufferedOutputStream(bbos)
+  // StreamBlock类型的数据，不支持autoPick
+  val autoPick = !blockId.isInstanceOf[StreamBlockId]
+  // 获取序列化器
+  val ser = getSerializer(classTag, autoPick).newInstance()
+  // 调用wrapForCompression， 添加压缩流装饰器。
+  // 然后添加序列化流装饰器
+  ser.serializeStream(wrapForCompression(blockId, byteStream)).writeAll(values).close()
+  // 返回序列化数据ChunkedByteBuffer
+  bbos.toChunkedByteBuffer
+}
+```
+
+
+
+### 序列化数据到流 ###
+
+序列化数据写入流，dataSerializeStream方法实现了装饰底层的流，并且将数据写入流中。
+
+```scala
+def dataSerializeStream[T: ClassTag](
+    blockId: BlockId,
+    outputStream: OutputStream,
+    values: Iterator[T]): Unit = {
+  // 实例化缓冲输出流
+  val byteStream = new BufferedOutputStream(outputStream)
+  // StreamBlock类型的数据，不支持autoPick
+  val autoPick = !blockId.isInstanceOf[StreamBlockId]
+  // 获取序列化器
+  val ser = getSerializer(implicitly[ClassTag[T]], autoPick).newInstance()
+  // 调用wrapForCompression， 添加压缩流装饰器。
+  // 然后添加序列化流装饰器
+  ser.serializeStream(wrapForCompression(blockId, byteStream)).writeAll(values).close()
+}
+```
+
+
+
+
+
+## 缓存 ##
+
+BufferedOutputStream 提供了缓存的作用，数据首先写入到BufferedOutputStream的缓存里，如果缓存满了，才会写入被装饰的底层流。
+
+
+
+ChunkedByteBufferOutputStream 提供了多个小块ByteBuffer的数组，数据都会存在在各个ByteBuffer里面。当数据写满后，会新建ByteBuffer添加到数组里。
+
+
+
+ChunkedByteBuffer 包含了ByteBuffer的数组， 提供了只读的功能。可以从ChunkedByteBufferOutputStream生成出来。
+
+
+
+ChunkedByteBufferInputStream包装了ChunkedByteBuffer， 提供流式读取的接口。 
+
+
+
+## 数据压缩 ##
+
+当指定了spark.io.compression.codec配置的值后，spark会选择对应的压缩方式。
+
+目前压缩方式支持三种方式， lz4， lzf， snappy。
+
+压缩支持输入流和输出流，由CompressionCodec接口表示。
+
+```scala
+trait CompressionCodec {
+
+  def compressedOutputStream(s: OutputStream): OutputStream
+
+  def compressedInputStream(s: InputStream): InputStream
+}
+```
+
+每种压缩方式都会实现这个接口。以lz4为例，
+
+```scala
+class LZ4CompressionCodec(conf: SparkConf) extends CompressionCodec {
+
+  override def compressedOutputStream(s: OutputStream): OutputStream = {
+    val blockSize = conf.getSizeAsBytes("spark.io.compression.lz4.blockSize", "32k").toInt
+    // 返回LZ4BlockOutputStream包装的输出流
+    new LZ4BlockOutputStream(s, blockSize)
+  }
+
+  // 返回LZ4BlockInputStream包装的输入流
+  override def compressedInputStream(s: InputStream): InputStream = new LZ4BlockInputStream(s)
+}
+```
+
+
+
+当序列化数据的时候，会根据存储Block的类型，判断是否需要压缩
+
+```
+private[spark] class SerializerManager(
+ 
+  // Broadcast类型的数据是否压缩
+  private[this] val compressBroadcast = conf.getBoolean("spark.broadcast.compress", true)
+  // Shuffle类型的数据是否压缩
+  private[this] val compressShuffle = conf.getBoolean("spark.shuffle.compress", true)
+  // RDD类型的数据是否压缩 
+  private[this] val compressRdds = conf.getBoolean("spark.rdd.compress", false)
+  // 存储在磁盘的shuffle类型的数据，是否压缩
+  private[this] val compressShuffleSpill = conf.getBoolean("spark.shuffle.spill.compress", true)
+
+  // 根据数据的类型，判断是否配置中允许压缩
+  private def shouldCompress(blockId: BlockId): Boolean = {
+    blockId match {
+      case _: ShuffleBlockId => compressShuffle
+      case _: BroadcastBlockId => compressBroadcast
+      case _: RDDBlockId => compressRdds
+      case _: TempLocalBlockId => compressShuffleSpill
+      case _: TempShuffleBlockId => compressShuffle
+      case _ => false
+    }
+  }
+}
+```
+
+
+
+
+
+## UML 类图
+
+这里使用了抽象工厂模式。SerializerInstance代表着抽象工厂，SerializationStream代表着序列化流，DeserializationStream代表着反序列化流。这里有两种实现方法，java和kryo。
+
+Serializer也是SerializerInstance的工厂类，它通过newInstance实例化对应的SerializerInstance。
 
 {% plantuml %}
 
 @startuml spark-serializer
+
+class Serializer
+
+calss JavaSerializer
+
+class KryoSerializer
 
 class SerializerInstance
 
@@ -33,6 +347,16 @@ class KryoSerializerInstance
 class KryoSerializationStream
 
 class KryoDeserializationStream
+
+Serializer <|--  JavaSerializer
+
+Serializer <|--  KryoSerializer
+
+JavaSerializer --> JavaSerializerInstance
+
+KryoSerializer --> KryoSerializerInstance
+
+Serializer --> SerializerInstance 
 
 SerializerInstance --> SerializationStream
 
@@ -64,15 +388,16 @@ KryoSerializerInstance --> KryoDeserializationStream
 
 
 
-## Java序列化 ##
+## Java序列化
 
-serialize方法实现了序列化一个对象，它调用了serializeStream生成流，然后写入数据。
+JavaSerializerInstance负责java序列化的实现。它的serialize方法实现了序列化一个对象，它的serializeStream方法提供了序列化的流。
 
 ```scala
 private[spark] class JavaSerializerInstance(
     counterReset: Int, extraDebugInfo: Boolean, defaultClassLoader: ClassLoader)
   extends SerializerInstance {
-
+ 
+  // 它调用了serializeStream生成流，然后写入数据。
   override def serialize[T: ClassTag](t: T): ByteBuffer = {
     // 生成bytebuffer输出流
     val bos = new ByteBufferOutputStream()
@@ -195,161 +520,4 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
 
 
 
-## Kryo 序列化 ##
-
-### kryo 初始化 ###
-
-kryo的初始化，在KryoSerializer类里。这里主要是Kryo预先注册需要序列化的类。
-
-```scala
-// 是够需要注册类，才能序列化对应的实例
-private val registrationRequired = conf.getBoolean("spark.kryo.registrationRequired", false)
-
-def newKryo(): Kryo = {
-  // 这里通过EmptyScalaKryoInstantiator工厂，实例化Kryo
-  val instantiator = new EmptyScalaKryoInstantiator
-  val kryo = instantiator.newKryo()
-  kryo.setRegistrationRequired(registrationRequired)
-
-  // 如果没有ClassLoader，则使用当前线程的ClassLoader
-  val oldClassLoader = Thread.currentThread.getContextClassLoader
-  val classLoader = defaultClassLoader.getOrElse(Thread.currentThread.getContextClassLoader)
-
-
-  // 注册类
-  .........
-  
-  kryo.setClassLoader(classLoader)
-  kryo
-}
-```
-
-
-
-serialize方法实现了序列化一个对象，
-
-```scala
-class KryoSerializer(conf: SparkConf) {
-  // 默认分配的缓存初始大小
-  private val bufferSizeKb = conf.getSizeAsKb("spark.kryoserializer.buffer", "64k")
-  // 默认分配的缓存最大值
-  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
-  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
-  private val maxBufferSize = ByteUnit.MiB.toBytes(maxBufferSizeMb).toInt
-    
-    
-  // 实例化KryoOutput， 使用默认的配置
-  def newKryoOutput(): KryoOutput =
-    if (useUnsafe) {
-      new KryoUnsafeOutput(bufferSize, math.max(bufferSize, maxBufferSize))
-    } else {
-      new KryoOutput(bufferSize, math.max(bufferSize, maxBufferSize))
-    }
-  }
-}
-
-
-private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boolean)
-  extends SerializerInstance {
-  // 缓存的Kryo
-  @Nullable private[this] var cachedKryo: Kryo = borrowKryo()
-  
-  // 调用KryoSerializer的newKryoOutput，实例化Kryo的缓存
-  private lazy val output = ks.newKryoOutput()
-
-  override def serialize[T: ClassTag](t: T): ByteBuffer = {
-    // 清除数据
-    output.clear()
-    // 获取Kryo， 如果有缓存，则直接返回。否则需要创建Kryo
-    val kryo = borrowKryo()
-    try {
-      // 序列化数据
-      kryo.writeClassAndObject(output, t)
-    } catch {
-      case e: KryoException if e.getMessage.startsWith("Buffer overflow") =>
-        throw new SparkException(s"Kryo serialization failed: ${e.getMessage}. To avoid this, " +
-          "increase spark.kryoserializer.buffer.max value.", e)
-    } finally {
-      releaseKryo(kryo)
-    }
-    // 返回序列化后的数据，注意output.toBytes会返回新的数组
-    ByteBuffer.wrap(output.toBytes)
-  }
-```
-
- 
-
-serializeStream方法返回KryoSerializationStream
-
-```scala
-class KryoSerializationStream(
-    serInstance: KryoSerializerInstance,
-    outStream: OutputStream,
-    useUnsafe: Boolean) extends SerializationStream {
-
-  // 通过outStream，来实例化KryoOutput
-  private[this] var output: KryoOutput =
-    if (useUnsafe) new KryoUnsafeOutput(outStream) else new KryoOutput(outStream)
-
-  private[this] var kryo: Kryo = serInstance.borrowKryo()
-
-  override def writeObject[T: ClassTag](t: T): SerializationStream = {
-    // 调用kryo的方法，序列化数据，写入outStream
-    kryo.writeClassAndObject(output, t)
-    this
-  }
-}
-```
-
-
-
-## SerializerManager ##
-
-SerializerManager会自动选择选用哪种序列化。SerializerManager对于使用Kryo序列化的条件比较苛刻，需要数据类型为原始类型或其对应的数组。
-
-getSerializer 会 根据条件挑选出序列化方式。首先需要支持autoPick为true，然后需要对应的类型可以支持kryo。
-
-支持kryo的类型，有字符串类型，基本数据类型和其对应的数组类型。
-
-```scala
-def getSerializer(ct: ClassTag[_], autoPick: Boolean): Serializer = {
-  // 如果允许自动挑选，并且这种类型的数据支持kryo
-  if (autoPick && canUseKryo(ct)) {
-    kryoSerializer
-  } else {
-    // 否则返回默认序列化
-    defaultSerializer
-  }
-}
-
-// 字符串类型
-private[this] val stringClassTag: ClassTag[String] = implicitly[ClassTag[String]]
-
-private[this] val primitiveAndPrimitiveArrayClassTags: Set[ClassTag[_]] = {
-  // 基本类型
-  val primitiveClassTags = Set[ClassTag[_]](
-      ClassTag.Boolean,
-      ClassTag.Byte,
-      ClassTag.Char,
-      ClassTag.Double,
-      ClassTag.Float,
-      ClassTag.Int,
-      ClassTag.Long,
-      ClassTag.Null,
-      ClassTag.Short
-    )
-    // 基本类型对应的数组
-    val arrayClassTags = primitiveClassTags.map(_.wrap)
-    // 合并类型
-    primitiveClassTags ++ arrayClassTags
-}
-
-def canUseKryo(ct: ClassTag[_]): Boolean = {
-  primitiveAndPrimitiveArrayClassTags.contains(ct) || ct == stringClassTag
-}
-```
-
-
-
 ## 
-
