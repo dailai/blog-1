@@ -1,6 +1,6 @@
 # 分区器 #
 
-当触发到shuffle的时候，就需要分区器指定每个数据的对应的分区地址。分区器的接口很简单，
+当触发到shuffle的时候，分区器会决定数据分配到哪个分区。分区器的接口很简单，
 
 ```scala
 abstract class Partitioner extends Serializable {
@@ -15,7 +15,7 @@ abstract class Partitioner extends Serializable {
 
 ## HashPartitioner ##
 
-HashPartitioner的原理很简单，只是计算key的hashcode，然后以分区数目取余数。注意HashPartition而不能支持key为数组类型。
+HashPartitioner的原理很简单，只是计算key的hashcode，然后对新分区的数目取余。所以HashPartitioner最重要的属性是新分区的数量。注意HashPartition不能支持key为数组类型。
 
 ```scala
 def getPartition(key: Any): Int = key match {
@@ -33,22 +33,25 @@ def nonNegativeMod(x: Int, mod: Int): Int = {
 
 ## RangePartitioner ##
 
-RangePartitioner的原理会稍微复杂一些，会遍历rdd的所有分区，从每个分区都会采样，然后根据样本，生成每个新的分区的范围值。根据范围值，就可以把key分布到对应的分区索引。
+RangePartitioner的原理会稍微复杂一些，会遍历rdd的所有分区，从每个分区都会采样，然后根据样本，生成新分区的边界值，这样就可以根据key把数据分布到对应的新分区。
 
-采样算法使用的是蓄水池采样。它的使用场景是从不知道大小的集合里，能够等概率的提取k个元素。算法原理是：
+### 蓄水池采样 ###
 
-1. 先从集合遍历k个元素，存储起来
-2. 依次遍历余下的元素，比如遍历第m个元素，然后生成[0, m)de随机数 i，如果小于k，则替换掉原来的第i个元素
+采样算法使用的是蓄水池采样。它的使用场景是从不知道大小的集合里，只需要一次遍历，就能够等概率的提取k个元素。算法原理是：
 
-```
+1. 先从集合的前k个元素，存储到蓄水池
+2. 依次遍历余下的元素，比如遍历第m个元素，然后生成[0, m)区间的随机数 i。如果 i 小于 k，则替换掉原来的第 i 个元素
+
+```scala
 def reservoirSampleAndCount[T: ClassTag](
     input: Iterator[T],
     k: Int,
     seed: Long = Random.nextLong())
   : (Array[T], Long) = {
+  // 结果集合
   val reservoir = new Array[T](k)
-  // Put the first k elements in the reservoir.
   var i = 0
+  // 取出前 k 个元素
   while (i < k && input.hasNext) {
     val item = input.next()
     reservoir(i) = item
@@ -60,6 +63,7 @@ def reservoirSampleAndCount[T: ClassTag](
     // 如果分区的数据都已经遍历完，则直接返回
     val trimReservoir = new Array[T](i)
     System.arraycopy(reservoir, 0, trimReservoir, 0, i)
+    // 返回采样结果和已遍历的数目
     (trimReservoir, i)
   } else {
     // 如果数据还有剩余，则进行蓄水池采样
@@ -81,9 +85,9 @@ def reservoirSampleAndCount[T: ClassTag](
 }
 ```
 
-上述reservoirSampleAndCount方法是从一个分区里采样。sketch会调用rdd的mapPartitionsWithIndex，对每个分区采样，并且调用collect返回采样结果。
+RangePartitioner会调用reservoirSampleAndCount对每个分区采样，并且调用collect返回采样结果。
 
-```
+```scala
 def sketch[K : ClassTag](
     rdd: RDD[K],
     sampleSizePerPartition: Int): (Long, Array[(Int, Long, Array[K])]) = {
@@ -99,6 +103,10 @@ def sketch[K : ClassTag](
   (numItems, sketched)
 }
 ```
+
+
+
+### 生成边界值 ###
 
 采样结果出来后，还需要处理。这里首先会将分区的采样结果分成两种情况，一种是采样的数目小于预期，这种情况需要重新采样，获取足够的样本。
 
@@ -171,11 +179,11 @@ def determineBounds[K : Ordering : ClassTag](
 
 ## 默认分区器 ##
 
-当有时候触发shuffle，但没有指定partitioner。spark会自动生成默认的分区器。
+当触发shuffle，但没有指定partitioner。spark会自动生成默认的分区器。
 
-首先去寻找父类rdd的partitioner，找到其中的最大值(按照分区数量排序)。
+首先去寻找父类rdd（注意不是所有祖先的rdd，而仅仅是上一级的rdd）的partitioner，则返回其中的最大partitioner (按照分区数量排序)。
 
-如果父类rdd没有，但是spark.default.parallelism有在配置中指定，则使用该数值，创建HashPartitioner。
+如果父类rdd没有指定partitioner，但是spark.default.parallelism有在配置中指定，则使用该数值，创建HashPartitioner。
 
 否则，就找到父类rdd的最大分区数目，使用该数值，创建HashPartitioner。
 
@@ -194,4 +202,34 @@ def defaultPartitioner(rdd: RDD[_], others: RDD[_]*): Partitioner = {
   }
 }
 ```
+
+
+
+## 自定义partitioner ##
+
+HashPartitioner的性能会比较好，但是容易造成划分不均衡，这样会导致shuffle倾斜。RangePartitioner的划分会比较公平，但是性能相对比较差，因为它需要遍历一次所有的数据，才能完成抽样。如果我们对于数据本身，有着比较好的理解，那么可以自定义partitioner，既能防止shuffle倾斜，也不需要像RangePartitioner那样遍历一次数据。
+
+比如有一批数据，是关于所有商品销售记录。我们需要计算出各种商品的销售情况。我们根据以往的经验，商品a卖的比较好，占了整个销售总和的10%， 其余的都差不多。那么可以实现自定义partitioner，将商品a的划分到一个分区，其余的商品根据hashCode随机分配。
+
+```scala
+class MyPartitioner extends Partitioner {
+    // 分区的数目
+    def numPartitions: Int = 10
+    
+    // 计算key对应的分区索引
+    def getPartition(key: Any): Int = {
+        val value = key.asInstanceOf(String)
+        value match {
+            case "商品a" => 0
+			case _ => Utils.nonNegativeMod(key.hashCode, numPartitions-1) + 1   
+        }
+    }
+}
+```
+
+
+
+
+
+
 
