@@ -1,6 +1,6 @@
 # 分区器 #
 
-当触发到shuffle的时候，分区器会决定数据分配到哪个分区。分区器的接口很简单，
+当触发到shuffle的时候，会将数据重新打乱分配。分区器会决定数据分配到哪个分区。分区器的接口很简单，
 
 ```scala
 abstract class Partitioner extends Serializable {
@@ -11,7 +11,7 @@ abstract class Partitioner extends Serializable {
 }
 ```
 
-分区器的实现有两种，HashPartitioner和RangePartitioner。
+spark有两种内置的分区器，HashPartitioner和RangePartitioner。
 
 ## HashPartitioner ##
 
@@ -111,19 +111,26 @@ def sketch[K : ClassTag](
 采样结果出来后，还需要处理。这里首先会将分区的采样结果分成两种情况，一种是采样的数目小于预期，这种情况需要重新采样，获取足够的样本。
 
 ```scala
-// 计算平均系数，表明每遍历 1个元素，应该获得的采样数目
+// 设置采样总数
+val sampleSize = math.min(20.0 * partitions, 1e6)
+// 每个分区的采样数，这里乘以3，是为了防止某些分区过小，导致采样总量不足
+val sampleSizePerPartition = math.ceil(3.0 * sampleSize / rdd.partitions.length).toInt
+// 抽样， numItems为遍历的数量， sketched为采样结果
+val (numItems, sketched) = RangePartitioner.sketch(rdd.map(_._1), sampleSizePerPartition)
+
+// 计算平均系数，表明每遍历一个元素，获得采样的数目
 val fraction = math.min(sampleSize / math.max(numItems, 1L), 1.0)
 // 存储结果， 存储类型为 (key, 权重)
 val candidates = ArrayBuffer.empty[(K, Float)]
 // 采样数目小于预期的partition
 val imbalancedPartitions = mutable.Set.empty[Int]
-// 遍历采样结果，idx表示分区索引，n表示遍历数目，sample为该分区的采样结果
+// 遍历采样结果，idx表示分区索引，n表示遍历数目，sample为该分区的样本值
 sketched.foreach { case (idx, n, sample) =>
     if (fraction * n > sampleSizePerPartition) {
-        // 如果预期的采样结果，大于实际的采样结果，则该分区需要重新采样
+        // 如果预期的采样结果数量，大于实际的采样结果数量，则该分区需要重新采样
         imbalancedPartitions += idx
     } else {
-        // 计算权重
+        // 计算权重，遍历数目越多，则表明可信度更高，权重也越高
         val weight = (n.toDouble / sample.length).toFloat
         // 添加到candidates
         for (key <- sample) {
@@ -132,7 +139,7 @@ sketched.foreach { case (idx, n, sample) =>
     }
     // 分区重新采样
     if (imbalancedPartitions.nonEmpty) {
-        // 实例PartitionPruningRDD，使用imbalancedPartitions挑选出需要采样的分区
+        // 实例PartitionPruningRDD，使用imbalancedPartitions挑选出，哪些分区需要重新采样
         val imbalanced = new PartitionPruningRDD(rdd.map(_._1), imbalancedPartitions.contains)
         // 调用rdd的sample取样
         val reSampled = imbalanced.sample(withReplacement = false, fraction, seed).collect()
@@ -221,7 +228,7 @@ class MyPartitioner extends Partitioner {
         val value = key.asInstanceOf(String)
         value match {
             case "商品a" => 0
-			case _ => Utils.nonNegativeMod(key.hashCode, numPartitions-1) + 1   
+            case _ => Utils.nonNegativeMod(key.hashCode, numPartitions-1) + 1   
         }
     }
 }
