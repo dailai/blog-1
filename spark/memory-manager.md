@@ -60,6 +60,8 @@ MemoryAllocator
 
 HeapMemoryAllocator
 
+
+
 直接申请数组
 
 堆外内存
@@ -70,5 +72,19 @@ UnsafeMemoryAllocator
 
 调用Unsafe的allocateMemory方法，分配堆外内存
 
+```scala
+public class UnsafeMemoryAllocator implements MemoryAllocator {
 
+  @Override
+  public MemoryBlock allocate(long size) throws OutOfMemoryError {
+    // Platform 使用 unsafe分配堆外内存
+    long address = Platform.allocateMemory(size);
+    MemoryBlock memory = new MemoryBlock(null, address, size);
+    if (MemoryAllocator.MEMORY_DEBUG_FILL_ENABLED) {
+      memory.fill(MemoryAllocator.MEMORY_DEBUG_FILL_CLEAN_VALUE);
+    }
+    return memory;
+  }
+}
+```
 
