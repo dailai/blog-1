@@ -4,11 +4,11 @@ spark计算任务，是由不同的节点上共同计算完成的，其中还有
 
 ## 序列化种类 ##
 
-这篇文章讲的是spark 2.2，目前支持Java自带的序列化，还有KryoSerializer。KryoSerializer目前只能支持简单的数据类型，2.4对KryoSerializer的支持会更好。   
+这篇文章讲的是spark 2.2，支持Java自带的序列化，还有KryoSerializer。KryoSerializer目前只能支持简单的数据类型，2.4对KryoSerializer的支持会更好。   
 
-SerializerManager提供了getSerializer接口， 会自动选择选用哪种序列化方式， 默认为Java自带的序列化。对于使用Kryo序列化的条件比较苛刻，需要数据类型为原始类型或其对应的数组，并且支持autoPick对应的block不是StreamBlock类型）。
+SerializerManager提供了getSerializer接口， 会自动选择选用哪种序列化方式， 默认为Java自带的序列化。对于使用Kryo序列化的条件比较苛刻，需要数据类型为原始类型或其对应的数组，并且支持autoPick（对应的block不是StreamBlock类型）。
 
-从getSerializer的源码可以看到，目前能够支持kryo序列化的类型，有字符串类型，基本数据类型和其对应的数组类型这几种。
+从getSerializer的源码可以看到，目前支持kryo序列化的类型，有字符串类型，基本数据类型和其对应的数组类型这几种。
 
 ```scala
 def getSerializer(ct: ClassTag[_], autoPick: Boolean): Serializer = {
@@ -52,7 +52,7 @@ def canUseKryo(ct: ClassTag[_]): Boolean = {
 
 ## UML 类图
 
-序列化涉及到了多个类，这里使用了抽象工厂模式。SerializerInstance代表着抽象工厂，SerializationStream代表着序列化流，DeserializationStream代表着反序列化流。
+序列化的过程涉及到了多个类，这里使用了抽象工厂模式。SerializerInstance代表着抽象工厂，SerializationStream代表着序列化流，DeserializationStream代表着反序列化流。
 
 Serializer也是SerializerInstance的工厂类，它通过newInstance实例化对应的SerializerInstance。
 
@@ -126,11 +126,11 @@ KryoSerializerInstance --> KryoDeserializationStream
 
 ## 序列化相关的缓存流 ##
 
-spark序列化数据，提供了写入到缓存中和流。这里涉及到了下面几个类
+spark序列化数据，提供了写入到缓存中和输出流。这里涉及到了下面几个类
 
 ByteArrayOutputStream 将数据存储在字节数组里，并且可以自动扩充数组大小。
 
-ByteBufferOutputStream 继承ByteArrayOutputStream， 提供了将字节数组转换为ByteBuffer的功能。
+ByteBufferOutputStream 继承ByteArrayOutputStream， 提供了将数据转换为ByteBuffer的功能。
 
 BufferedOutputStream 提供了缓存的作用，数据首先写入到BufferedOutputStream的缓存里，如果缓存满了，才会写入被装饰的底层流。
 
@@ -198,7 +198,7 @@ private[spark] class JavaSerializationStream(
         throw SerializationDebugger.improveException(t, e)
     }
     counter += 1
-    // 每写入counterReset的数据，则调用reset
+    // 每写入counterReset条数据，则调用reset
     if (counterReset > 0 && counter >= counterReset) {
       objOut.reset()
       counter = 0
@@ -234,10 +234,6 @@ private[spark] class JavaSerializerInstance(
     in.readObject()
   }
 
-  override def serializeStream(s: OutputStream): SerializationStream = {
-    new JavaSerializationStream(s, counterReset, extraDebugInfo)
-  }
-
   override def deserializeStream(s: InputStream): DeserializationStream = {
     new JavaDeserializationStream(s, defaultClassLoader)
   }
@@ -252,7 +248,7 @@ private[spark] class JavaSerializerInstance(
 
 JavaDeserializationStream的原理，它使用了ObjectInputStream类。ObjectInputStream类是属于java库的，它提供了反序列化的功能。这里实现了resolveClass方法，提供了指定ClassLoader来加载类。
 
-```
+```scala
 private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoader)
   extends DeserializationStream {
   
@@ -294,7 +290,7 @@ def newKryo(): Kryo = {
   val classLoader = defaultClassLoader.getOrElse(Thread.currentThread.getContextClassLoader)
 
 
-  // 注册类
+  // 向kryo注册类信息
   .........
   
   kryo.setClassLoader(classLoader)
@@ -477,7 +473,7 @@ class LZ4CompressionCodec(conf: SparkConf) extends CompressionCodec {
 
 当序列化数据的时候，会根据存储Block的类型，判断是否需要压缩
 
-```
+```scala
 private[spark] class SerializerManager(
  
   // Broadcast类型的数据是否压缩
