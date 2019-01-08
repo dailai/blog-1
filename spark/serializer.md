@@ -273,45 +273,32 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
 
 ## Kryo 序列化 ##
 
-kryo的初始化，在KryoSerializer类里。这里主要是Kryo预先注册需要序列化的类。
+kryo的初始化，在KryoSerializer类的newKryo方法，Kryo预先注册需要序列化的类。
+
+newKryoOutput方法会实例化KryoOutput, 作为数据存储的缓冲区。
 
 ```scala
-// 是够需要注册类，才能序列化对应的实例
-private val registrationRequired = conf.getBoolean("spark.kryo.registrationRequired", false)
+class KryoSerializer(conf: SparkConf)
+  extends org.apache.spark.serializer.Serializer {
 
-def newKryo(): Kryo = {
-  // 这里通过EmptyScalaKryoInstantiator工厂，实例化Kryo
-  val instantiator = new EmptyScalaKryoInstantiator
-  val kryo = instantiator.newKryo()
-  kryo.setRegistrationRequired(registrationRequired)
+  // 是否需要注册类，才能序列化对应的实例
+  private val registrationRequired = conf.getBoolean("spark.kryo.registrationRequired", false)
 
-  // 如果没有ClassLoader，则使用当前线程的ClassLoader
-  val oldClassLoader = Thread.currentThread.getContextClassLoader
-  val classLoader = defaultClassLoader.getOrElse(Thread.currentThread.getContextClassLoader)
+  def newKryo(): Kryo = {
+    // 这里通过EmptyScalaKryoInstantiator工厂，实例化Kryo
+    val instantiator = new EmptyScalaKryoInstantiator
+    val kryo = instantiator.newKryo()
+    kryo.setRegistrationRequired(registrationRequired)
+    // 如果没有ClassLoader，则使用当前线程的ClassLoader
+    val oldClassLoader = Thread.currentThread.getContextClassLoader
+    val classLoader = defaultClassLoader.getOrElse(Thread.currentThread.getContextClassLoader)
 
-
-  // 向kryo注册类信息
-  .........
-  
-  kryo.setClassLoader(classLoader)
-  kryo
-}
-```
-
-
-
-serialize方法实现了序列化一个对象，
-
-```scala
-class KryoSerializer(conf: SparkConf) {
-  // 默认分配的缓存初始大小
-  private val bufferSizeKb = conf.getSizeAsKb("spark.kryoserializer.buffer", "64k")
-  // 默认分配的缓存最大值
-  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
-  val maxBufferSizeMb = conf.getSizeAsMb("spark.kryoserializer.buffer.max", "64m").toInt
-  private val maxBufferSize = ByteUnit.MiB.toBytes(maxBufferSizeMb).toInt
-    
-    
+    // 向kryo注册类信息
+    .........
+    kryo.setClassLoader(classLoader)
+    kryo
+  }
+      
   // 实例化KryoOutput， 使用默认的配置
   def newKryoOutput(): KryoOutput =
     if (useUnsafe) {
@@ -320,21 +307,27 @@ class KryoSerializer(conf: SparkConf) {
       new KryoOutput(bufferSize, math.max(bufferSize, maxBufferSize))
     }
   }
+
 }
+```
 
 
-private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boolean)
+
+类的serialize方法实现了序列化一个对象，
+
+```scala
+class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boolean)
   extends SerializerInstance {
   // 缓存的Kryo
   @Nullable private[this] var cachedKryo: Kryo = borrowKryo()
   
-  // 调用KryoSerializer的newKryoOutput，实例化Kryo的缓存
+  // 调用KryoSerializer的newKryoOutput，实例化Kryo的缓存区
   private lazy val output = ks.newKryoOutput()
 
   override def serialize[T: ClassTag](t: T): ByteBuffer = {
     // 清除数据
     output.clear()
-    // 获取Kryo， 如果有缓存，则直接返回。否则需要创建Kryo
+    // 如果已经有Kryo的实例，则直接返回。否则需要创建Kryo
     val kryo = borrowKryo()
     try {
       // 序列化数据
@@ -349,6 +342,12 @@ private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boole
     // 返回序列化后的数据，注意output.toBytes会返回新的数组
     ByteBuffer.wrap(output.toBytes)
   }
+      
+      
+  private lazy val output = ks.newKryoOutput()
+      
+}
+
 ```
 
  
@@ -361,7 +360,7 @@ class KryoSerializationStream(
     outStream: OutputStream,
     useUnsafe: Boolean) extends SerializationStream {
 
-  // 通过outStream，来实例化KryoOutput
+  // 将outStream 装饰成 KryoOutput输出
   private[this] var output: KryoOutput =
     if (useUnsafe) new KryoUnsafeOutput(outStream) else new KryoOutput(outStream)
 
@@ -376,6 +375,10 @@ class KryoSerializationStream(
 ```
 
 
+
+## SerializerManager ###
+
+SerializerManager统一了Java序列化和Kryo序列化的接口。我们只需要调用SerializerManager的方法，就可很方便的序列化数据。
 
 ### 序列化数据到内存 ###
 
