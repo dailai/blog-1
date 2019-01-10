@@ -370,13 +370,11 @@ MemoryManager 负责管理下列内存池
 
 #### 静态资源管理 ####
 
-静态资源管理会初始化各个内存池的大小，之后内存池的大小不能改变。
+静态资源管理会初始化各个内存池的大小，之后内存池的大小不能改变。内存分为两个用途，一个是缓存数据使用的，另一部分是任务执行使用的。静态资源管理不支持用于数据缓存的堆外内存。
 
-静态资源管理不支持用于存储的堆外内存。
+getMaxStorageMemory方法返回缓存数据的内存容量
 
-内存分为两个用途，一个是缓存数据使用的，另一部分是任务执行使用的。
-
-getMaxStorageMemory方法
+getMaxExecutionMemory方法返回执行任务的内存容量
 
 ```scala
 private[spark] object StaticMemoryManager {
@@ -385,6 +383,7 @@ private[spark] object StaticMemoryManager {
 
   // 返回存储数据的内存容量
   private def getMaxStorageMemory(conf: SparkConf): Long = {
+    // 获取
     val systemMaxMemory = conf.getLong("spark.testing.memory", Runtime.getRuntime.maxMemory)
     val memoryFraction = conf.getDouble("spark.storage.memoryFraction", 0.6)
     val safetyFraction = conf.getDouble("spark.storage.safetyFraction", 0.9)
@@ -398,18 +397,15 @@ private[spark] object StaticMemoryManager {
     val safetyFraction = conf.getDouble("spark.shuffle.safetyFraction", 0.8)
     (systemMaxMemory * memoryFraction * safetyFraction).toLong
   }
-
 }
 ```
 
 
 
-
-
-
+StaticMemoryManager的acquireStorageMemory提供申请缓存数据的内存，acquireExecutionMemory提供申请执行任务的内存。
 
 ```scala
-private[spark] class StaticMemoryManager(
+class StaticMemoryManager(
     conf: SparkConf,
     maxOnHeapExecutionMemory: Long,
     override val maxOnHeapStorageMemory: Long,
@@ -452,7 +448,6 @@ private[spark] class StaticMemoryManager(
     }
   }
   
-  private[memory]
   override def acquireExecutionMemory(
       numBytes: Long,
       taskAttemptId: Long,
@@ -470,25 +465,163 @@ private[spark] class StaticMemoryManager(
 
 #### 动态资源管理 ####
 
+动态资源管理的原理是，不严格划分缓存数据和任务执行的内存容量。当其中一个内存不足时，可以相互共享内存。这样就可以提高内存的使用效率。
+
+acquireStorageMemory方法提供了申请storage用途的内存。如果当前storage的内存不够，则试图向execution借用空闲的内存。
+
+```scala
+class UnifiedMemoryManager {
+      
+  override def acquireStorageMemory(
+      blockId: BlockId,
+      numBytes: Long,
+      memoryMode: MemoryMode): Boolean = synchronized {
+    // 根据内存在堆外还是堆内，返回对应的内存池
+    val (executionPool, storagePool, maxMemory) = memoryMode match {
+      case MemoryMode.ON_HEAP => (
+        onHeapExecutionMemoryPool,
+        onHeapStorageMemoryPool,
+        maxOnHeapStorageMemory)
+      case MemoryMode.OFF_HEAP => (
+        offHeapExecutionMemoryPool,
+        offHeapStorageMemoryPool,
+        maxOffHeapStorageMemory)
+    }
+    // 申请内存超过了最大容量，返回false，表示没有申请成功
+    if (numBytes > maxMemory) {
+      logInfo(s"Will not store $blockId as the required space ($numBytes bytes) exceeds our " +
+        s"memory limit ($maxMemory bytes)")
+      return false
+    }
+    // 如果当前storage的内存池不够，则向execution的内存池借用
+    if (numBytes > storagePool.memoryFree) {
+      // 计算需要借用的内存大小，不能小于execution的空闲内存
+      val memoryBorrowedFromExecution = Math.min(executionPool.memoryFree,
+        numBytes - storagePool.memoryFree)
+      // 减少execution内存池的容量
+      executionPool.decrementPoolSize(memoryBorrowedFromExecution)
+      // 增加storage内存池的容量
+      storagePool.incrementPoolSize(memoryBorrowedFromExecution)
+    }
+    // 向storage内存池申请
+    storagePool.acquireMemory(blockId, numBytes)
+  }
+}
 ```
-UnifiedMemoryManager
+
+
+
+acquireExecutionMemory方法提供了申请execution用途的内存。如果当execution的内存不够，它会借用storage的内存。
+
+```scala
+override private[memory] def acquireExecutionMemory(
+    numBytes: Long,
+    taskAttemptId: Long,
+    memoryMode: MemoryMode): Long = synchronized {
+  // 根据内存在堆外还是堆内，返回对应的内存池
+  // storageRegionSize表示storage类型，当内存不足时，可使用的最高容量
+  // maxMemory表示总的内存大小，包括storage和execution
+  val (executionPool, storagePool, storageRegionSize, maxMemory) = memoryMode match {
+    case MemoryMode.ON_HEAP => (
+      onHeapExecutionMemoryPool,
+      onHeapStorageMemoryPool,
+      onHeapStorageRegionSize,
+      maxHeapMemory)
+    case MemoryMode.OFF_HEAP => (
+      offHeapExecutionMemoryPool,
+      offHeapStorageMemoryPool,
+      offHeapStorageMemory,
+      maxOffHeapMemory)
+  }
+
+  // 借用storage内存
+  def maybeGrowExecutionPool(extraMemoryNeeded: Long): Unit = {
+    if (extraMemoryNeeded > 0) {
+      // 如果storage内存池有空闲内存，
+      // 或者storage内存池的容量大于最低容量storageRegionSize
+      val memoryReclaimableFromStorage = math.max(
+        storagePool.memoryFree,
+        storagePool.poolSize - storageRegionSize)
+      if (memoryReclaimableFromStorage > 0) {
+        // 尝试释放空间，有可能会将缓存的数据块，溢写到磁盘
+        val spaceToReclaim = storagePool.freeSpaceToShrinkPool(
+          math.min(extraMemoryNeeded, memoryReclaimableFromStorage))
+        // 减少storage内存池的容量
+        storagePool.decrementPoolSize(spaceToReclaim)
+        // 增加execution内存池的容量
+        executionPool.incrementPoolSize(spaceToReclaim)
+      }
+    }
+  }
+
+  // 计算最大的execution的内存容量
+  def computeMaxExecutionPoolSize(): Long = {
+    maxMemory - math.min(storagePool.memoryUsed, storageRegionSize)
+  }
+
+  // 向executionPool申请内存，maybeGrowExecutionPool和computeMaxExecutionPoolSize函数，
+  // 会在每次尝试申请都会调用
+  executionPool.acquireMemory(
+    numBytes, taskAttemptId, maybeGrowExecutionPool, computeMaxExecutionPoolSize)
+}
 ```
 
 
 
+## 申请storage内存 ##
 
+当spark缓存数据的时候，会申请storage类型的内存。我们通过MemoryStore类，查看它的申请流程。
 
-## 内存消费端 ##
+putBytes是将数据缓存到内存中。它申请内存的方法很简单，首先向memoryManager申请，如果memoryManager同意，直接调用_bytes函数，生成ChunkedByteBuffer。
 
-
-
-
-
+```scala
+class MemoryStore {
+  
+  def putBytes[T: ClassTag](
+      blockId: BlockId,
+      size: Long,
+      memoryMode: MemoryMode,
+      _bytes: () => ChunkedByteBuffer): Boolean = {
+    // 申请storage内存
+    if (memoryManager.acquireStorageMemory(blockId, size, memoryMode)) {
+      // 生成ChunkedByteBuffer，里面存储着要缓存的数据
+      val bytes = _bytes()
+      assert(bytes.size == size)
+      val entry = new SerializedMemoryEntry[T](bytes, memoryMode, implicitly[ClassTag[T]])
+      entries.synchronized {
+        entries.put(blockId, entry)
+      }
+      true
+    } else {
+      false
+    }
+  }
+}
 ```
-MemoryConsumer
+
+
+
+## 申请execution内存 ##
+
+
+
+MemoryConsumer提供了申请和释放内存的接口，并且支持数据溢写到磁盘。接口如下
+
+```scala
+public abstract class MemoryConsumer {
+  // taskMemoryManager实例
+  protected final TaskMemoryManager taskMemoryManager;
+  // 释放内存，将数据溢写到磁盘
+  public abstract long spill(long size, MemoryConsumer trigger) throws IOException;
+  // 分配内存，返回形式为LongArray
+  public LongArray allocateArray(long size) {}
+  // 分配内存，返回形式为MemoryBlock
+  protected MemoryBlock allocatePage(long required) {}
+  // 释放内存
+  public void freeMemory(long size) {}
 ```
 
-提供了申请和释放内存的接口，并且支持数据溢写到磁盘。
+ 
 
 
 
@@ -512,7 +645,11 @@ TaskMemoryManager
 
 
 
-任务内存管理
+## TaskMemoryManager ##
+
+TaskMemoryManager负责任务执行的内存管理，它基于MemoryManager扩展了更加丰富的操作。
+
+
 
 ```
 TaskMemoryManager
@@ -598,41 +735,6 @@ private final MemoryBlock[] pageTable = new MemoryBlock[PAGE_TABLE_SIZE];
 
 // 表示生成MemoryBlock的pagenum，这个对应着在列表pageTable的索引
 private final BitSet allocatedPages = new BitSet(PAGE_TABLE_SIZE);
-```
-
-
-
-
-
-存储内存
-
-```scala
-private[spark] class MemoryStore(
-
-  def putBytes[T: ClassTag](
-      blockId: BlockId,
-      size: Long,
-      memoryMode: MemoryMode,
-      _bytes: () => ChunkedByteBuffer): Boolean = {
-    require(!contains(blockId), s"Block $blockId is already present in the MemoryStore")
-    // 调用acquireStorageMemory申请内存
-    if (memoryManager.acquireStorageMemory(blockId, size, memoryMode)) {
-      // We acquired enough memory for the block, so go ahead and put it
-      // 使用传递的函数，生成ChunkedByteBuffer
-      val bytes = _bytes()
-      assert(bytes.size == size)
-      val entry = new SerializedMemoryEntry[T](bytes, memoryMode, implicitly[ClassTag[T]])
-      entries.synchronized {
-        entries.put(blockId, entry)
-      }
-      logInfo("Block %s stored as bytes in memory (estimated size %s, free %s)".format(
-        blockId, Utils.bytesToString(size), Utils.bytesToString(maxMemory - blocksMemoryUsed)))
-      true
-    } else {
-      false
-    }
-  }    
-}
 ```
 
 
