@@ -1,4 +1,4 @@
-# Spark 内存管理 #
+#   Spark 内存管理 #
 
 spark为了更加高效的使用内存，自己来管理内存。spark支持堆内内存分配和堆外内存分配，
 
@@ -601,221 +601,246 @@ class MemoryStore {
 
 
 
-## 申请execution内存 ##
+## 申请execution内存                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ##
 
+Spark对于execution内存的申请，通过MemoryConsumer抽象类，统一了申请和释放内存的客户端接口，并且支持数据溢写到磁盘。接口如下
 
-
-MemoryConsumer提供了申请和释放内存的接口，并且支持数据溢写到磁盘。接口如下
-
-```scala
+```java
 public abstract class MemoryConsumer {
+    
   // taskMemoryManager实例
   protected final TaskMemoryManager taskMemoryManager;
+    
   // 释放内存，将数据溢写到磁盘
   public abstract long spill(long size, MemoryConsumer trigger) throws IOException;
+    
   // 分配内存，返回形式为LongArray
   public LongArray allocateArray(long size) {}
+    
   // 分配内存，返回形式为MemoryBlock
   protected MemoryBlock allocatePage(long required) {}
+    
   // 释放内存
   public void freeMemory(long size) {}
 ```
-
- 
-
-
-
-```
-ShuffleExternalSorter
-```
-
-都继承MemoryConsumer
-
-
 
 MemoryConsumer的申请内存，都是调用TaskMemoryManager的方法。
 
 
 
-```
-TaskMemoryManager
-```
+### TaskMemoryManager ###
 
-的原理很重要
+TaskMemoryManager负责任务执行的内存管理，它负责管理所有的MemoryConsumer。 当内存不够时，TaskMemoryManager会调用MemoryConsumer的spill方法，释放内存。
 
+TaskMemoryManager同样也管理已分配的MemoryBlock，对于每个MemoryBlock都有一个唯一的pageNumber，表示它在TaskMemoryManager集合的位置。
 
+```java
+public class TaskMemoryManager {
+    
+    // 表示内存是堆外还是堆内
+    final MemoryMode tungstenMemoryMode;
+    
+    // MemoryConsumer集合
+    private final HashSet<MemoryConsumer> consumers;
+    
+    // 保存分配的MemoryBlock
+    private final MemoryBlock[] pageTable = new MemoryBlock[PAGE_TABLE_SIZE];
 
-## TaskMemoryManager ##
+    // 索引为MemoryBlock的pageNumber，对应值为true，表示该MemoryBlock已经分配
+    private final BitSet allocatedPages = new BitSet(PAGE_TABLE_SIZE);
+    
+    // 分配MemoryBlock
+    public MemoryBlock allocatePage(long size, MemoryConsumer consumer) {
+      assert(consumer != null);
+      // 表示 consumer 的内存类型必须和TaskMemoryManager一致
+      assert(consumer.getMode() == tungstenMemoryMode);
+      // 申请内存，不能超过指定大小
+      if (size > MAXIMUM_PAGE_SIZE_BYTES) {
+        throw new IllegalArgumentException(
+          "Cannot allocate a page with more than " + MAXIMUM_PAGE_SIZE_BYTES + " bytes");
+      }
 
-TaskMemoryManager负责任务执行的内存管理，它基于MemoryManager扩展了更加丰富的操作。
-
-
-
-```
-TaskMemoryManager
-```
-
-
-
-```
-allocatedPages 记录分配的内存块
-```
-
-
-
-
-
-TaskMemoryManager包含了所有的MemoryConsumer, 只负责execution用途的内存管理
-
-
-
-```scala
-/**
- * Allocate a block of memory that will be tracked in the MemoryManager's page table; this is
- * intended for allocating large blocks of Tungsten memory that will be shared between operators.
- *
- * Returns `null` if there was not enough memory to allocate the page. May return a page that
- * contains fewer bytes than requested, so callers should verify the size of returned pages.
- */
-public MemoryBlock allocatePage(long size, MemoryConsumer consumer) {
-  assert(consumer != null);
-  assert(consumer.getMode() == tungstenMemoryMode);
-  if (size > MAXIMUM_PAGE_SIZE_BYTES) {
-    throw new IllegalArgumentException(
-      "Cannot allocate a page with more than " + MAXIMUM_PAGE_SIZE_BYTES + " bytes");
-  }
-
-  // acquireExecutionMemory会去检测是否有足够的内存，
-  // 还会尝试将MemoryConsumer溢写到磁盘来释放内存
-  long acquired = acquireExecutionMemory(size, consumer);
-  if (acquired <= 0) {
-    return null;
-  }
-
-  final int pageNumber;
-  synchronized (this) {
-    pageNumber = allocatedPages.nextClearBit(0);
-    if (pageNumber >= PAGE_TABLE_SIZE) {
-      releaseExecutionMemory(acquired, consumer);
-      throw new IllegalStateException(
-        "Have already allocated a maximum of " + PAGE_TABLE_SIZE + " pages");
+      // acquireExecutionMemory会去检测是否有足够的内存，
+      // 还会尝试将MemoryConsumer溢写到磁盘来释放内存
+      long acquired = acquireExecutionMemory(size, consumer);
+      if (acquired <= 0) {
+        return null;
+      }
+        
+	 // 生成MemoryBlock的pageNumber
+      final int pageNumber;
+      synchronized (this) {
+       // 寻找allocatedPages中值为0的索引，表示该pageNumber没有分配
+        pageNumber = allocatedPages.nextClearBit(0);
+        if (pageNumber >= PAGE_TABLE_SIZE) {
+          releaseExecutionMemory(acquired, consumer);
+          throw new IllegalStateException(
+            "Have already allocated a maximum of " + PAGE_TABLE_SIZE + " pages");
+        }
+        allocatedPages.set(pageNumber);
+      }
+      MemoryBlock page = null;
+      try {
+        // 调用MemoryAllocator，来分配内存
+        page = memoryManager.tungstenMemoryAllocator().allocate(acquired);
+      } catch (OutOfMemoryError e) {
+        logger.warn("Failed to allocate a page ({} bytes), try again.", acquired);
+        synchronized (this) {
+          // acquiredButNotUsed记录了申请失败的内存大小
+          acquiredButNotUsed += acquired;
+          // 因为申请失败了，所以pageNumber需要回收。
+          allocatedPages.clear(pageNumber);
+        }
+        // 进行下一次尝试
+        return allocatePage(size, consumer);
+      }
+      // 更新pageTable集合
+      page.pageNumber = pageNumber;
+      pageTable[pageNumber] = page;
+      return page;
     }
-    allocatedPages.set(pageNumber);
-  }
-  MemoryBlock page = null;
-  try {
-    page = memoryManager.tungstenMemoryAllocator().allocate(acquired);
-  } catch (OutOfMemoryError e) {
-    logger.warn("Failed to allocate a page ({} bytes), try again.", acquired);
-    // there is no enough memory actually, it means the actual free memory is smaller than
-    // MemoryManager thought, we should keep the acquired memory.
-    synchronized (this) {
-      acquiredButNotUsed += acquired;
-      allocatedPages.clear(pageNumber);
-    }
-    // this could trigger spilling to free some pages.
-    return allocatePage(size, consumer);
-  }
-  page.pageNumber = pageNumber;
-  pageTable[pageNumber] = page;
-  if (logger.isTraceEnabled()) {
-    logger.trace("Allocate page number {} ({} bytes)", pageNumber, acquired);
-  }
-  return page;
 }
 ```
 
 
 
+上面的acquireExecutionMemory方法，会去申请内存，如果内存不足，会优先挑选出占用内存稍微大于申请内存的MemoryConsumer。如果没有则按照占用内存从大到小的顺序。
 
+```java
+public long acquireExecutionMemory(long required, MemoryConsumer consumer) {
+  assert(required >= 0);
+  assert(consumer != null);
+  MemoryMode mode = consumer.getMode();
+  synchronized (this) {
+    // 向memoryManager申请execution内存， 返回申请的内存容量
+    long got = memoryManager.acquireExecutionMemory(required, taskAttemptId, mode);
+
+    // 如果获得内存小于申请大小，则需要MemoryConsumer溢写，释放内存
+    if (got < required) {
+      // 记录MemoryConsumer的内存量
+      // Key为内存使用量， Value为对应的MemoryConsumer的列表
+      TreeMap<Long, List<MemoryConsumer>> sortedConsumers = new TreeMap<>();
+      for (MemoryConsumer c: consumers) {
+        if (c != consumer && c.getUsed() > 0 && c.getMode() == mode) {
+          long key = c.getUsed();
+          List<MemoryConsumer> list =
+              sortedConsumers.computeIfAbsent(key, k -> new ArrayList<>(1));
+          list.add(c);
+        }
+      }
+        
+      // 尝试挑选MemoryConsumer溢写， 直到申请内存满足或者所有的MemoryConsumer已经溢写
+      while (!sortedConsumers.isEmpty()) {
+        // required - got 表示还差多少内存
+        // 寻找刚好内存大于或等于需求值的MemoryConsumer
+        Map.Entry<Long, List<MemoryConsumer>> currentEntry =
+          sortedConsumers.ceilingEntry(required - got);
+        // 如果没有找到，则返回最后的一项，也就是最大的一项
+        if (currentEntry == null) {
+          currentEntry = sortedConsumers.lastEntry();
+        }
+        // 获取对应的MemoryConsumer列表
+        List<MemoryConsumer> cList = currentEntry.getValue();
+        // 从MemoryConsumer列表取出一个元素
+        MemoryConsumer c = cList.remove(cList.size() - 1);
+        if (cList.isEmpty()) {
+          sortedConsumers.remove(currentEntry.getKey());
+        }
+          
+        try {
+          // 调用该MemoryConsumer的spill溢写，释放内存
+          long released = c.spill(required - got, consumer);
+          if (released > 0) {
+            // 继续向memoryManager申请execution内存， 并且更新已获取的内存容量got
+            got += memoryManager.acquireExecutionMemory(required - got, taskAttemptId, mode);
+            // 如果已经申请到了足够的内存，则跳出循环
+            if (got >= required) {
+              break;
+            }
+          }
+        } catch (ClosedByInterruptException e) {
+          // This called by user to kill a task (e.g: speculative task).
+          logger.error("error while calling spill() on " + c, e);
+          throw new RuntimeException(e.getMessage());
+        } catch (IOException e) {
+          logger.error("error while calling spill() on " + c, e);
+          throw new OutOfMemoryError("error while calling spill() on " + c + " : "
+            + e.getMessage());
+        }
+      }
+    }
+
+    // 如果所有的MemoryConsumer都已经溢写，仍旧没有满足
+    // 那么只能将申请者MemoryConsumer溢写
+    if (got < required) {
+      try {
+        // 当前MemoryConsumer溢写
+        long released = consumer.spill(required - got, consumer);
+        if (released > 0) {
+          // 继续向memoryManager申请execution内存， 并且更新已获取的内存容量got
+          got += memoryManager.acquireExecutionMemory(required - got, taskAttemptId, mode);
+        }
+      } catch (ClosedByInterruptException e) {
+        logger.error("error while calling spill() on " + consumer, e);
+        throw new RuntimeException(e.getMessage());
+      } catch (IOException e) {
+        logger.error("error while calling spill() on " + consumer, e);
+        throw new OutOfMemoryError("error while calling spill() on " + consumer + " : "
+          + e.getMessage());
+      }
+    }
+    // 添加到consumers列表
+    consumers.add(consumer);
+    logger.debug("Task {} acquired {} for {}", taskAttemptId, Utils.bytesToString(got), consumer);
+    return got;
+  }
+}
+```
+
+
+
+### ShuffleExternalSorter例子 ###
+
+ShuffleExternalSorter 继承 MemoryConsumer， 负责shuffle排序用的。当它排序的时候，会使用到execution内存。
+
+acquireNewPageIfNecessary方法会申请内存，这里面就是调用了MemoryConsumer的allocatePage方法。
+
+MemoryConsumer的allocatePage也是调用TaskMemoryManager的allocatePage方法。
 
 ```scala
-// 保存分配的MemoryBlock
-private final MemoryBlock[] pageTable = new MemoryBlock[PAGE_TABLE_SIZE];
+class ShuffleExternalSorter extends MemoryConsumer {
 
-// 表示生成MemoryBlock的pagenum，这个对应着在列表pageTable的索引
-private final BitSet allocatedPages = new BitSet(PAGE_TABLE_SIZE);
-```
-
-
-
-执行内存
-
-```
-final class ShuffleExternalSorter extends MemoryConsumer {
-  public void insertRecord(Object recordBase, long recordOffset, int length, int partitionId)
-  throws IOException {
-
-    // for tests
-    assert(inMemSorter != null);
-    if (inMemSorter.numRecords() >= numElementsForSpillThreshold) {
-      logger.info("Spilling data because number of spilledRecords crossed the threshold " +
-        numElementsForSpillThreshold);
-      spill();
-    }
-
-    growPointerArrayIfNecessary();
-    // Need 4 bytes to store the record length.
-    final int required = length + 4;
-    acquireNewPageIfNecessary(required);
-    
-  }
-  
-  
-  private void growPointerArrayIfNecessary() throws IOException {
-    assert(inMemSorter != null);
-    if (!inMemSorter.hasSpaceForAnotherRecord()) {
-      long used = inMemSorter.getMemoryUsage();
-      LongArray array;
-      try {
-        // could trigger spilling
-        array = allocateArray(used / 8 * 2);
-      } catch (OutOfMemoryError e) {
-        // should have trigger spilling
-        if (!inMemSorter.hasSpaceForAnotherRecord()) {
-          logger.error("Unable to grow the pointer array");
-          throw e;
-        }
-        return;
-      }
-      // check if spilling is triggered or not
-      if (inMemSorter.hasSpaceForAnotherRecord()) {
-        freeArray(array);
-      } else {
-        inMemSorter.expandPointerArray(array);
-      }
-    }
-  }
-
-  /**
-   * Allocates more memory in order to insert an additional record. This will request additional
-   * memory from the memory manager and spill if the requested memory can not be obtained.
-   *
-   * @param required the required space in the data page, in bytes, including space for storing
-   *                      the record size. This must be less than or equal to the page size (records
-   *                      that exceed the page size are handled via a different code path which uses
-   *                      special overflow pages).
-   */
   private void acquireNewPageIfNecessary(int required) {
     if (currentPage == null ||
       pageCursor + required > currentPage.getBaseOffset() + currentPage.size() ) {
-      // TODO: try to find space in previous pages
+      调用
       currentPage = allocatePage(required);
       pageCursor = currentPage.getBaseOffset();
       allocatedPages.add(currentPage);
     }
   }
+}
+
+
+public abstract class MemoryConsumer {
+
+  protected final TaskMemoryManager taskMemoryManager;
+    
+  protected MemoryBlock allocatePage(long required) {
+    // 向taskMemoryManager申请分配内存
+    MemoryBlock page = taskMemoryManager.allocatePage(Math.max(pageSize, required), this);
+    if (page == null || page.size() < required) {
+      long got = 0;
+      if (page != null) {
+        got = page.size();
+        taskMemoryManager.freePage(page, this);
+      }
+      taskMemoryManager.showMemoryUsage();
+      throw new OutOfMemoryError("Unable to acquire " + required + " bytes of memory, got " + got);
+    }
+    used += page.size();
+    return page;
+  }
+}
 ```
-
-
-
-
-
-
-
-MemoryManager只负责管理内存的数量，而不负责实际的分配的
-
-MemoryConsumer 提供了实际的分配内存接口。allocateArray 和 allocatePage。这些都是转发给TaskMemoryManager
-
-TaskMemoryManager 获取是实际的内存分配，但它只负责申请execution用途的内存
 
