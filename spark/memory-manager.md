@@ -1,6 +1,6 @@
 #   Spark 内存管理 #
 
-spark为了更加高效的使用内存，自己来管理内存。spark支持堆内内存分配和堆外内存分配，
+spark自己实现了一套内存的管理，为了精准的控制内存。因为JVM的垃圾回收不可控制，尤其是大内存的回收，会造成程序暂停长时间。spark为了避免这种情况，实现了内存的管理，尤其是针对大内存。对于大内存，spark会使用内存池的方法，避免了垃圾回收的次数，提高了程序的稳定性。目前spark支持堆内内存分配和堆外内存分配。
 
 
 
@@ -229,7 +229,7 @@ abstract class MemoryPool(lock: Object) {
 
 
 
-StorageMemoryPool 继承 MemoryPool， 增加申请内存接口。它支持堆外和堆内内存，由memoryMode参数指定。
+StorageMemoryPool 继承 MemoryPool，表示用来存储数据的内存池。 它支持堆外和堆内内存，由memoryMode参数指定。它提供了增加申请内存接口 acquireMemory。
 
 ```scala
 private[memory] class StorageMemoryPool(
@@ -270,7 +270,7 @@ private[memory] class StorageMemoryPool(
 
 
 
-ExecutionMemoryPool继承 MemoryPool， 增加了申请内存接口。它支持堆外和堆内内存，由memoryMode参数指定。
+ExecutionMemoryPool继承 MemoryPool， 表示用来执行任务的内存池。它支持堆外和堆内内存，由memoryMode参数指定。它提供了增加申请内存接口 acquireMemory。
 
 ```scala
 class ExecutionMemoryPool(
@@ -355,7 +355,7 @@ class ExecutionMemoryPool(
 
 
 
-### 管理策略 ###
+### 内存池管理策略 ###
 
 MemoryManager 负责管理下列内存池
 
@@ -371,6 +371,8 @@ MemoryManager 负责管理下列内存池
 #### 静态资源管理 ####
 
 静态资源管理会初始化各个内存池的大小，之后内存池的大小不能改变。内存分为两个用途，一个是缓存数据使用的，另一部分是任务执行使用的。静态资源管理不支持用于数据缓存的堆外内存。
+
+StaticMemoryManager表示静态资源管理，它会根据spark的配置，来计算出各个内存池的容量。
 
 getMaxStorageMemory方法返回缓存数据的内存容量
 
@@ -402,7 +404,7 @@ private[spark] object StaticMemoryManager {
 
 
 
-StaticMemoryManager的acquireStorageMemory提供申请缓存数据的内存，acquireExecutionMemory提供申请执行任务的内存。
+StaticMemoryManager对于内存的申请，分别对应 acquireStorageMemory提供申请缓存数据的内存，acquireExecutionMemory提供申请执行任务的内存。
 
 ```scala
 class StaticMemoryManager(
@@ -465,7 +467,7 @@ class StaticMemoryManager(
 
 #### 动态资源管理 ####
 
-动态资源管理的原理是，不严格划分缓存数据和任务执行的内存容量。当其中一个内存不足时，可以相互共享内存。这样就可以提高内存的使用效率。
+动态资源管理的原理是，不严格划分缓存数据和任务执行的内存容量。当其中一个内存不足时，可以相互借用，共享内存。这样就可以提高内存的使用效率。
 
 acquireStorageMemory方法提供了申请storage用途的内存。如果当前storage的内存不够，则试图向execution借用空闲的内存。
 
@@ -570,9 +572,9 @@ override private[memory] def acquireExecutionMemory(
 
 ## 申请storage内存 ##
 
-当spark缓存数据的时候，会申请storage类型的内存。我们通过MemoryStore类，查看它的申请流程。
+上面介绍了内存的管理和分配，这里介绍了使用者的用法。我们以MemoryStore类为例，当spark缓存数据的时候，会申请storage类型的内存。
 
-putBytes是将数据缓存到内存中。它申请内存的方法很简单，首先向memoryManager申请，如果memoryManager同意，直接调用_bytes函数，生成ChunkedByteBuffer。
+MemoryStore 的 putBytes 方法是将数据缓存到内存中。它申请内存的方法很简单，首先向memoryManager申请，如果memoryManager同意，直接调用_bytes函数，生成ChunkedByteBuffer。
 
 ```scala
 class MemoryStore {
@@ -624,15 +626,17 @@ public abstract class MemoryConsumer {
   public void freeMemory(long size) {}
 ```
 
-MemoryConsumer的申请内存，都是调用TaskMemoryManager的方法。
+MemoryConsumer的源码比较简单，它的申请内存接口，都是调用TaskMemoryManager的方法。
 
 
 
 ### TaskMemoryManager ###
 
-TaskMemoryManager负责任务执行的内存管理，它负责管理所有的MemoryConsumer。 当内存不够时，TaskMemoryManager会调用MemoryConsumer的spill方法，释放内存。
+TaskMemoryManager负责管理所有的MemoryConsumer。 当内存不够时，TaskMemoryManager会调用MemoryConsumer的spill方法，释放内存。
 
 TaskMemoryManager同样也管理已分配的MemoryBlock，对于每个MemoryBlock都有一个唯一的pageNumber，表示它在TaskMemoryManager集合的位置。
+
+TaskMemoryManager只负责任务执行的内存管理。它提供了allocatePage方法，分配内存 MemoryBlock
 
 ```java
 public class TaskMemoryManager {
@@ -704,7 +708,7 @@ public class TaskMemoryManager {
 
 
 
-上面的acquireExecutionMemory方法，会去申请内存，如果内存不足，会优先挑选出占用内存稍微大于申请内存的MemoryConsumer。如果没有则按照占用内存从大到小的顺序。
+注意到上面调用了acquireExecutionMemory方法。acquireExecutionMemory 方法会向 memoryManager 去申请内存，如果申请失败，会尝试释放内存。释放内存的原理是，从已申请的 MemoryConsumer中， 优先挑选出占用内存稍微大于申请内存的MemoryConsumer，如果没有 则按照占用内存从大到小的顺序释放。
 
 ```java
 public long acquireExecutionMemory(long required, MemoryConsumer consumer) {
@@ -801,11 +805,9 @@ public long acquireExecutionMemory(long required, MemoryConsumer consumer) {
 
 ### ShuffleExternalSorter例子 ###
 
-ShuffleExternalSorter 继承 MemoryConsumer， 负责shuffle排序用的。当它排序的时候，会使用到execution内存。
+这里以ShuffleExternalSorter为例，它继承 MemoryConsumer， 负责shuffle排序用的。当它排序的时候，会使用到execution内存。
 
 acquireNewPageIfNecessary方法会申请内存，这里面就是调用了MemoryConsumer的allocatePage方法。
-
-MemoryConsumer的allocatePage也是调用TaskMemoryManager的allocatePage方法。
 
 ```scala
 class ShuffleExternalSorter extends MemoryConsumer {
