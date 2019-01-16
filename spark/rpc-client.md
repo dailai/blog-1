@@ -119,7 +119,6 @@ TransportClientFactory实现了缓存池。对于不同的服务，它都有一�
          clientBootstrap.doBootstrap(client, channel);
     }
 
-
     return client;
   }
 ```
