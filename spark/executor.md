@@ -1,6 +1,88 @@
 # Spark Executor 节点运行原理 #
 
-Spark Executor负责执行从driver发来的任务，它的启动类是CoarseGrainedExecutorBackend。
+
+
+## Executor运行流程图 ##
+
+
+
+
+
+## Executor 节点启动 ##
+
+这里讲的spark运行的场景都是在Yarn上。从这边博客，可以看到Executor的启动函数，是CoarseGrainedExecutorBackend类的main函数。
+
+```scala
+object CoarseGrainedExecutorBackend extends Logging {
+  
+  def main(args: Array[String]) {
+    // 解析参数
+    var argv = args.toList
+    while (!argv.isEmpty) {
+      .....
+    }
+    
+    //   调用 run 函数
+    run(driverUrl, executorId, hostname, cores, appId, workerUrl, userClassPath)
+    System.exit(0)
+  }
+  
+  def run(
+      driverUrl: String,
+      executorId: String,
+      hostname: String,
+      cores: Int,
+      appId: String,
+      workerUrl: Option[String],
+      userClassPath: Seq[URL]) {
+      // 以hadoop所使用的用户执行程序 
+      SparkHadoopUtil.get.runAsSparkUser { () =>
+        Utils.checkHost(hostname)
+
+        // 实例化executor的默认spark配置
+        val executorConf = new SparkConf
+        // 连接driver的客户端使用的端口号
+        val port = executorConf.getInt("spark.executor.port", 0)
+        // 实例化客户模式的RpcEnv
+        val fetcher = RpcEnv.create(
+          "driverPropsFetcher",
+          hostname,
+          port,
+          executorConf,
+          new SecurityManager(executorConf),
+          clientMode = true)
+        // 创建连接driver服务的客户端，
+        // 这里的driver是指 CoarseGrainedSchedulerBackend类的 DriverEndpoint服务
+        val driver = fetcher.setupEndpointRefByURI(driverUrl)
+        // 向driver请求spark配置
+        val cfg = driver.askSync[SparkAppConfig](RetrieveSparkAppConfig)
+        val props = cfg.sparkProperties ++ Seq[(String, String)](("spark.app.id", appId))
+        // 获取完配置后，关闭客户端
+        fetcher.shutdown()
+
+        // 根据driver获取的配置，生成executor的配置
+        val driverConf = new SparkConf()
+        for ((key, value) <- props) {
+          if (SparkConf.isExecutorStartupConf(key)) {
+            driverConf.setIfMissing(key, value)
+          } else {
+            driverConf.set(key, value)
+          }
+        } 
+
+        // 创建Executor的SparkEnv
+        val env = SparkEnv.createExecutorEnv(
+          driverConf, executorId, hostname, port, cores, cfg.ioEncryptionKey, isLocal = false)
+
+        // 注册并运行CoarseGrainedExecutorBackend 服务
+        env.rpcEnv.setupEndpoint("Executor", new CoarseGrainedExecutorBackend(
+          env.rpcEnv, driverUrl, executorId, hostname, cores, userClassPath, env))
+        // 等待 Rpc服务运行结束
+        env.rpcEnv.awaitTermination()
+      }
+  }
+} 
+```
 
 
 
@@ -82,11 +164,9 @@ private[spark] class CoarseGrainedExecutorBackend
 
 
 
-## Executor类 ##
+## 执行任务 ##
 
 上面的CoarseGrainedExecutorBackend类，负责接收driver发过来的Task，然后转交给Executor执行。
-
-###  执行任务 ###
 
 Executor有一个线程池threadPool，负责执行任务。该线程池使用newCachedThreadPool类型，没有线程数目限制。
 
@@ -152,7 +232,7 @@ class TaskRunner(
 
 
 
-### 心跳服务 ###
+## 心跳服务 ##
 
 Executor还负责与driver的心跳连接，它启动了后台单线程，定时发送给心跳信息。每次心跳都会携带任务执行的状态信息。
 
@@ -192,4 +272,6 @@ class Executor() {
 ```
 
 
+
+## 任务信息发送 ##
 
