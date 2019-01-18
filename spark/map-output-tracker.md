@@ -1,43 +1,108 @@
-# Spark ShuffleMapTask 原理 #
+# Spark MapOutputTracker 原理
 
 
 
-ShuffleMapTask 返回结果 MapStatus， 结果会被发送给Driver。最后保存在MapOutputTrackerMaster。
-
-```mermaid
-sequenceDiagram
-    CoarseGrainedExecutorBackend ->>+ DriverEndpoint : send(StatusUpdate)
-    DriverEndpoint ->>+ TaskSchedulerImpl : statusUpdate
-    TaskSchedulerImpl ->>+ TaskResultGetter : enqueueSuccessfulTask
-    TaskResultGetter ->>+ TaskSchedulerImpl : handleSuccessfulTask
-    TaskSchedulerImpl ->>+ TaskSetManager : handleSuccessfulTask
-    TaskSetManager ->>+ DagScheduler : taskEnded
-    DagScheduler ->>+ DAGSchedulerEventProcessLoop : post(CompletionEvent)
-    DAGSchedulerEventProcessLoop ->>+ DagScheduler : handleTaskCompletion
-    DagScheduler ->>+ MapOutputTrackerMaster : registerMapOutputs
-    
-    MapOutputTrackerMaster -->>- DagScheduler : 
-    DagScheduler -->>- DAGSchedulerEventProcessLoop : 
-    DAGSchedulerEventProcessLoop -->>- DagScheduler  : 
-    DagScheduler -->>- TaskSetManager  : 
-    TaskSetManager -->>- TaskSchedulerImpl : 
-    TaskSchedulerImpl -->>- TaskResultGetter : 
-    TaskResultGetter -->>- TaskSchedulerImpl : 
-    TaskSchedulerImpl -->>- DriverEndpoint : 
-    DriverEndpoint -->>- CoarseGrainedExecutorBackend : #
-```
-
-
-
-MapOutputTracker 对于shuffle启动重要的沟通作用。shuffle的过程分为writer和reader两块。
+MapOutputTracker 在 shuffle 过程中，起着非常重要的沟通作用。shuffle的过程分为writer和reader两块。
 
 shuffle writer会将数据保存到Block里面，然后将数据的位置发送给MapOutputTracker。
 
 shuffle reader通过向 MapOutputTracker获取shuffle writer的数据位置之后，才能读取到数据。
 
+以下图为例，
 
 
 
+rdd1 经过shuffle 生成 rdd2。rdd1有三个分区，对应着三个ShuffleMapTask。每一个ShuffleMapTask执行的结果，对应着一个MapStatus。以rdd1 的 parition 0 分区为例，可以看到它的shuffle中间数据分为三部分，对应着rdd2 的分区。
+
+shuffle reader 需要读取rdd1 shuffle的中间数据，才能生成 rdd2。 以rdd2的partition 0 分区为例，它需要 rdd1 计算出的数据，找到所有reduce0 的数据。这些数据的位置，需要从MapOutputTracker获取。
+
+
+
+## 输出信息 MapStatus ##
+
+MapStatus类表示shuffle write的数据位置。一个MapStatus是一个ShuffleMapTask执行返回的结果。
+
+它有两个方法
+
+* location ， 返回数据存储所在 BlockManager 的 Id
+* getSizeForBlock， 返回 shufle中间数据中，指定 reduceId 的那部分数据的大小。注意这个值是精度误差的
+
+MapStatus会将结果进行压缩，因为一个MapStatus会包含多个reduce的数据长度，这样会占用太多的内存。对于不同的reduce数量，对应着不同的子类。CompressedMapStatus 和 HighlyCompressedMapStatus。当reduceId超过了2000， 就使用HighlyCompressedMapStatus。否则使用CompressedMapStatus 。
+
+首先来看看MapStatus压缩数据长度的原理。 对于Long类型的长度，经过log数学运算, 转换为只占一个字节的Byte类型 。虽然结果压缩了，但是精确度却有一定的损失。算法如下，通过对数的方式压缩成整数类型，最大值为255。最大可以表示35GB的长度。
+
+```scala
+private[spark] object MapStatus {
+    private[this] val LOG_BASE = 1.1
+    
+    def compressSize(size: Long): Byte = {
+    	if (size == 0) {
+      		0
+    	} else if (size <= 1L) {
+      		1
+    	} else {
+      		math.min(255, math.ceil(math.log(size) / math.log(LOG_BASE)).toInt).toByte
+    	}
+  }
+```
+
+### CompressedMapStatus 压缩原理 ###
+
+CompressedMapStatus的原理比较简单，只是将长度压缩保存。
+
+```scala
+private[spark] class CompressedMapStatus(
+    private[this] var loc: BlockManagerId,
+    private[this] var compressedSizes: Array[Byte])
+  extends MapStatus with Externalizable {
+      // 接收Long类型的数组，数组的索引是reduceId，索引项是对应的长度
+      def this(loc: BlockManagerId, uncompressedSizes: Array[Long]) {
+          // 调用上面的compressSize方法， 将Long类型的长度，转换为Byte类型
+          this(loc, uncompressedSizes.map(MapStatus.compressSize))
+      }
+      
+      override def getSizeForBlock(reduceId: Int): Long = {
+          // 获取压缩的数据长度，然后还原成Long类型
+          MapStatus.decompressSize(compressedSizes(reduceId))
+      }
+```
+
+### HighlyCompressedMapStatus 压缩原理 ###
+
+HighlyCompressedMapStatus适用于reduce数量比较大的情况。对于长度特别大的值，会将长度压缩，单独保存。对于其余的长度，直接返回平均值。
+
+```scala
+private[spark] class HighlyCompressedMapStatus private (
+    private[this] var loc: BlockManagerId,
+    // 哪些reduce数据不为空的数目
+    private[this] var numNonEmptyBlocks: Int,
+    // reduce数据为空的集合，这里使用了RoaringBitmap，也是为了节省内存
+    private[this] var emptyBlocks: RoaringBitmap,
+    // 平均长度
+    private[this] var avgSize: Long,
+    // 长度特别大的reduce集合
+    private var hugeBlockSizes: Map[Int, Byte]) {
+    
+    override def getSizeForBlock(reduceId: Int): Long = {
+    	assert(hugeBlockSizes != null)
+        // 如果reduce对应的数据为空，则直接返回0
+    	if (emptyBlocks.contains(reduceId)) {
+      		0
+    	} else {
+      		hugeBlockSizes.get(reduceId) match {
+                 // 如果该reduceId特别大，则从 hugeBlockSizes集合中，获取长度并解压
+        		case Some(size) => MapStatus.decompressSize(size)
+                // 否则，返回平局长度
+        		case None => avgSize
+      		}
+    	}
+  	}
+}
+```
+
+
+
+## MapOutputTracker 相关类 ##
 
 {% plantuml %}
 
@@ -49,30 +114,27 @@ MapOutputTracker <|-- MapOutputTrackerMaster
 MapOutputTracker <|-- MapOutputTrackerWorker
 MapOutputTrackerMaster -- MapOutputTrackerMasterEndpoint
 
-
 @enduml
 
 {% plantuml %}
 
 
 
-MapOutputTrackerMaster是运行在driver节点上的，它管理着shuffle的输出信息。
+MapOutputTrackerMaster是运行在driver节点上的，它管理着shuffle的中间数据信息。
 
-MapOutputTrackerWorker是运行在executor节点上的，它会向driver请求shuffle输出的信息。
+MapOutputTrackerWorker是运行在executor节点上的，它会向driver请求shuffle中间数据的信息。
 
-MapOutputTrackerMasterEndpoint是运行在driver节点上的Rpc服务，提供shuffle信息的获取。
-
-
+MapOutputTrackerMasterEndpoint是运行在driver节点上的Rpc服务。
 
 
 
-## MapOutputTrackerMaster ##
+## Driver节点的MapOutputTracker
 
-MapOutputTrackerMaster管理所有shuffle的数据输出位置，
+MapOutputTrackerMaster运行在driver节点上。管理所有shuffle的数据信息。所有的shuffle中间数据，它有两个主要的属性
 
-mapStatuses， 类型 ConcurrentHashMap[Int, Array[MapStatus]]， Key为shuffleId， Value为该shuffle的MapStatus列表
+* mapStatuses， 类型 ConcurrentHashMap[Int, Array[MapStatus]]， Key为shuffleId， Value为该shuffle的MapStatus列表
 
-shuffleIdLocks， 类型为ConcurrentHashMap[Int, AnyRef]， Key为shuffleId， Value为普通的Object实例，仅仅作为锁存在。
+* shuffleIdLocks， 类型为ConcurrentHashMap[Int, AnyRef]， Key为shuffleId， Value为普通的Object实例，仅仅作为锁存在。
 
 提供接口新增shuffle
 
@@ -155,13 +217,12 @@ class MapOutputTrackerMaster {
 
 ```scala
 private[spark] class MapOutputTrackerMaste {
-  
+  // 缓存版本
   private var cacheEpoch = epoch
   
   // 缓存请求结果，注意到结果是Byte类型，是序列化之后的数据
   private val cachedSerializedStatuses = new ConcurrentHashMap[Int, Array[Byte]]().asScala
-  
-  
+   
   def getSerializedMapOutputStatuses(shuffleId: Int): Array[Byte] = {
     // 该shuffleId 对应的 MapStatus列表
     var statuses: Array[MapStatus] = null
@@ -224,15 +285,13 @@ private[spark] class MapOutputTrackerMaste {
 
 
 
-查看Executor节点如何获取shuffle的输出数据信息
+## Executor节点的MapOutputTracker ##
 
-MapOutputTrackerWorker继承MapOutputTracker， 它提供了getStatuses方法，获取shuffle的MapStatus。
+MapOutputTrackerWorker运行在Executor节点，它提供了getStatuses方法，获取shuffle的MapStatus。
 
 mapStatuses属性在MapOutputTrackerWorker， 表示executor节点的缓存。
 
-
-
-getStatuses优先去从本地缓存mapStatuses获取，如果没有，则发送GetMapOutputStatuses请求给driver。
+getStatuses方法，会优先从本地缓存mapStatuses获取，如果没有，则发送GetMapOutputStatuses请求给driver。
 
 ```scala
 // 正在请求的shuffleId集合
@@ -294,10 +353,3 @@ private def getStatuses(shuffleId: Int): Array[MapStatus] = {
   }
 }
 ```
-
-
-
-
-
-
-
