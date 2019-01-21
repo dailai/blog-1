@@ -4,13 +4,13 @@
 
 ## Executor运行流程图 ##
 
-
+![spark-executor-communicate](spark-executor-communicate.svg)
 
 
 
 ## Executor 节点启动 ##
 
-这里讲的spark运行的场景都是在Yarn上。从这边博客，可以看到Executor的启动函数，是CoarseGrainedExecutorBackend类的main函数。
+这里讲的spark运行的场景都是在Yarn上。从这边博客 {% post_link  spark-on-yarn %} ，可以看到Executor节点的启动函数，是CoarseGrainedExecutorBackend的main函数。
 
 ```scala
 object CoarseGrainedExecutorBackend extends Logging {
@@ -74,7 +74,7 @@ object CoarseGrainedExecutorBackend extends Logging {
         val env = SparkEnv.createExecutorEnv(
           driverConf, executorId, hostname, port, cores, cfg.ioEncryptionKey, isLocal = false)
 
-        // 注册并运行CoarseGrainedExecutorBackend 服务
+        // 注册并运行CoarseGrainedExecutorBackend Rpc服务
         env.rpcEnv.setupEndpoint("Executor", new CoarseGrainedExecutorBackend(
           env.rpcEnv, driverUrl, executorId, hostname, cores, userClassPath, env))
         // 等待 Rpc服务运行结束
@@ -86,19 +86,15 @@ object CoarseGrainedExecutorBackend extends Logging {
 
 
 
-## CoarseGrainedExecutorBackend ##
+## CoarseGrainedExecutorBackend 服务 ##
 
-CoarseGrainedExecutorBackend负责和driver的通信，包括向driver注册exectuor，接收driver发过来的任务。
-
-CoarseGrainedExecutorBackend的启动过程如下图所示：
-
-
-
-CoarseGrainedExecutorBackend继承ThreadSafeRpcEndpoint，实现了Rpc服务，支持下列接口：
+CoarseGrainedExecutorBackend继承ThreadSafeRpcEndpoint，包装了Executor类，实现对外提供Rpc服务，支持下列接口：
 
 - RegisteredExecutor， 注册executor
 - LaunchTask， 执行task
 - KillTask， 停止task
+
+
 
 ```scala
 private[spark] class CoarseGrainedExecutorBackend
@@ -166,12 +162,13 @@ private[spark] class CoarseGrainedExecutorBackend
 
 ## 执行任务 ##
 
-上面的CoarseGrainedExecutorBackend类，负责接收driver发过来的Task，然后转交给Executor执行。
+driver会发送Task给CoarseGrainedExecutorBackend 服务。CoarseGrainedExecutorBackend会转交给Executor类执行。从上面的代码可以看到，是调用了Executor类的launchTask方法。
 
-Executor有一个线程池threadPool，负责执行任务。该线程池使用newCachedThreadPool类型，没有线程数目限制。
+Executor类有一个线程池threadPool，负责执行任务。该线程池使用newCachedThreadPool类型，没有线程数目限制。它会把接收的任务，丢到这个线程池里面执行。
 
 ```scala
 class Executor() {
+    
     private val threadPool = {
     	val threadFactory = new ThreadFactoryBuilder()
       		.setDaemon(true)
@@ -234,7 +231,7 @@ class TaskRunner(
 
 ## 心跳服务 ##
 
-Executor还负责与driver的心跳连接，它启动了后台单线程，定时发送给心跳信息。每次心跳都会携带任务执行的状态信息。
+Executor节点还需要保持与driver的心跳，否则driver会认为Executor节点异常。Executor类有个线程，专门负责与driver的心跳连接，定时发送给心跳信息。每次心跳都会携带任务的运行信息。
 
 ```scala
 class Executor() {
@@ -271,7 +268,4 @@ class Executor() {
 }
 ```
 
-
-
-## 任务信息发送 ##
 

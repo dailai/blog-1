@@ -2,17 +2,17 @@
 
 
 
-MapOutputTracker 在 shuffle 过程中，起着非常重要的沟通作用。shuffle的过程分为writer和reader两块。
+Spark的shuffle过程分为writer和reader两块。 writer负责生成中间数据，reader负责整合中间数据。而中间数据的元信息，则由MapOutputTracker负责管理。 它负责writer和reader的沟通。
 
-shuffle writer会将数据保存到Block里面，然后将数据的位置发送给MapOutputTracker。
+shuffle writer会将中间数据保存到Block里面，然后将数据的位置发送给MapOutputTracker。
 
-shuffle reader通过向 MapOutputTracker获取shuffle writer的数据位置之后，才能读取到数据。
+shuffle reader通过向 MapOutputTracker获取中间数据的位置之后，才能读取到数据。
 
 以下图为例，
 
 
 
-rdd1 经过shuffle 生成 rdd2。rdd1有三个分区，对应着三个ShuffleMapTask。每一个ShuffleMapTask执行的结果，对应着一个MapStatus。以rdd1 的 parition 0 分区为例，可以看到它的shuffle中间数据分为三部分，对应着rdd2 的分区。
+rdd1 经过shuffle 生成 rdd2。rdd1有三个分区，对应着三个ShuffleMapTask。每一个ShuffleMapTask执行的结果，对应着一个MapStatus。以rdd1 的 parition 0 分区为例，可以看到它把该分区的数据，根据分区器分成三部分，对应着rdd2 的分区。
 
 shuffle reader 需要读取rdd1 shuffle的中间数据，才能生成 rdd2。 以rdd2的partition 0 分区为例，它需要 rdd1 计算出的数据，找到所有reduce0 的数据。这些数据的位置，需要从MapOutputTracker获取。
 
@@ -20,14 +20,16 @@ shuffle reader 需要读取rdd1 shuffle的中间数据，才能生成 rdd2。 �
 
 ## 输出信息 MapStatus ##
 
-MapStatus类表示shuffle write的数据位置。一个MapStatus是一个ShuffleMapTask执行返回的结果。
+MapStatus类表示一个ShuffleMapTask执行返回的结果。MapStatus包含了这个ShuffleMapTask的数据输出信息。
 
 它有两个方法
 
 * location ， 返回数据存储所在 BlockManager 的 Id
 * getSizeForBlock， 返回 shufle中间数据中，指定 reduceId 的那部分数据的大小。注意这个值是精度误差的
 
-MapStatus会将结果进行压缩，因为一个MapStatus会包含多个reduce的数据长度，这样会占用太多的内存。对于不同的reduce数量，对应着不同的子类。CompressedMapStatus 和 HighlyCompressedMapStatus。当reduceId超过了2000， 就使用HighlyCompressedMapStatus。否则使用CompressedMapStatus 。
+以上图的rdd1 的 parition 0 分区为例，它对应着一个ShuffleMapTask。ShuffleMapTask会返回一个MapStatus，该MapStatus会包含了三块数据，分别是reduce0， reduce1， reduce2.
+
+因为一个MapStatus会包含多个reduce的数据信息，这样会占用太多的内存， 所以MapStatus会将结果进行压缩，主要是对长度的压缩。对于不同的reduce数量，对应着不同的子类，CompressedMapStatus 和 HighlyCompressedMapStatus。当reduceId超过了2000， 就使用HighlyCompressedMapStatus。否则使用CompressedMapStatus 。
 
 首先来看看MapStatus压缩数据长度的原理。 对于Long类型的长度，经过log数学运算, 转换为只占一个字节的Byte类型 。虽然结果压缩了，但是精确度却有一定的损失。算法如下，通过对数的方式压缩成整数类型，最大值为255。最大可以表示35GB的长度。
 
@@ -130,25 +132,24 @@ MapOutputTrackerMasterEndpoint是运行在driver节点上的Rpc服务。
 
 ## Driver节点的MapOutputTracker
 
-MapOutputTrackerMaster运行在driver节点上。管理所有shuffle的数据信息。所有的shuffle中间数据，它有两个主要的属性
+MapOutputTrackerMaster继承MapStatus， 运行在driver节点上。管理所有shuffle的数据信息。所有的shuffle中间数据，都必须在MapOutputTrackerMaster登记。它有两个主要的属性
 
 * mapStatuses， 类型 ConcurrentHashMap[Int, Array[MapStatus]]， Key为shuffleId， Value为该shuffle的MapStatus列表
 
 * shuffleIdLocks， 类型为ConcurrentHashMap[Int, AnyRef]， Key为shuffleId， Value为普通的Object实例，仅仅作为锁存在。
 
-提供接口新增shuffle
+新增shuffle接口
 
 ```scala
 def registerShuffle(shuffleId: Int, numMaps: Int) {
   if (mapStatuses.put(shuffleId, new Array[MapStatus](numMaps)).isDefined) {
     throw new IllegalArgumentException("Shuffle ID " + shuffleId + " registered twice")
   }
-  // 
   shuffleIdLocks.putIfAbsent(shuffleId, new Object())
 }
 ```
 
-新增MapStatus
+新增MapStatus接口
 
 ```scala
 def registerMapOutputs(shuffleId: Int, statuses: Array[MapStatus], changeEpoch: Boolean = false) {
@@ -161,7 +162,7 @@ def registerMapOutputs(shuffleId: Int, statuses: Array[MapStatus], changeEpoch: 
 
 
 
-MapOutputTrackerMaster有一个队列，存储着获取MapStatus的请求。MapOutputTrackerMasterEndpoint在收到请求后，会将请求添加到这个队列里。MapOutputTrackerMaster还有着一个线程池，来处理队列的消息。
+MapOutputTrackerMaster有一个队列，存储着请求MapStatus的消息。MapOutputTrackerMasterEndpoint在收到请求后，会将请求添加到这个队列里。MapOutputTrackerMaster还有着一个线程池，来处理队列的消息。
 
 ```scala
 class MapOutputTrackerMaster {
@@ -287,9 +288,9 @@ private[spark] class MapOutputTrackerMaste {
 
 ## Executor节点的MapOutputTracker ##
 
-MapOutputTrackerWorker运行在Executor节点，它提供了getStatuses方法，获取shuffle的MapStatus。
+MapOutputTrackerWorker继承MapOutputTracker，运行在Executor节点。它同样有mapStatuses属性，但这里是表示executor节点的缓存。 
 
-mapStatuses属性在MapOutputTrackerWorker， 表示executor节点的缓存。
+它提供了getStatuses方法，提供给Executor节点，获取指定shuffle的MapStatus。
 
 getStatuses方法，会优先从本地缓存mapStatuses获取，如果没有，则发送GetMapOutputStatuses请求给driver。
 
@@ -298,7 +299,7 @@ getStatuses方法，会优先从本地缓存mapStatuses获取，如果没有，�
 private val fetching = new HashSet[Int]
 
 private def getStatuses(shuffleId: Int): Array[MapStatus] = {
-    
+  // 试图从缓存mapStatuses获取结果
   val statuses = mapStatuses.get(shuffleId).orNull
   // 如果mapStatuses没有shuffleId的数据，则会向dirver请求
   if (statuses == null) {
