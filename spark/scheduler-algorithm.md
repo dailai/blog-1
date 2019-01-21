@@ -33,7 +33,7 @@ Schedulable有几个重要的方法
 
 ## Scheduler 初始化 ##
 
- TaskSchedulerImpl负责实例化 scheduler 算法。TaskSchedulerImpl首先会新建一个rootPool，然后使用SchedulableBuilder来配置rootPool。
+TaskSchedulerImpl负责实例化 scheduler 算法。TaskSchedulerImpl首先会新建一个rootPool，然后使用SchedulableBuilder来配置rootPool。
 
 ```scala
 private[spark] class TaskSchedulerImpl {

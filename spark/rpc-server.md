@@ -62,7 +62,8 @@ NettyRpcHandler的receive方法，首先调用了internalReceive生成RequestMes
 NettyRpcHandler还有个属性remoteAddresses，它保存了client的地址。通过remoteAddresses， 可以确定这个client是否为新连接。每当新的client连接时，都会发送一个RemoteProcessConnected消息。
 
 ```scala
-private[netty] class NettyRpcHandler(
+private[netty] class NettyRpcHandler {
+    
   override def receive(
       client: TransportClient,
       message: ByteBuffer,
@@ -71,7 +72,7 @@ private[netty] class NettyRpcHandler(
     dispatcher.postRemoteMessage(messageToDispatch, callback)
   }
 
-  private def internalReceive(client: TransportClient, message: ByteBuffer): 		      RequestMessage = {
+  private def internalReceive(client: TransportClient, message: ByteBuffer): RequestMessage = {
     val addr = client.getChannel().remoteAddress().asInstanceOf[InetSocketAddress]
     assert(addr != null)
     val clientAddr = RpcAddress(addr.getHostString, addr.getPort)
@@ -88,7 +89,7 @@ private[netty] class NettyRpcHandler(
       requestMessage
     }
   }
-
+}
 ```
 
 
