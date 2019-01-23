@@ -159,5 +159,9 @@ ShuffleInMemorySorter
 
 ShuffleInMemorySorter包含了LongArray， 并且提供了替换LongArray接口。
 
-ShuffleExternalSorter 包含ShuffleInMemorySorter， 支持
+ShuffleExternalSorter 包含ShuffleInMemorySorter， 支持申请内存和磁盘溢写。
+
+
+
+ShuffleExternalSorter指定了申请内存块的最大容量，不能超过 1<< 27，也就是不能超过27位。
 
