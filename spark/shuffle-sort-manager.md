@@ -91,6 +91,14 @@ registerShuffle方法比较简单，这里简单说下原理。它对于不同�
 
 
 
+ShuffleWriter的使用方法
+
+首先调用write方法，添加数据，完成排序
+
+最后调用stop方法，返回MapStatus结果
+
+
+
 
 
 BypassMergeSortShuffleHandle 原理
@@ -111,13 +119,45 @@ DiskBlockObjectWriter 支持添加写，并且返回FileSegment。FileSegment包
 
 
 
-BypassMergeSortShuffleHandle会为每个reduce的分区，创建DiskBlockObjectWriter。根据Key判断出所在的分区索引，然后添加到对应的DiskBlockObjectWriter。
+BypassMergeSortShuffleHandle会为每个reduce的分区，创建DiskBlockObjectWriter。根据Key判断出所在的分区索引，然后添加到对应的DiskBlockObjectWriter，写入到磁盘临时文件。
 
 最后所有的DiskBlockObjectWriter的数据，按照分区索引，汇合到同一个文件，保存在ShuffleBlock中。
 
+并且创建索引文件，记录分区数据对应的文件所在位置。
+
+结果保存在MapStatus
 
 
 
 
 
+
+
+UnsafeShuffleWriter 原理
+
+
+
+
+
+LongArray可以看作是一个Long类型的数组，不过它支持堆内和堆外内存。
+
+这里Long类型包含了三部分的数组，分区索引，所在的内存块，所在内存块中的偏移位置。一个Long类型占据64bit，格式如下：
+
+```shell
+---------------------------------------------------------------
+     24 bit           |    13 bit        |      27 bit
+---------------------------------------------------------------
+   partitionId        |   memoryBlock    |      offset
+--------------------------------------------------------------
+```
+
+
+
+
+
+ShuffleInMemorySorter
+
+ShuffleInMemorySorter包含了LongArray， 并且提供了替换LongArray接口。
+
+ShuffleExternalSorter 包含ShuffleInMemorySorter， 支持
 
