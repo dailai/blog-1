@@ -202,6 +202,16 @@ def commitAndGet(): FileSegment = {
 
 
 
+
+
+## 索引文件 ##
+
+IndexShuffleBlockResolver类负责创建索引文件，它提供了writeIndexFileAndCommit方法创建索引。
+
+
+
+
+
 ## BypassMergeSortShuffleHandle 原理 ##
 
 BypassMergeSortShuffleHandle会为 reduce端的每个分区，创建一个DiskBlockObjectWriter。根据Key判断分区索引，然后添加到对应的DiskBlockObjectWriter，写入到文件。 最后按照分区索引顺序，将所有的文件汇合到同一个文件。如下图所示：
@@ -246,13 +256,14 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
       partitionWriterSegments[i] = writer.commitAndGet();
       writer.close();
     }
-    // 获取最终结果的Block，将数据存到最后的文件中
+    // 获取最终结果的文件名
     File output = shuffleBlockResolver.getDataFile(shuffleId, mapId);
     // 根据output文件名，生成临时文件。临时文件的名称只是在output文件名后面添加了一个uuid
     File tmp = Utils.tempFileWith(output);
     try {
-      // 
+      // 将所有的文件都合并到tmp文件中
       partitionLengths = writePartitionedFile(tmp);
+      // 这里writeIndexFileAndCommit会将tmp文件重命名，并且会创建索引文件。
       shuffleBlockResolver.writeIndexFileAndCommit(shuffleId, mapId, partitionLengths, tmp);
     } finally {
       if (tmp.exists() && !tmp.delete()) {
@@ -268,13 +279,9 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
 
 
 
-
-
-
-
 ## UnsafeShuffleWriter 原理 ##
 
-
+UnsafeShuffleWriter会首先将数据序列化，保存在MemoryBlock中。
 
 LongArray可以看作是一个Long类型的数组，不过它支持堆内和堆外内存。
 
