@@ -261,7 +261,7 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     // 根据output文件名，生成临时文件。临时文件的名称只是在output文件名后面添加了一个uuid
     File tmp = Utils.tempFileWith(output);
     try {
-      // 将所有的文件都合并到tmp文件中
+      // 将所有的文件都合并到tmp文件中，返回每个数据段的长度
       partitionLengths = writePartitionedFile(tmp);
       // 这里writeIndexFileAndCommit会将tmp文件重命名，并且会创建索引文件。
       shuffleBlockResolver.writeIndexFileAndCommit(shuffleId, mapId, partitionLengths, tmp);
@@ -275,55 +275,360 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
 }
 ```
 
-并且创建索引文件，记录分区数据对应的文件所在位置。
+从上面的代码可以看到，BypassMergeSortShuffleHandle所有的中间数据都是在磁盘里，并没有利用内存。而且它只保证分区索引的排序，而并不保证数据的排序。
 
 
 
 ## UnsafeShuffleWriter 原理 ##
 
-UnsafeShuffleWriter会首先将数据序列化，保存在MemoryBlock中。
+UnsafeShuffleWriter会首先将数据序列化，保存在MemoryBlock中。然后将该数据的地址和对应的分区索引，保存在ShuffleInMemorySorter内存中，利用ShuffleInMemorySorter根据分区排序。当内存不足时，会触发spill操作，生成spill文件。最后会将所有的spill文件合并在同一个文件里。
 
-LongArray可以看作是一个Long类型的数组，不过它支持堆内和堆外内存。
+整个过程可以想象成归并排序。ShuffleExternalSorter负责分片的读取数据到内存，然后利用ShuffleInMemorySorter进行排序。排序之后会将结果存储到磁盘文件中。这样就会有很多个已排序的文件， UnsafeShuffleWriter会将所有的文件合并。
 
-这里Long类型包含了三部分的数组，分区索引，所在的内存块，所在内存块中的偏移位置。一个Long类型占据64bit，格式如下：
+ 如下图所示，表示了map端一个分区的shuffle过程：
 
-```shell
----------------------------------------------------------------
-     24 bit           |    13 bit        |      27 bit
----------------------------------------------------------------
-   partitionId        |   memoryBlock    |      offset
---------------------------------------------------------------
+
+
+首先介绍下数据如何存储到MemoryBlock和ShuffleInMemorySorter里。
+
+UnsafeShuffleWriter的insertRecordIntoSorter方法，支持写入单条数据。它会首先序列化数据，再存储到ShuffleExternalSorter。
+
+```java
+public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
+    
+    // 插入单条数据
+    void insertRecordIntoSorter(Product2<K, V> record) throws IOException {
+      assert(sorter != null);
+      // 获取该条数据的key
+      final K key = record._1();
+      // 根据key计算出，该数据要被分配的分区索引
+      final int partitionId = partitioner.getPartition(key);
+      // serBuffer存储序列化之后的数据，每一次序列化数据之前，都会清空
+      serBuffer.reset();
+      // serOutputStream流是在serBuffer外层包装的，通过它实现序列化的写入
+      serOutputStream.writeKey(key, OBJECT_CLASS_TAG);
+      serOutputStream.writeValue(record._2(), OBJECT_CLASS_TAG);
+      serOutputStream.flush();
+
+      final int serializedRecordSize = serBuffer.size();
+      assert (serializedRecordSize > 0);
+      // 调用ShuffleExternalSorter的insertRecord方法写入数据
+      sorter.insertRecord(
+        serBuffer.getBuf(), Platform.BYTE_ARRAY_OFFSET, serializedRecordSize, partitionId);
+    }
+}
+```
+
+ShuffleExternalSorter会将读取数据，将数据存到内存中，并将数据地址添加到ShuffleInMemorySorter，并排序。ShuffleExternalSorter的原理会比较复杂，它会涉及到spill操作。
+
+这里先简单的介绍下数据的写入过程 
+
+```java
+final class ShuffleExternalSorter extends MemoryConsumer {
+    
+    // 当前内存块，当触发spill操作时，会重新申请内存块
+    private MemoryBlock currentPage = null;
+    // 表示当前内存块的写位置
+    private long pageCursor = -1;
+  
+    // recordBase表示数据对象的起始地址，
+    // recordOffset表示数据的偏移量（相对于 recordBase）
+    // length表示数据的长度
+    public void insertRecord(Object recordBase, long recordOffset, int length, int partitionId)
+      throws IOException {
+    // 当inMemSorter的数据条数过大时，会触发spill
+    if (inMemSorter.numRecords() >= numElementsForSpillThreshold) {
+      logger.info("Spilling data because number of spilledRecords crossed the threshold " +
+        numElementsForSpillThreshold);
+      spill();
+    }
+
+    // 申请内存
+    growPointerArrayIfNecessary();
+    // Need 4 bytes to store the record length.
+    final int required = length + 4;
+    acquireNewPageIfNecessary(required);
+
+    
+    final Object base = currentPage.getBaseObject();
+    // 将数据所在MemoryBlock的pageNum 和 起始位置 压缩成一个Long类型
+    final long recordAddress = taskMemoryManager.encodePageNumberAndOffset(currentPage, pageCursor);
+    // 向 MemoryBlock 写入数据长度，使用4个byte表示
+    Platform.putInt(base, pageCursor, length);
+    pageCursor += 4;
+    // 拷贝数据到MemoryBlock
+    Platform.copyMemory(recordBase, recordOffset, base, pageCursor, length);
+    pageCursor += length;
+    // 调用insertRecord方法添加到inMemSorter
+    inMemSorter.insertRecord(recordAddress, partitionId);
+  }
+}
 ```
 
 
 
+ShuffleInMemorySorter支持数据按照分区索引排序。ShuffleInMemorySorter会将数据地址和分区索引，压缩在一个Long类型。一个Long类型有64 bit，包含了分区索引，所在的内存块的pageNum，所在内存块中的偏移位置三部分。Long类型占据64bit，格式如下：
+
+```shell
+--------------------------------------------------------------------------
+     24 bit           |    13 bit             |      27 bit
+--------------------------------------------------------------------------
+   partitionId        |   memoryBlock page    |      memoryBlock offset
+--------------------------------------------------------------------------
+```
+
+因为一个MemoryBlock的偏移量只能由27 bit表示，所以ShuffleExternalSorter指定了申请内存块的最大容量，不能超过 1<< 27，也就是不能超过27位。
+
+ShuffleInMemorySorter使用LongArray保存数据。LongArray可以看作是一个Long类型的数组，不过它支持堆内和堆外内存。下面简单看看它的源码：
+
+```java
+final class ShuffleInMemorySorter {
+  // 存储数据的数组
+  private LongArray array;
+
+  // 添加数据， recordPointer表示数据地址， partitionId表示分区索引
+  public void insertRecord(long recordPointer, int partitionId) {
+    if (!hasSpaceForAnotherRecord()) {
+      throw new IllegalStateException("There is no space for new record");
+    }
+    // 添加到数组， pos表示数组的索引
+    array.set(pos, PackedRecordPointer.packPointer(recordPointer, partitionId));
+    pos++;
+  }
+  
+  // 排序计算，返回迭代器
+  public ShuffleSorterIterator getSortedIterator() {
+    int offset = 0;
+    // 使用RadixSort排序算法
+    if (useRadixSort) {
+      offset = RadixSort.sort(
+        array, pos,
+        PackedRecordPointer.PARTITION_ID_START_BYTE_INDEX,
+        PackedRecordPointer.PARTITION_ID_END_BYTE_INDEX, false, false);
+    } else {
+      // 提取LongArray还未使用的内存
+      MemoryBlock unused = new MemoryBlock(
+        array.getBaseObject(),
+        array.getBaseOffset() + pos * 8L,
+        (array.size() - pos) * 8L);
+      LongArray buffer = new LongArray(unused);
+      Sorter<PackedRecordPointer, LongArray> sorter =
+        new Sorter<>(new ShuffleSortDataFormat(buffer));
+      // 使用timSort排序算法
+      sorter.sort(array, 0, pos, SORT_COMPARATOR);
+    }
+    return new ShuffleSorterIterator(pos, array, offset);
+  }
+  
+```
 
 
-ShuffleInMemorySorter
 
-ShuffleInMemorySorter包含了LongArray， 并且提供了替换LongArray接口。并且支持数据按照分区索引排序
+然后看看ShuffleExternalSorter的spill原理。ShuffleExternalSorter继承MemoryConsumer，当ShuffleInMemorySorter的数量过大，或者Executor节点的内存不足时，都会触发spill操作。  ShuffleExternalSorter在spill的时候会从ShuffleInMemorySorter获取排序后的数据地址，然后根据地址取出数据，存到文件里面。
+
+```java
+final class ShuffleExternalSorter extends MemoryConsumer {
+
+  public long spill(long size, MemoryConsumer trigger) throws IOException {
+    if (trigger != this || inMemSorter == null || inMemSorter.numRecords() == 0) {
+      return 0L;
+    }
+    // 调用writeSortedFile方法将结果写入磁盘
+    writeSortedFile(false);
+    // 释放内存
+    final long spillSize = freeMemory();
+    // 释放inMemSorter的内存
+    inMemSorter.reset();
+    return spillSize;
+  }
+    
+  private void writeSortedFile(boolean isLastFile) throws IOException {
+    // 调用inMemSorter获取排序后的结果
+    final ShuffleInMemorySorter.ShuffleSorterIterator sortedRecords =
+      inMemSorter.getSortedIterator();
+
+    // 字节数组，作为缓存使用保存提取的数据
+    final byte[] writeBuffer = new byte[DISK_WRITE_BUFFER_SIZE];
+
+    // 创建临时TempShuffleBlock和临时文件
+    final Tuple2<TempShuffleBlockId, File> spilledFileInfo =
+      blockManager.diskBlockManager().createTempShuffleBlock();
+    final File file = spilledFileInfo._2();
+    final TempShuffleBlockId blockId = spilledFileInfo._1();
+    
+    // 保存此次spill的结果信息
+    final SpillInfo spillInfo = new SpillInfo(numPartitions, file, blockId);
+    final SerializerInstance ser = DummySerializerInstance.INSTANCE;
+
+    // 为该数据创建DiskBlockObjectWriter
+    final DiskBlockObjectWriter writer =
+      blockManager.getDiskWriter(blockId, file, ser, fileBufferSizeBytes, writeMetricsToUse);
+
+    // 当前遍历的分区索引
+    int currentPartition = -1;
+    // 遍历排序后的结果
+    while (sortedRecords.hasNext()) {
+      sortedRecords.loadNext();
+      // 获取数据的分区索引
+      final int partition = sortedRecords.packedRecordPointer.getPartitionId();
+      assert (partition >= currentPartition);
+      if (partition != currentPartition) {
+        // 遇到下一个分区的数据，需要调用commitAndGet方法，返回数据信息
+        if (currentPartition != -1) {
+          final FileSegment fileSegment = writer.commitAndGet();
+          // 将FileSegment记录到spillInfo
+          spillInfo.partitionLengths[currentPartition] = fileSegment.length();
+        }
+        // 更新当前遍历的分区索引
+        currentPartition = partition;
+      }
+      
+      final long recordPointer = sortedRecords.packedRecordPointer.getRecordPointer();
+      // 获取数据的起始地址
+      final Object recordPage = taskMemoryManager.getPage(recordPointer);
+      // 获取数据所在内存块的位置
+      final long recordOffsetInPage = taskMemoryManager.getOffsetInPage(recordPointer);
+      // 读取数据的长度，长度使用int， 4bytes存储
+      int dataRemaining = Platform.getInt(recordPage, recordOffsetInPage);
+      long recordReadPosition = recordOffsetInPage + 4; 
+      // 拷贝数据到字节数组中，然后写入到 DiskBlockObjectWriter
+      while (dataRemaining > 0) {
+        final int toTransfer = Math.min(DISK_WRITE_BUFFER_SIZE, dataRemaining);
+        Platform.copyMemory(
+          recordPage, recordReadPosition, writeBuffer, Platform.BYTE_ARRAY_OFFSET, toTransfer);
+        writer.write(writeBuffer, 0, toTransfer);
+        recordReadPosition += toTransfer;
+        dataRemaining -= toTransfer;
+      }
+      writer.recordWritten();
+    }
+    // 将剩余的数据写入文件
+    final FileSegment committedSegment = writer.commitAndGet();
+    writer.close();
+    
+    // 将此次spill的数据结果的信息，添加到spills列表中
+    if (currentPartition != -1) {
+      spillInfo.partitionLengths[currentPartition] = committedSegment.length();
+      spills.add(spillInfo);
+    }
+  }    
+```
 
 
 
-ShuffleExternalSorter 包含ShuffleInMemorySorter， 支持申请内存和磁盘溢写。
+ShuffleExternalSorter会把每次spill的信息保存到SpillInfo，后面的UnsafeShuffleWriter在合并文件时会用到。SpillInfo有两个重要的属性：
 
-ShuffleExternalSorter指定了申请内存块的最大容量，不能超过 1<< 27，也就是不能超过27位。
+```scala
+class SpillInfo {
+    
+  // 每个对应分区的数据长度 
+  final long[] partitionLengths;
+    
+  // 存储的文件
+  final File file;
+ }
+```
 
 
 
-UnsafeShuffleWriter会将ShuffleExternalSorter的溢写的文件，合并到一起。
+UnsafeShuffleWriter的合并spill文件，代码如下：
+
+```java
+public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
+    
+  private long[] mergeSpills(SpillInfo[] spills, File outputFile) throws IOException {
+    // 是否需要压缩
+    final boolean compressionEnabled = sparkConf.getBoolean("spark.shuffle.compress", true);
+    final CompressionCodec compressionCodec = CompressionCodec$.MODULE$.createCodec(sparkConf);
+    // 是否需要快速合并
+    final boolean fastMergeEnabled =
+      sparkConf.getBoolean("spark.shuffle.unsafe.fastMergeEnabled", true);
+    // 编码方式是否支持快速合并
+    final boolean fastMergeIsSupported = !compressionEnabled ||
+      CompressionCodec$.MODULE$.supportsConcatenationOfSerializedStreams(compressionCodec);
+    // 是否指定了shuffle中间数据加密
+    final boolean encryptionEnabled = blockManager.serializerManager().encryptionEnabled();
+    if (spills.length == 0) {
+        new FileOutputStream(outputFile).close(); // Create an empty file
+        return new long[partitioner.numPartitions()];
+    } else if (spills.length == 1) {
+        Files.move(spills[0].file, outputFile);
+        return spills[0].partitionLengths;
+    } else {
+        final long[] partitionLengths;
+        if (fastMergeEnabled && fastMergeIsSupported) {
+          if (transferToEnabled && !encryptionEnabled) {
+            // 不需要加密，则调用mergeSpillsWithTransferTo方法合并
+            logger.debug("Using transferTo-based fast merge");
+            partitionLengths = mergeSpillsWithTransferTo(spills, outputFile);
+          } else {
+            // 否则调用mergeSpillsWithFileStream方法合并
+            logger.debug("Using fileStream-based fast merge");
+            partitionLengths = mergeSpillsWithFileStream(spills, outputFile, null);
+          }
+        } else {
+          // 调用mergeSpillsWithFileStream方法合并
+          logger.debug("Using slow merge");
+          partitionLengths = mergeSpillsWithFileStream(spills, outputFile, compressionCodec);
+        }
+      return partitionLengths;
+  }
+}
+```
+
+上面有两个方法mergeSpillsWithTransferTo和mergeSpillsWithFileStream都可以合并文件。
+
+mergeSpillsWithTransferTo方法的原理比较简单，只是简单的按照分区遍历每个文件，调用了nio的transferTo机制，拷贝数据。
+
+```java
+private long[] mergeSpillsWithTransferTo(SpillInfo[] spills, File outputFile) throws IOException {
+  assert (spills.length >= 2);
+  final int numPartitions = partitioner.numPartitions();
+  // 保存每个分区的数据长度
+  final long[] partitionLengths = new long[numPartitions];
+  // 每个分区对应的FileChannel
+  final FileChannel[] spillInputChannels = new FileChannel[spills.length];
+  // 每个分区对应在输出文件的位置， 默认值为0
+  final long[] spillInputChannelPositions = new long[spills.length];
+  FileChannel mergedFileOutputChannel = null;
+  // 通过SpillInfo的file属性，获取文件输入流
+  for (int i = 0; i < spills.length; i++) {
+      spillInputChannels[i] = new FileInputStream(spills[i].file).getChannel();
+  }
+  // 获取输出文件的流
+  mergedFileOutputChannel = new FileOutputStream(outputFile, true).getChannel();
+
+  // 按照分区索引，依次遍历所有文件
+  for (int partition = 0; partition < numPartitions; partition++) {
+      // 遍历文件
+      for (int i = 0; i < spills.length; i++) {
+        // 获取该分区数据的长度
+        final long partitionLengthInSpill = spills[i].partitionLengths[partition];
+        final FileChannel spillInputChannel = spillInputChannels[i];
+        // 调用了FileChannel的transferTo方法，拷贝数据
+        Utils.copyFileStreamNIO(
+          spillInputChannel,               // 源文件
+          mergedFileOutputChannel,         // 目标文件 
+          spillInputChannelPositions[i],   // 在输出文件的位置
+          partitionLengthInSpill);         // 数据长度
+        // 设置下一个分区的数据对应输出文件的位置
+        spillInputChannelPositions[i] += partitionLengthInSpill;
+        // 
+        partitionLengths[partition] += partitionLengthInSpill;
+      }
+  }
+
+  return partitionLengths;
+}
+```
 
 
 
-
-
-
-
-SortShuffleWriter
+## SortShuffleWriter ##
 
 SortShuffleWriter使用 ExternalSorter 排序合并。
 
-
+ 
 
 ExternalSorter会比较复杂，因为它支持聚合，排序。
 
