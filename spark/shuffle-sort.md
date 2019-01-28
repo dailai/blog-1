@@ -6,6 +6,213 @@
 
 对于不需要聚合的，则使用PartitionedPairBuffer排序。
 
+
+
+## PartitionedPairBuffer 原理 ##
+
+PartitionedPairBuffer的原理很简单，它使用数组保存数据，最后调用Tim排序算法，根据分区索引排序。
+
+数据格式如下：
+
+```shell
+--------------------------------------------------------------------------
+     AnyRef            |   AnyRef   |       AnyRef           |   AnyRef  |
+--------------------------------------------------------------------------
+   partitionId, key    |   value    |     partitionId, key   |    value  | 
+--------------------------------------------------------------------------
+
+```
+
+PartitionedPairBuffer使用Array[AnyRef] 数组，AnyRef指向两种格式的数据，一种是(parition, key)的元组， 一种是value。
+
+```scala
+class PartitionedPairBuffer {
+    
+    // 使用AnyRef数组，保存数据
+    private var data = new Array[AnyRef](2 * initialCapacity)
+    // 数组目前的索引
+    private var curSize = 0
+    // 数组的容量
+    private var capacity = initialCapacity
+    
+    // 添加数据
+    def insert(partition: Int, key: K, value: V): Unit = {
+       if (curSize == capacity) {
+           // 增大数组的容量
+           growArray()
+       }
+       // // 存储（partition， key）元素
+       data(2 * curSize) = (partition, key.asInstanceOf[AnyRef])
+       // 写入 value
+       data(2 * curSize + 1) = value.asInstanceOf[AnyRef]
+       curSize += 1
+    }
+    
+    override def partitionedDestructiveSortedIterator(keyComparator: Option[Comparator[K]])
+         : Iterator[((Int, K), V)] = {
+        val comparator = keyComparator.map(partitionKeyComparator).getOrElse(partitionComparator)
+        // 调用TimSort算法
+        new Sorter(new KVArraySortDataFormat[(Int, K), AnyRef]).sort(data, 0, curSize, comparator)
+        iterator
+    }
+}
+```
+
+
+
+##  PartitionedAppendOnlyMap 原理 ##
+
+PartitionedAppendOnlyMap继承PartitionedAppendOnlyMap，主要的添加由PartitionedAppendOnlyMap负责。PartitionedAppendOnlyMap自己实现了哈希表，采用了二次探测算法避免哈希冲突。
+
+```scala
+class AppendOnlyMap[K, V](initialCapacity: Int = 64) {
+  
+  // 因为一条数据，占用array的两个位置。所以数组的大小为 数据的容量的两倍
+  private var data = new Array[AnyRef](2 * capacity)  
+  private var capacity = nextPowerOf2(initialCapacity)
+  
+  private def rehash(h: Int): Int = Hashing.murmur3_32().hashInt(h).asInt()
+  
+  // 添加数据
+  def update(key: K, value: V): Unit = {
+    assert(!destroyed, destructionMessage)
+    val k = key.asInstanceOf[AnyRef]
+    // 处理key为null
+    if (k.eq(null)) {
+      if (!haveNullValue) {
+        incrementSize()
+      }
+      nullValue = value
+      haveNullValue = true
+      return
+    }
+    // 根据key的hashCode，哈希计算其在数组的位置
+    // 这里使用二次探测算法避免哈希冲突
+    var pos = rehash(key.hashCode) & mask
+    var i = 1
+    while (true) {
+      val curKey = data(2 * pos)
+      // 如果当前位置的值为空，则写入对应的值
+      if (curKey.eq(null)) {
+        data(2 * pos) = k
+        data(2 * pos + 1) = value.asInstanceOf[AnyRef]
+        incrementSize()  // Since we added a new key
+        return
+      } else if (k.eq(curKey) || k.equals(curKey)) {
+        // 如果等于当前key，则更新value
+        data(2 * pos + 1) = value.asInstanceOf[AnyRef]
+        return
+      } else {
+        // 如果发生哈希冲突，则更新pos位置
+        val delta = i
+        pos = (pos + delta) & mask
+        i += 1
+      }
+    }
+  }
+    
+  // 提供修改数据，这里涉及到聚合操作
+  // updateFunc函数接收两个参数，第一个参数表示这个位置是否已经有数据
+  // 第二个参数表示原有的数据
+  def changeValue(key: K, updateFunc: (Boolean, V) => V): V = {
+    val k = key.asInstanceOf[AnyRef]
+    if (k.eq(null)) {
+      if (!haveNullValue) {
+        incrementSize()
+      }
+      nullValue = updateFunc(haveNullValue, nullValue)
+      haveNullValue = true
+      return nullValue
+    }
+    // 使用二次探测算法，找到数据的位置
+    var pos = rehash(k.hashCode) & mask
+    var i = 1
+    while (true) {
+      val curKey = data(2 * pos)
+      if (curKey.eq(null)) {
+        // 如果当前位置没数据，则调用updateFunc函数，返回新的值
+        val newValue = updateFunc(false, null.asInstanceOf[V])
+        data(2 * pos) = k
+        data(2 * pos + 1) = newValue.asInstanceOf[AnyRef]
+        incrementSize()
+        return newValue
+      } else if (k.eq(curKey) || k.equals(curKey)) {
+        // 如果当前位置有数据，则调用updateFunc函数，返回新的值
+        val newValue = updateFunc(true, data(2 * pos + 1).asInstanceOf[V])
+        data(2 * pos + 1) = newValue.asInstanceOf[AnyRef]
+        return newValue
+      } else {
+        // 更新pos位置直到找到key
+        val delta = i
+        pos = (pos + delta) & mask
+        i += 1
+      }
+    }
+    null.asInstanceOf[V] // Never reached but needed to keep compiler happy
+  }
+}
+```
+
+
+
+##  ExternalSorter原理 ##
+
+SortShuffleWriter使用ExternalSorter进行排序，ExternalSorter会根据是否需要聚合来选择不同的算法。
+
+
+
+```scala
+private[spark] class ExternalSorter[K, V, C] {
+
+  def insertAll(records: Iterator[Product2[K, V]]): Unit = {
+    // TODO: stop combining if we find that the reduction factor isn't high
+    val shouldCombine = aggregator.isDefined
+
+    if (shouldCombine) {
+      // 涉及到聚合，使用PartitionedAppendOnlyMap算法
+      val mergeValue = aggregator.get.mergeValue
+      val createCombiner = aggregator.get.createCombiner
+      var kv: Product2[K, V] = null
+      // 构造聚合函数，如果有旧有值，则调用聚合的mergeValue合并值。否则调用createCombiner实例combiner
+      val update = (hadValue: Boolean, oldValue: C) => {
+        if (hadValue) mergeValue(oldValue, kv._2) else createCombiner(kv._2)
+      }
+      while (records.hasNext) {
+        addElementsRead()
+        kv = records.next()
+        // 调用getPartition根据key，获得partitionId， 添加到map里
+        map.changeValue((getPartition(kv._1), kv._1), update)
+        // 检测是否触发spill
+        maybeSpillCollection(usingMap = true)
+      }
+    } else { 
+      // 没有涉及到聚合，使用PartitionedPairBuffer算法
+      while (records.hasNext) {
+        addElementsRead()
+        val kv = records.next()
+        buffer.insert(getPartition(kv._1), kv._1, kv._2.asInstanceOf[C])
+        // 检测是否触发spill
+        maybeSpillCollection(usingMap = false)
+      }
+    }
+  }
+}
+```
+
+
+
+上面的maybeSpillCollection方法，当数据过多时，会触发溢写。溢写由spill方法负责，它会将已添加的数据进行排序。
+
+
+
+
+
+
+
+
+
+
+
 ## 排序规则 ##
 
 排序的规则，根据不同的场景，分为是否rdd指定了order两种。
