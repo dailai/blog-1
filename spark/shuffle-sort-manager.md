@@ -1,4 +1,4 @@
-## shuffle sort manager ##
+## Spark ShuffleWriter 原理 ##
 
 
 
@@ -611,9 +611,9 @@ private long[] mergeSpillsWithTransferTo(SpillInfo[] spills, File outputFile) th
           mergedFileOutputChannel,         // 目标文件 
           spillInputChannelPositions[i],   // 在输出文件的位置
           partitionLengthInSpill);         // 数据长度
-        // 设置下一个分区的数据对应输出文件的位置
+        // 更新该分区的数据对应输出文件的位置
         spillInputChannelPositions[i] += partitionLengthInSpill;
-        // 
+        // 更新该分区的数据的长度
         partitionLengths[partition] += partitionLengthInSpill;
       }
   }
@@ -622,13 +622,11 @@ private long[] mergeSpillsWithTransferTo(SpillInfo[] spills, File outputFile) th
 }
 ```
 
+mergeSpillsWithFileStream的原理和mergeSpillsWithTransferTo差不多，只不过增加了加密和压缩的功能。
 
+综上所述，UnsafeShuffleWriter会利用内存存储和排序，当内存不足时，会溢写到磁盘。而且它只保证分区索引的排序，而并不保证数据的排序。
 
 ## SortShuffleWriter ##
 
-SortShuffleWriter使用 ExternalSorter 排序合并。
-
- 
-
-ExternalSorter会比较复杂，因为它支持聚合，排序。
+SortShuffleWriter它支持聚合和排序， 所以它的原理会比较复杂。可以参考这篇博客。
 
