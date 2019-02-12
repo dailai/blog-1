@@ -249,7 +249,86 @@ private[streaming] class ReceiverSupervisorImpl
 
 ReceiverTracker首先从DStreamGraph中获取所有的ReceiverInputDStream，然后取得它的Receiver。这样就得到了Receiver列表，然后为每一个Receiver分配一个Executor，运行ReceiverSupervisorImpl服务。这里运行的Executor是一直占用的，直到整个spark streaming的任务停止。
 
-ReceiverTracker的startReceiver方法，负责启动单个Receiver，代码简化如下
+首先来看下是怎么分配receiver的运行位置。分配算法由ReceiverSchedulingPolicy类负责，原理如下
+
+首先介绍三个变量：
+
+* hostToExecutors， 每个host对应的executor列表
+* scheduledLocations， 每个recevier对应的TaskLocation列表
+* numReceiversOnExecutor， 每个executor可能执行receiver的数目
+
+再介绍分配算法：
+
+1. 首先根据 receiver 指定的 host 位置，从该 host 的executor 列表中，找到对应 receiver 数目最少的那个，分配给这个 receiver
+2. 将剩下没有指定位置的 receiver，从所有 executor 中，找到对应 receiver 数目最少的那个，分配给这个 receiver
+3. 如果还有空闲的executor，那么从 receiver 列表中，找到分配 executor 数目最少的那个receiver，然后将这个空闲executor分配给receiver
+
+代码如下：
+
+```scala
+def scheduleReceivers(
+    receivers: Seq[Receiver[_]],
+    executors: Seq[ExecutorCacheTaskLocation]): Map[Int, Seq[TaskLocation]] = {
+  // 每个host对应的executor列表
+  val hostToExecutors = executors.groupBy(_.host)
+  // 每个recevier对应的TaskLocation列表
+  val scheduledLocations = Array.fill(receivers.length)(new mutable.ArrayBuffer[TaskLocation])
+  // 每个executor可能执行receiver的数目, 初始值为0
+  val numReceiversOnExecutor = mutable.HashMap[ExecutorCacheTaskLocation, Int]()
+  executors.foreach(e => numReceiversOnExecutor(e) = 0)
+  
+  // 遍历receivers列表
+  for (i <- 0 until receivers.length) {
+    // 如果该receiver指定了位置，那么提取所在位置的host
+    receivers(i).preferredLocation.foreach { host =>
+      hostToExecutors.get(host) match {
+        case Some(executorsOnHost) =>
+          // 从该host中寻找分配receiver数目最少的那个executor
+          val leastScheduledExecutor =
+            executorsOnHost.minBy(executor => numReceiversOnExecutor(executor))
+          // 更新scheduledLocations集合
+          scheduledLocations(i) += leastScheduledExecutor
+          // 更新numReceiversOnExecutor集合
+          numReceiversOnExecutor(leastScheduledExecutor) =
+            numReceiversOnExecutor(leastScheduledExecutor) + 1
+        case None =>
+          // preferredLocation is an unknown host.
+          // Note: There are two cases:
+          // 1. This executor is not up. But it may be up later.
+          // 2. This executor is dead, or it's not a host in the cluster.
+          // Currently, simply add host to the scheduled executors.
+
+          // Note: host could be `HDFSCacheTaskLocation`, so use `TaskLocation.apply` to handle
+          // this case
+          scheduledLocations(i) += TaskLocation(host)
+      }
+    }
+  }
+
+  // 遍历那些没有指定位置的receiver
+  for (scheduledLocationsForOneReceiver <- scheduledLocations.filter(_.isEmpty)) {
+    // 从executor列表中挑选出，分配receiver数目最小的executor
+    val (leastScheduledExecutor, numReceivers) = numReceiversOnExecutor.minBy(_._2)
+    // 更新scheduledLocations集合
+    scheduledLocationsForOneReceiver += leastScheduledExecutor
+    // 更新numReceiversOnExecutor集合
+    numReceiversOnExecutor(leastScheduledExecutor) = numReceivers + 1
+  }
+
+  // 如果还有空闲的executor
+  val idleExecutors = numReceiversOnExecutor.filter(_._2 == 0).map(_._1)
+  for (executor <- idleExecutors) {
+    // 选择出分配executor数目最少的receiver
+    val leastScheduledExecutors = scheduledLocations.minBy(_.size)
+    // 将这个空闲executor分配给这个receiver
+    leastScheduledExecutors += executor
+  }
+  // 返回 InputDStream 对应 TaskLocaltion的列表
+  receivers.map(_.streamId).zip(scheduledLocations).toMap
+}
+```
+
+获取到receiver的分配位置后，ReceiverTracker的startReceiver方法，负责启动单个Receiver，代码简化如下
 
 ```scala
 private def startReceiver(
@@ -309,11 +388,11 @@ ReceivedBlockTracker负责管理来自输入流的数据。
 * streamIdToUnallocatedBlockQueues， 保存所有InputDStream对应的还未分配的数据
 * timeToAllocatedBlocks， 保存了已分配的数据
 
-当ReceiverTrackerEndpoint收到AddBlock请求， 会调用addBlock方法添加数据。
+当ReceiverTrackerEndpoint收到AddBlock请求， 会调用ReceivedBlockTracker的addBlock方法添加数据。
 
 当spark streaming需要从这儿分配到数据， 才能提交Job。allocateBlocksToBatch方法负责分配数据。
 
-```
+```scala
 private[streaming] class ReceivedBlockTracker(
     conf: SparkConf,
     hadoopConf: Configuration,
@@ -334,7 +413,8 @@ private[streaming] class ReceivedBlockTracker(
   private def getReceivedBlockQueue(streamId: Int): ReceivedBlockQueue = {
     streamIdToUnallocatedBlockQueues.getOrElseUpdate(streamId, new ReceivedBlockQueue)
   }
-  
+      
+  //添加Block
   def addBlock(receivedBlockInfo: ReceivedBlockInfo): Boolean = {
     // 如果配置了wal，则写入wal日志
     val writeResult = writeToLog(BlockAdditionEvent(receivedBlockInfo))
@@ -347,26 +427,25 @@ private[streaming] class ReceivedBlockTracker(
     writeResult
   }
 
+  // 分配Block
   def allocateBlocksToBatch(batchTime: Time): Unit = synchronized {
+    // 检测batchTime的时间必须大于上一次分配的时间
     if (lastAllocatedBatchTime == null || batchTime > lastAllocatedBatchTime) {
+      // 获取所有InputDStream的待分配数据
       val streamIdToBlocks = streamIds.map { streamId =>
           (streamId, getReceivedBlockQueue(streamId).dequeueAll(x => true))
       }.toMap
+      //实例化AllocatedBlocks
       val allocatedBlocks = AllocatedBlocks(streamIdToBlocks)
       if (writeToLog(BatchAllocationEvent(batchTime, allocatedBlocks))) {
+        // 将分配的数据，保存到timeToAllocatedBlocks集合
         timeToAllocatedBlocks.put(batchTime, allocatedBlocks)
+        // 更新最后一次分配时间
         lastAllocatedBatchTime = batchTime
       } else {
         logInfo(s"Possibly processed batch $batchTime needs to be processed again in WAL recovery")
       }
     } else {
-      // This situation occurs when:
-      // 1. WAL is ended with BatchAllocationEvent, but without BatchCleanupEvent,
-      // possibly processed batch job or half-processed batch job need to be processed again,
-      // so the batchTime will be equal to lastAllocatedBatchTime.
-      // 2. Slow checkpointing makes recovered batch time older than WAL recovered
-      // lastAllocatedBatchTime.
-      // This situation will only occurs in recovery time.
       logInfo(s"Possibly processed batch $batchTime needs to be processed again in WAL recovery")
     }
   }  

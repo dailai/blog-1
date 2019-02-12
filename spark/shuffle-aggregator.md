@@ -1,8 +1,8 @@
 # Spark 聚合原理 #
 
-spark在shuffle的时候，都会涉及到聚合，这样会达到优化计算的效率。
+spark在触发shuffle的时候，在一些场景下会涉及到聚合操作。聚合操作起到了一个优化整体计算效率的作用。
 
-## 聚合算法 ##
+## 聚合算法简介 ##
 
 Aggregator类表示Spark的聚合算法。 聚合只能用于数据源是key，value类型。
 
@@ -12,7 +12,9 @@ Aggregator类表示Spark的聚合算法。 聚合只能用于数据源是key，v
 * mergeValue，(C, V) => C， 将value数据，合并到Combiner类型
 * mergeCombiners， (C, C) => C)， 合并Combiner类型的数据
 
-这里演示一个例子
+这里演示一个例子， 如下图所示：
+
+
 
  (key_0, value_0), 	(key_0, value_1), 	(key_0, value_2)
 

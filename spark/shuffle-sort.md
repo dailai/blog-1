@@ -76,6 +76,8 @@ private[spark] object WritablePartitionedPairCollection {
 }
 ```
 
+
+
 ## PartitionedPairBuffer 原理 ##
 
 当只使用rdd的groupby的方法，那么这里只需要分组，而不需要聚合。这种情况会使用PartitionedPairBuffer排序。首先调用PartitionedPairBuffer的insert方法，向PartitionedPairBuffer添加元素，最后调用partitionedDestructiveSortedIterator获取排序后的结果。
@@ -210,7 +212,9 @@ def partitionedDestructiveSortedIterator(keyComparator: Option[Comparator[K]])
 
 def destructiveSortedIterator(keyComparator: Comparator[K]): Iterator[(K, V)] = {
     destroyed = true
-    // data是存储着数据的数组，将
+    // data是存储着数据的数组，
+    // 这里会剔除空的元素，将非空的元素往前移
+    // keyIndex代表着遍历元素的位置，newIndex代表着要移动的目标位置
     var keyIndex, newIndex = 0
     while (keyIndex < capacity) {
       if (data(2 * keyIndex) != null) {
@@ -221,9 +225,9 @@ def destructiveSortedIterator(keyComparator: Comparator[K]): Iterator[(K, V)] = 
       keyIndex += 1
     }
     assert(curSize == newIndex + (if (haveNullValue) 1 else 0))
-
+    // 调用Sorter排序
     new Sorter(new KVArraySortDataFormat[K, AnyRef]).sort(data, 0, newIndex, keyComparator)
-
+    // 将结果以迭代器的形式返回
     new Iterator[(K, V)] {
       var i = 0
       var nullValueReady = haveNullValue
@@ -242,6 +246,8 @@ def destructiveSortedIterator(keyComparator: Comparator[K]): Iterator[(K, V)] = 
   }
 
 ```
+
+
 
 ##  添加数据 ##
 
@@ -524,7 +530,7 @@ def writePartitionedFile(
 这里调用了partitionedIterator方法排序返回结果，partitionedIterator方法其实是调用了merge方法合并结果。
 
 ```scala
-// spills表示溢写文件，inMemory表示最后的内存数据
+// spills表示溢写文件，inMemory表示最后一部分存在内存的数据
 private def merge(spills: Seq[SpilledFile], inMemory: Iterator[((Int, K), C)])
     : Iterator[(Int, Iterator[Product2[K, C]])] = {
   // SpillReader负责读spill文件
@@ -553,9 +559,13 @@ private def merge(spills: Seq[SpilledFile], inMemory: Iterator[((Int, K), C)])
 
 mergeWithAggregation方法的原理是调用了mergeSort方法实现排序。
 
-mergeSort的排序原理采用了并排序的算法，使用PriorityQueue优先队列实现。PriorityQueue存储Iterator，比较大小是将Iterator的第一个数据。每次从最小的Iterator取出数据后，然后将iterator重新插入到PriorityQueue，这样PriorityQueue就会将Iterator重新排序。
+mergeSort的排序原理采用了并排序的算法，使用PriorityQueue优先队列实现。PriorityQueue存储Iterator，比较大小是将Iterator的第一个数据。每次从最小的Iterator取出数据后，然后将iterator重新插入到PriorityQueue，这样PriorityQueue就会将Iterator重新排序。实例如下图所示，有三部分数据，序列按照从上到下的顺序排列。每一步都会从队列中提取一个最小的元素
 
-```
+
+
+
+
+```scala
 private def mergeSort(iterators: Seq[Iterator[Product2[K, C]]], comparator: Comparator[K])
     : Iterator[Product2[K, C]] =
 {
@@ -589,416 +599,4 @@ private def mergeSort(iterators: Seq[Iterator[Product2[K, C]]], comparator: Comp
 }
 ```
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## 排序种类 ##
-
-### 非聚合排序 ###
-
-当只使用rdd的groupby的方法，那么这里只需要分组，而不需要聚合。这种情况会使用PartitionedPairBuffer排序。首先调用PartitionedPairBuffer的insert方法，向PartitionedPairBuffer添加元素，最后调用partitionedDestructiveSortedIterator获取排序后的结果。
-
-PartitionedPairBuffer使用array存储存储元素。本来一条数据有三个属性，partition，key，value。但array 将数据切分成两部分（partition， key） 和 （value），分别存储到array的元素里。当数据的空间不足时会调用growArray申请新的数组，大小是原来的两倍。注意到array的数据类型为AnyRef，即使申请两倍的大小，占用的内存相比于数据也是比较小的。
-
-```scala
-private[spark] class PartitionedPairBuffer[K, V](initialCapacity: Int = 64) {
-    // 数据的容量
-	private var capacity = initialCapacity
-  	private var curSize = 0
-    // 因为一条数据，占用array的两个位置。所以数组的大小为 数据的容量的两倍
-  	private var data = new Array[AnyRef](2 * initialCapacity)
-    
-    def insert(partition: Int, key: K, value: V): Unit = {
-    if (curSize == capacity) {
-      // 容量不足会申请内存
-      growArray()
-    }
-    // 存储（partition， key）元素
-    data(2 * curSize) = (partition, key.asInstanceOf[AnyRef])
-    // 存储（value）元素
-    data(2 * curSize + 1) = value.asInstanceOf[AnyRef]
-    curSize += 1
-  }
-    
-  private def growArray(): Unit = {
-    if (capacity >= MAXIMUM_CAPACITY) {
-      throw new IllegalStateException(s"Can't insert more than ${MAXIMUM_CAPACITY} elements")
-    }
-    val newCapacity =
-      if (capacity * 2 < 0 || capacity * 2 > MAXIMUM_CAPACITY) { // Overflow
-        MAXIMUM_CAPACITY
-      } else {
-        capacity * 2
-      }
-    val newArray = new Array[AnyRef](2 * newCapacity)
-    System.arraycopy(data, 0, newArray, 0, 2 * capacity)
-    data = newArray
-    capacity = newCapacity
-    resetSamples()
-  }
-
-}
-	
-```
-
-Sorter这里是调用了的TimSort算法。TimSort的 定义在org.apache.spark.util.collection包里，具体原理可以搜索。当Sorter排序后，结果仍在存在data数组里。这里封装了data的访问方式，提供了Iterator的遍历。
-
-```scala
-override def partitionedDestructiveSortedIterator(keyComparator: Option[Comparator[K]])
-    : Iterator[((Int, K), V)] = {
-    val comparator = keyComparator.map(partitionKeyComparator).getOrElse(partitionComparator)
-    new Sorter(new KVArraySortDataFormat[(Int, K), AnyRef]).sort(data, 0, curSize, comparator)
-    iterator
-  }
-
-private def iterator(): Iterator[((Int, K), V)] = new Iterator[((Int, K), V)] {
-    var pos = 0
-
-    override def hasNext: Boolean = pos < curSize
-
-    override def next(): ((Int, K), V) = {
-      if (!hasNext) {
-        throw new NoSuchElementException
-      }
-      val pair = (data(2 * pos).asInstanceOf[(Int, K)], data(2 * pos + 1).asInstanceOf[V])
-      pos += 1
-      pair
-    }
-  }
-```
-
-### 聚合排序 ###
-
-
-
-
-
-## spill原理 ##
-
-当每添加一条数据时，都会检查是否需要将结果存储到磁盘中。
-
-```
-@volatile private var map = new PartitionedAppendOnlyMap[K, C]
-@volatile private var buffer = new PartitionedPairBuffer[K, C]
-
-def insertAll(records: Iterator[Product2[K, V]]): Unit = {
-  val shouldCombine = aggregator.isDefined
-
-  if (shouldCombine) {
-    // 使用map存储数据
-    val mergeValue = aggregator.get.mergeValue
-    val createCombiner = aggregator.get.createCombiner
-    var kv: Product2[K, V] = null
-    val update = (hadValue: Boolean, oldValue: C) => {
-      if (hadValue) mergeValue(oldValue, kv._2) else createCombiner(kv._2)
-    }
-    while (records.hasNext) {
-      addElementsRead()
-      kv = records.next()
-      // 调用getPartition根据key，获得partitionId
-      map.changeValue((getPartition(kv._1), kv._1), update)
-      // 检测是否触发spill
-      maybeSpillCollection(usingMap = true)
-    }
-  } else {
-    // 使用buffer存储数据
-    while (records.hasNext) {
-      addElementsRead()
-      val kv = records.next()
-      // 调用getPartition根据key，获得partitionId
-      buffer.insert(getPartition(kv._1), kv._1, kv._2.asInstanceOf[C])
-      // 检测是否触发spill
-      maybeSpillCollection(usingMap = false)
-    }
-  }
-}
-```
-
-上述maybeSpillCollection用来触发spill过程。
-
-```scala
-private def maybeSpillCollection(usingMap: Boolean): Unit = {
-    var estimatedSize = 0L
-    if (usingMap) {
-      // 获取map的大小
-      estimatedSize = map.estimateSize()
-      // 触发spill过程
-      if (maybeSpill(map, estimatedSize)) {
-        map = new PartitionedAppendOnlyMap[K, C]
-      }
-    } else {
-      // 获取buffer的大小
-      estimatedSize = buffer.estimateSize()
-      // 触发spill过程
-      if (maybeSpill(buffer, estimatedSize)) {
-        buffer = new PartitionedPairBuffer[K, C]
-      }
-    }
-  }
-
-protected def maybeSpill(collection: C, currentMemory: Long): Boolean = {
-    var shouldSpill = false
-    // 每隔32条数据，检查是否当前使用内存超过限制
-    if (elementsRead % 32 == 0 && currentMemory >= myMemoryThreshold) {
-      // 申请2倍内存
-      val amountToRequest = 2 * currentMemory - myMemoryThreshold
-      val granted = acquireMemory(amountToRequest)
-      myMemoryThreshold += granted
-      // 如果申请之后的内存，仍然不够存储，那么触发spill
-      shouldSpill = currentMemory >= myMemoryThreshold
-    }
-    // 当内存不足，或者数据大小超过了指定值，则执行spill
-    shouldSpill = shouldSpill || _elementsRead > numElementsForceSpillThreshold
-    if (shouldSpill) {
-      _spillCount += 1
-      // 调用spill
-      spill(collection)
-      _elementsRead = 0
-      _memoryBytesSpilled += currentMemory
-      // 释放数据占用的内存
-      releaseMemory()
-    }
-    // 返回是否触发了spill
-    shouldSpill
-  }
-
-override protected[this] def spill(collection: WritablePartitionedPairCollection[K, C]): Unit = {
-    // 调用destructiveSortedWritablePartitionedIterator获取排序后的结果
-    val inMemoryIterator = collection.destructiveSortedWritablePartitionedIterator(comparator)
-    // 将排序后的结果写入文件
-    val spillFile = spillMemoryIteratorToDisk(inMemoryIterator)
-    // 记录文件
-    spills += spillFile
-  }
-```
-
-spillMemoryIteratorToDisk负责将排序后的结果，写到磁盘。它生成TempShuffleBlockId，然后调用DiskBlockObjectWriter执行写动作。
-
-```scala
-  private[this] def spillMemoryIteratorToDisk(inMemoryIterator: WritablePartitionedIterator) : SpilledFile = {
-      // 创建TempShuffleBlock
-  	  val (blockId, file) = diskBlockManager.createTempShuffleBlock()
-      // 生成Writer
-      val writer: DiskBlockObjectWriter =
-      blockManager.getDiskWriter(blockId, file, serInstance, fileBufferSize, spillMetrics)
-      // 记录此次partition拥有的数据条数
-      val elementsPerPartition = new Array[Long](numPartitions)
-      // 每一次刷新，都会生成一个batch
-      val batchSizes = new ArrayBuffer[Long]
-      
-      // 属性
-      def flush(): Unit = {
-      	val segment = writer.commitAndGet()
-      	batchSizes += segment.length
-      	_diskBytesSpilled += segment.length
-      	objectsWritten = 0
-      }
-      
-      while (inMemoryIterator.hasNext) {
-          val partitionId = inMemoryIterator.nextPartition()
-          // 将数据写入writer
-          inMemoryIterator.writeNext(writer)
-          // 记录每个partition的数目
-          elementsPerPartition(partitionId) += 1
-          objectsWritten += 1
-          // 每写入固定条数的数据，则刷新写入磁盘
-          if (objectsWritten == serializerBatchSize) {
-             flush()
-          }
-      }
-      // 将剩余的数据，刷新到磁盘
-      if (objectsWritten > 0) {
-        flush()
-      }
-      // 返回SpilledFile对象，包含了此次spill文件的信息
-      SpilledFile(file, blockId, batchSizes.toArray, elementsPerPartition)
-      
-  }
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## 读取spill文件 ##
-
-spill文件首先根据partition分片，每个partitioin分片又被切分成多个batch分片。每个batch分片，才是存储了record。
-
-```shell
-------------------------------------------------------------------------------------
-                     parition 0                                  |     partition 1
-------------------------------------------------------------------------------------
-                batch 0              |       batch 1             |   
--------------------------------------------------------------------------------------
-record 0   |  record 2  |  record 3  |
-```
-
-
-
-spill的文件读取由SpillReader负责，SpillReader有几个属性比较重要：
-
-* partitionId， 当前读取record的所在partition
-* indexInPartition， 当前读取的record在partition的索引
-* batchId， 当前读取的record的所在batch
-
-* lastPartitionId，下一个record所在的partition
-* nextPartitionToRead， 要读取的下一个partition
-
-访问数据，也是按照partition的顺序遍历的。通过readNextPartition方法，返回partition的数据迭代器。
-
-```scala
-def readNextPartition(): Iterator[Product2[K, C]] = new Iterator[Product2[K, C]] {
-  // 记录当前Iterator的所在partition
-  val myPartition = nextPartitionToRead
-  nextPartitionToRead += 1
-
-  override def hasNext: Boolean = {
-    if (nextItem == null) {
-      // 调用SpillReader的readNextItem方法，返回record
-      nextItem = readNextItem()
-      if (nextItem == null) {
-        return false
-      }
-    }
-    assert(lastPartitionId >= myPartition)
-    // 如果下一个要读取的record所在的partition，不在等于当前Iterator的所在partition，
-    // 也就是当前partition的数据都已经读完
-    lastPartitionId == myPartition
-  }
-
-  override def next(): Product2[K, C] = {
-    if (!hasNext) {
-      throw new NoSuchElementException
-    }
-    val item = nextItem
-    nextItem = null
-    item
-  }
-}
-```
-
-
-
-## 合并排序结果 ##
-
-从上面的spill介绍，可以看到对于一个输入，可能会被切分，生成多个spill文件，和最后一部分存在内存的结果。目前只能切片是有序的，所以这里需要将结果合并。
-
-```sacla
-private def merge(spills: Seq[SpilledFile], inMemory: Iterator[((Int, K), C)])
-    : Iterator[(Int, Iterator[Product2[K, C]])] = {
-  // 为每个spill file 生成 SpillReader
-  val readers = spills.map(new SpillReader(_))
-  val inMemBuffered = inMemory.buffered
-  // 按照partition顺序，遍历各个切片
-  (0 until numPartitions).iterator.map { p =>
-    val inMemIterator = new IteratorForPartition(p, inMemBuffered)
-    // 合并切片为一个iterators
-    val iterators = readers.map(_.readNextPartition()) ++ Seq(inMemIterator)
-    if (aggregator.isDefined) {
-      // 指定了聚合，调用mergeWithAggregation排序
-      (p, mergeWithAggregation(
-        iterators, aggregator.get.mergeCombiners, keyComparator, ordering.isDefined))
-    } else if (ordering.isDefined) {
-      // 指定了order，调用mergeSort合并排序
-      (p, mergeSort(iterators, ordering.get))
-    } else {
-      // 因为这里已经保证了iterators是按照partition排序
-      (p, iterators.iterator.flatten)
-    }
-  }
-}
-```
-
-
-
-### 指定聚合 ###
-
-
-
-
-
-### 指定order ###
-
-这里使用了合并排序的算法。实现使用了PriorityQueue。PriorityQueue存储Iterator，比较大小是将Iterator的第一个数据。每次从最小的Iterator取出数据后，然后将iterator重新插入到PriorityQueue，这样PriorityQueue就会将Iterator重新排序。
-
-```
-private def mergeSort(iterators: Seq[Iterator[Product2[K, C]]], comparator: Comparator[K])
-    : Iterator[Product2[K, C]] =
-{
-  val bufferedIters = iterators.filter(_.hasNext).map(_.buffered)
-  type Iter = BufferedIterator[Product2[K, C]]
-  val heap = new mutable.PriorityQueue[Iter]()(new Ordering[Iter] {
-    // Use the reverse of comparator.compare because PriorityQueue dequeues the max
-    override 
-    def compare(x: Iter, y: Iter): Int = -comparator.compare(x.head._1, y.head._1)
-  })
-  // 添加所有的iterator
-  heap.enqueue(bufferedIters: _*)  // Will contain only the iterators with hasNext = true
-  new Iterator[Product2[K, C]] {
-    override def hasNext: Boolean = !heap.isEmpty
-
-    override def next(): Product2[K, C] = {
-      if (!hasNext) {
-        throw new NoSuchElementException
-      }
-      // 取出最小的iterator
-      val firstBuf = heap.dequeue()
-      // 从iterator中取第一个数据
-      val firstPair = firstBuf.next()
-      if (firstBuf.hasNext) {
-        // 重新插入到PriorityQueue， 让PriorityQueue重新排序
-        heap.enqueue(firstBuf)
-      }
-      firstPair
-    }
-  }
-}
-```
 
