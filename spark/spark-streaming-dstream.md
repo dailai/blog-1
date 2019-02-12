@@ -335,15 +335,13 @@ class ForEachDStream[T: ClassTag] (
 
 
 
-
-
-
-
 ## 任务提交 ##
 
+首先介绍 EventLoop类和RecurringTimer类，它们在任务提交中都有使用到。
 
+### 时间处理器  EventLoop
 
-首先介绍 EventLoop类，它包含了一个任务队列，和一个处理任务的线程。子类需要继承onReceive方法，实现任务的处理。
+EventLoop用于线程之间的通信。它包含了一个任务队列，和一个处理任务的线程。子类需要继承onReceive方法，实现任务的处理。
 
 ```
 private[spark] abstract class EventLoop[E](name: String) extends Logging {
@@ -387,6 +385,8 @@ private[spark] abstract class EventLoop[E](name: String) extends Logging {
 
 
 
+### 定时任务  RecurringTimer
+
 RecurringTimer负责定时回调，它有一个后台线程，定时检查时间。每隔一段时间，就会回调。
 
 ```
@@ -426,7 +426,9 @@ class RecurringTimer(clock: Clock, period: Long, callback: (Long) => Unit, name:
 
 
 
-接下来介绍JobGenerator类，它有一个EventLoop实例，处理JobGeneratorEvent事件。
+### Job生成 JobGenerator ###
+
+JobGenerator类，它有一个EventLoop实例，处理JobGeneratorEvent事件。
 
 ```scala
 class JobGenerator(jobScheduler: JobScheduler) extends Logging {
@@ -448,11 +450,9 @@ class JobGenerator(jobScheduler: JobScheduler) extends Logging {
 }
 ```
 
-JobGenerator当接收到GenerateJobs事件后，就会调用generateJobs方法处理。
-
 JobGenerator类还有一个线程，定时发送GenerateJobs事件。
 
-```
+```scala
 class JobGenerator(jobScheduler: JobScheduler) extends Logging {
   // 实例化RecurringTimer，定时向eventLoop发送GenerateJobs事件
   // 时间间隔在StreamingContext初始化时指定
@@ -461,18 +461,21 @@ class JobGenerator(jobScheduler: JobScheduler) extends Logging {
 }
 ```
 
-然后继续看generateJobs方法，是如何生成Job
+JobGenerator当接收到GenerateJobs事件后，就会调用generateJobs方法处理。继续看generateJobs方法，是如何生成Job
 
 ```scala
 private def generateJobs(time: Time) {
   Try {
-    // 通知receiverTracker生成数据批次
+    // 通知receiverTracker生成此次Job的数据批次
     jobScheduler.receiverTracker.allocateBlocksToBatch(time) // allocate received blocks to batch
     // 调用DStreamGraph生成Job
     graph.generateJobs(time) // generate jobs using allocated block
   } match {
     case Success(jobs) =>
+      // 生成Job成功，然后提交Job
+      // 获取该Job的数据输入信息
       val streamIdToInputInfos = jobScheduler.inputInfoTracker.getInfo(time)
+      // 通知jobScheduler提交JobSet
       jobScheduler.submitJobSet(JobSet(time, jobs, streamIdToInputInfos))
     case Failure(e) =>
       jobScheduler.reportError("Error generating jobs for time " + time, e)
@@ -482,7 +485,7 @@ private def generateJobs(time: Time) {
 }
 ```
 
-DStreamGraph类包含了所有的输出流，它会为每个输出流都生成一个Job
+上面使用了DStreamGraph生成Job列表。DStreamGraph包含了所有的输出流，它会为每个输出流都生成一个Job
 
 ```scala
 final private[streaming] class DStreamGraph extends Serializable with Logging {
@@ -493,7 +496,7 @@ final private[streaming] class DStreamGraph extends Serializable with Logging {
     val jobs = this.synchronized {
       // 遍历输出流
       outputStreams.flatMap { outputStream =>
-        // 调用输出流，生成Job
+        // 调用输出流的generateJob方法，生成Job
         val jobOption = outputStream.generateJob(time)
         jobOption.foreach(_.setCallSite(outputStream.creationSite))
         jobOption
@@ -504,3 +507,149 @@ final private[streaming] class DStreamGraph extends Serializable with Logging {
   }
 }
 ```
+
+
+
+### Job集合 ###
+
+JobSet类包含了Job的集合，和记录了处理信息（开始时间，结束时间）。它提供了对应的接口，来更新JobSet的信息。
+
+
+
+### Job调度 JobScheduler ###
+
+JobScheduler包含了JobSet的集合和一个线程池负责提交Job。
+
+```scala
+class JobScheduler(val ssc: StreamingContext) extends Logging {
+  // JobSet集合，Key为该JobSet的批次时间
+  private val jobSets: java.util.Map[Time, JobSet] = new ConcurrentHashMap[Time, JobSet]
+  // 后台线程池，负责提交Job
+  private val numConcurrentJobs = ssc.conf.getInt("spark.streaming.concurrentJobs", 1)
+  private val jobExecutor =
+    ThreadUtils.newDaemonFixedThreadPool(numConcurrentJobs, "streaming-job-executor")
+  
+  def submitJobSet(jobSet: JobSet) {
+    if (jobSet.jobs.isEmpty) {
+      logInfo("No jobs added for time " + jobSet.time)
+    } else {
+      listenerBus.post(StreamingListenerBatchSubmitted(jobSet.toBatchInfo))
+      // 添加到jobSets集合
+      jobSets.put(jobSet.time, jobSet)
+      // 后台线程提交Job
+      jobSet.jobs.foreach(job => jobExecutor.execute(new JobHandler(job)))
+      logInfo("Added jobs for time " + jobSet.time)
+    }
+  }
+  
+  private class JobHandler(job: Job) extends Runnable with Logging {
+    import JobScheduler._
+
+    def run() {
+      val oldProps = ssc.sparkContext.getLocalProperties
+      try {
+        var _eventLoop = eventLoop
+        if (_eventLoop != null) {
+          // 发送JobStarted事件
+          _eventLoop.post(JobStarted(job, clock.getTimeMillis()))
+          SparkHadoopWriterUtils.disableOutputSpecValidation.withValue(true) {
+            // 执行job的run方法，提交Job并且等待完成
+            job.run()
+          }
+          _eventLoop = eventLoop
+          if (_eventLoop != null) {
+            // 发送JobCompleted事件
+            _eventLoop.post(JobCompleted(job, clock.getTimeMillis()))
+          }
+        } else {
+          // JobScheduler has been stopped.
+        }
+      } finally {
+        ssc.sparkContext.setLocalProperties(oldProps)
+      }
+    }
+  }  
+
+```
+
+它还包含了一个事件处理器，负责处理JobSchedulerEvent事件，主要负责更新JobSet的状态。
+
+```scala
+class JobScheduler(val ssc: StreamingContext) extends Logging {
+
+  private var eventLoop: EventLoop[JobSchedulerEvent] = null
+
+  // JobScheduler的初始化方法
+  def start(): Unit = synchronized {
+    // 实例EventLoop， 处理JobSchedulerEvent事件
+    eventLoop = new EventLoop[JobSchedulerEvent]("JobScheduler") {
+      // 调用processEvent方法处理事件
+      override protected def onReceive(event: JobSchedulerEvent): Unit = processEvent(event)
+
+      override protected def onError(e: Throwable): Unit = reportError("Error in job scheduler", e)
+    }
+    eventLoop.start()
+  }
+
+  private def processEvent(event: JobSchedulerEvent) {
+    try {
+      event match {
+        // 处理Job开始
+        case JobStarted(job, startTime) => handleJobStart(job, startTime)
+        // 处理Job完成
+        case JobCompleted(job, completedTime) => handleJobCompletion(job, completedTime)
+        // 处理Job失败
+        case ErrorReported(m, e) => handleError(m, e)
+      }
+    } catch {
+      case e: Throwable =>
+        reportError("Error in job scheduler", e)
+    }
+  }
+    
+  private def handleJobStart(job: Job, startTime: Long) {
+    // 获取JobSet
+    val jobSet = jobSets.get(job.time)
+    // 更新jobSet的状态
+    jobSet.handleJobStart(job)
+    // 设置job的开始执行时间
+    job.setStartTime(startTime)
+    logInfo("Starting job " + job.id + " from job set of time " + jobSet.time)
+  }
+
+  private def handleJobCompletion(job: Job, completedTime: Long) {
+    // 获取JobSet
+    val jobSet = jobSets.get(job.time)
+    // 更新jobSet的状态
+    jobSet.handleJobCompletion(job)
+    // 设置job的结束时间
+    job.setEndTime(completedTime)
+    // 处理job执行的结果
+    job.result match {
+      case Failure(e) =>
+        reportError("Error running job " + job, e)
+      case _ =>
+        // 如果jobSet中所有的job都完成，则从jobSets删除掉
+        if (jobSet.hasCompleted) {
+          jobSets.remove(jobSet.time)
+          // 通知jobGenerator，这个批次的Job已经完成
+          jobGenerator.onBatchCompletion(jobSet.time)
+          logInfo("Total delay: %.3f s for time %s (execution: %.3f s)".format(
+            jobSet.totalDelay / 1000.0, jobSet.time.toString,
+            jobSet.processingDelay / 1000.0
+          ))
+        }
+    }
+  }
+}    
+  
+```
+
+
+
+
+
+
+
+
+
