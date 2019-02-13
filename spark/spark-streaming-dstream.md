@@ -1,8 +1,6 @@
-# Spark Streaming Dstream 的原理 #
+# Spark Streaming 的 Dstream 原理 #
 
-在spark streaming中，数据会被切成一个个批次的，然后分批进行处理。Dstream表示数据流，它会将数据按照时间间隔，分成一个个的数据块RDD，然后提交给spark core执行。接下来看看Dstream的原理
-
-Dstream 是 spark streaming 的基本单位，先来看看一个小例子，引用自官网
+先来看看spark streaming的一个例子，引用自官网
 
 ```scala
 import org.apache.spark._
@@ -31,6 +29,8 @@ ssc.awaitTermination()
 
 
 ## DStream和RDD的联系 ##
+
+Dstream 是 spark streaming 的基本单位，表示数据流。它会将数据按照时间间隔，将数据分批，每个批次的数据都会转换为RDD，然后提交给spark core执行。
 
 接下来看看各种DStream是如何转换为RDD的
 
