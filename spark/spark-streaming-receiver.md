@@ -2,41 +2,37 @@
 
   
 
-Spark Streaming 支持多种数据源，数据源的读取流程比较复杂，过程如下图所示
+Spark Streaming 支持多种数据源，数据源的读取涉及到多个组件，流程如下图所示
 
 
 
-数据源的读取都是由Receiver负责。Receiver会启动后台线程，持续的拉取数据，发送给 ReceiverSupervisorImpl处理。
+数据源的读取都是由Receiver负责。Receiver会启动后台线程，持续的拉取数据，发送给ReceiverSupervisorImpl处理。
 
 ReceiverSupervisorImpl是运行在executor端的服务，它会将接收的数转发给BlockGenerator。
 
-BlockGenerator 接收数据后，会先缓存起来，每隔一段时间，就会将缓存的数据封装成Block保存起来，然后将Block的信息发送到driver端。
+BlockGenerator 接收数据后，会先缓存起来。然后每隔一段时间，就会将缓存的数据封装成Block保存起来，然后将Block的信息发送到driver端。
 
 
 
-## Receiver 启动 ##
+## Receiver 任务运行 ##
 
-Receiver是运行在executor端的，它是作为spark core的任务运行的。而任务提交是由driver端的ReceiverTracker负责，我们需要弄清ReceiverTracker是如何提交的
+Receiver 是运行在executor端的，它是作为spark core的任务运行的。而任务提交是由driver端的ReceiverTracker负责，我们先弄清楚ReceiverTracker是如何提交的
 
 ### ReceiverTracker 提交任务 ###
 
-ReceiverTracker首先从DStreamGraph中获取所有的ReceiverInputDStream，然后取得它的Receiver。这样就得到了Receiver列表，然后为每一个Receiver分配一个Executor，运行ReceiverSupervisorImpl服务。这里运行的Executor是一直占用的，直到整个spark streaming的任务停止。
+ReceiverTracker首先从DStreamGraph中获取所有的ReceiverInputDStream，然后取得它的Receiver。这样就得到了Receiver列表，然后为每一个Receiver分配一个Executor，运行ReceiverSupervisorImpl服务。ReceiverSupervisorImpl服务会一直占用Executor，直到整个spark streaming停止。
 
-首先来看下是怎么分配receiver的运行位置。分配算法由ReceiverSchedulingPolicy类负责，原理如下
+首先来看下是怎么分配 receiver 的运行位置。分配算法由ReceiverSchedulingPolicy类负责，原理如下：
 
-首先介绍三个变量：
-
-* hostToExecutors， 每个host对应的executor列表
-* scheduledLocations， 每个recevier对应的TaskLocation列表
-* numReceiversOnExecutor， 每个executor可能执行receiver的数目
-
-再介绍分配算法：
-
-1. 首先根据 receiver 指定的 host 位置，从该 host 的executor 列表中，找到对应 receiver 数目最少的那个，分配给 这个 receiver
+1. 首先根据 receiver 指定的 host 位置，从在该 host 的executor 中，找到对应 receiver 数目最少的那个，分配给 这个 receiver
 2. 将剩下没有指定位置的 receiver，从所有 executor 中，找到对应 receiver 数目最少的那个，分配给这个 receiver
 3. 如果还有空闲的executor，那么从 receiver 列表中，找到分配 executor 数目最少的那个receiver，然后将这个空闲executor分配给receiver
 
-代码如下：
+代码如下，先介绍三个变量：
+
+- hostToExecutors， 每个host对应的executor列表
+- scheduledLocations， 每个recevier对应的TaskLocation列表
+- numReceiversOnExecutor， 每个executor可能执行receiver的数目
 
 ```scala
 def scheduleReceivers(
@@ -148,7 +144,7 @@ private def startReceiver(
 
 ### ReceiverSupervisorImpl 启动 ###
 
-上面介绍了driver端向spark提交了运行 Receiver 的 任务，接下来看看receiver在executor端的启动。executor端的启动函数是调用了ReceiverSupervisorImpl的start方法， ReceiverSupervisorImpl继承ReceiverSupervisor。
+上面介绍了 driver 端向 spark 提交了运行 Receiver 的 任务，接下来看看 receiver 在 executor 端的启动过程。executor 端的启动函数是调用了ReceiverSupervisorImpl的 start 方法， ReceiverSupervisorImpl继承ReceiverSupervisor。
 
 ```scala
 private[streaming] abstract class ReceiverSupervisor(
@@ -219,7 +215,9 @@ private[streaming] class ReceiverSupervisorImpl(
 
 
 
-接下来看Receiver类的启动，Receiver类只是一个抽象类，它只提供了保存数据的接口。子类需要实现onStart方法，完成初始化，这个方法不能阻塞。以SocketReceiver为例，它的onStart方法是启动了一个后台线程，读取socket的数据，然后存储到receiver里。
+### Receiver 启动 ###
+
+Receiver类只是一个抽象类，它只提供了保存数据的接口。子类需要实现 onStart 方法，完成初始化，这个方法不能阻塞。以SocketReceiver为例，它的 onStart 方法是启动了一个后台线程，读取 socket 的数据，然后存储到 receiver 里。
 
 ```scala
 class SocketReceiver[T: ClassTag](
@@ -243,13 +241,14 @@ class SocketReceiver[T: ClassTag](
   def receive() {
     val iterator = bytesToObjects(socket.getInputStream())
     while(!isStopped && iterator.hasNext) {
-      // 调用store方法存储数据
+      // 读取数据，并且调用store方法存储数据
       store(iterator.next())
     }
   }
+}
 ```
 
-从上面的代码可以看到，Receiver提供了store方法保存单条数据。
+从上面的代码可以看到，Receiver提供了 store 方法保存数据。Receiver的数据经过ReceiverSupervisorImpl最终添加到了BlockGenerator的缓存队列。
 
 ```scala
 abstract class Receiver[T](val storageLevel: StorageLevel) extends Serializable {
@@ -454,7 +453,7 @@ private[streaming] class ReceiverSupervisorImpl
 
 ## ReceiverTracker 接收 Block 信息 ##
 
-ReceiverTracker类启动着一个Rpc服务ReceiverTrackerEndpoint，负责处理从executor端发过来的Block信息。
+ReceiverTracker运行在 driver 节点上，它启动着一个Rpc服务ReceiverTrackerEndpoint，负责处理从executor端发过来的Block信息。
 
 它有两个重要变量：
 
