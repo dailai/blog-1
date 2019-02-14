@@ -2,6 +2,31 @@
 
 
 
+
+
+WriteAheadLog是一个接口，提供了读取，写入，删除WAL日志的方法。
+
+```scala
+public abstract class WriteAheadLog {
+  
+  // 将数据写入到WAL文件，参数record为即将保存的数据，参数time表示数据的结束时间
+  // 返回WriteAheadLogRecordHandle对象，包含了存储的信息
+  public abstract WriteAheadLogRecordHandle write(ByteBuffer record, long time);
+  
+  // 根据write方法返回的信息，来读取对应的数据
+  public abstract ByteBuffer read(WriteAheadLogRecordHandle handle);
+
+  // 读取所有还未过期的数据
+  public abstract Iterator<ByteBuffer> readAll();
+
+  // 清除过期的WAL文件，参数threshTime表示截止时间
+  public abstract void clean(long threshTime, boolean waitForCompletion);
+  
+}  
+```
+
+
+
 spark streaming 为了实现了高可用，引入了 wal （write ahead log）。当receiver端 存储数据的时候，如果配置了wal选项，会先将数据以wal的格式存储起来。
 
 
