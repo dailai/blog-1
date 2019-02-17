@@ -1,4 +1,4 @@
-# Spark Streaming 的 Dstream 原理 #
+# Spark Streaming 的 运行原理 #
 
 先来看看spark streaming的一个例子，引用自官网
 
@@ -28,9 +28,15 @@ ssc.awaitTermination()
 
 
 
-## DStream和RDD的联系 ##
+上面例子的DStream运行的流程如下，
 
-Dstream 是 spark streaming 的基本单位，表示数据流。它会将数据按照时间间隔，将数据分批，每个批次的数据都会转换为RDD，然后提交给spark core执行。
+
+
+ 
+
+## DStream的原理 ##
+
+DStream 是 spark streaming 的基本单位，表示数据流。它会将数据按照时间间隔，将数据分批，每个批次的数据都会转换为RDD，然后提交给spark core执行。首先我们先来看看DStream是如何
 
 接下来看看各种DStream是如何转换为RDD的
 
@@ -343,7 +349,7 @@ class ForEachDStream[T: ClassTag] (
 
 EventLoop用于线程之间的通信。它包含了一个任务队列，和一个处理任务的线程。子类需要继承onReceive方法，实现任务的处理。
 
-```
+```scala
 private[spark] abstract class EventLoop[E](name: String) extends Logging {
   // 任务队列
   private val eventQueue: BlockingQueue[E] = new LinkedBlockingDeque[E]()
@@ -389,7 +395,7 @@ private[spark] abstract class EventLoop[E](name: String) extends Logging {
 
 RecurringTimer负责定时回调，它有一个后台线程，定时检查时间。每隔一段时间，就会回调。
 
-```
+```scala
 class RecurringTimer(clock: Clock, period: Long, callback: (Long) => Unit, name: String)
   extends Logging {
   // 定时线程

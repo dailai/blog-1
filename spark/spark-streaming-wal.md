@@ -10,7 +10,7 @@ WAL表示预写日志，经常在数据库中会使用到，在宕机后也能�
 
 ## WAL Writer 种类 ##
 
-WriteAheadLog是WAL处理的抽象类，提供了读取，写入，删除WAL日志的方法。
+WriteAheadLog是WAL处理的抽象类，由如下方法，提供了读取，写入，删除WAL。
 
 ```scala
 public abstract class WriteAheadLog {
@@ -27,7 +27,7 @@ public abstract class WriteAheadLog {
 
   // 清除过期的WAL文件，参数threshTime表示截止时间
   public abstract void clean(long threshTime, boolean waitForCompletion);
-}  
+}
 ```
 
 WriteAheadLog有两个子类，对应不同的存储原理。 
@@ -40,7 +40,7 @@ WriteAheadLog有两个子类，对应不同的存储原理。
 
 ## FileBasedWriteAheadLog 原理 ##
 
-executor节点上的WAL采用了FileBasedWriteAheadLog管理。如果要支持wal，必须指定 checkpoint 的目录。
+executor 节点上的WAL采用了FileBasedWriteAheadLog管理。如果要支持 wal，必须指定 checkpoint 的目录。
 
 它的WAL目录格式如下：
 
@@ -55,15 +55,15 @@ checkpointDir/
 │   └── streamId2
 ```
 
-wal的根目录是checkpoint 目录下的receivedData目录。
+wal的根目录是 checkpoint 目录下的 receivedData 目录。
 
-每个receiver都有独立的目录，目录名为它的 id 号。
+每个 receiver 都有独立的目录，目录名为它的 id 号。
 
-在每个独立的目录下，还会按照时间范围存储WAL，文件名中包含了起始时间和结束时间。 
+在每个独立的目录下，还会按照时间范围存储WAL文件，文件名中包含了起始时间和结束时间。 
 
 ### WAL创建 ###
 
-WAL的创建由write方法负责。再介绍write方法之前，需要先介绍FileBasedWriteAheadLogWriter类。它负责wal的写入，会将数据写入到hdfs里。
+WAL的创建由write方法负责。再介绍write方法之前，需要先介绍FileBasedWriteAheadLogWriter类。它负责wal的写入，会将数据写入到 可靠的文件系统 hdfs 里。
 
 ```scala
 class FileBasedWriteAheadLogWriter(path: String, hadoopConf: Configuration)
@@ -101,9 +101,9 @@ class FileBasedWriteAheadLogWriter(path: String, hadoopConf: Configuration)
 }
 ```
 
-FileBasedWriteAheadLogWriter的write方法返回 FileBasedWriteAheadLogSegment类，表示了此次WAL的位置信息。后面的WAL读取，会通过它来找到位置。
+FileBasedWriteAheadLogWriter的write方法返回FileBasedWriteAheadLogSegment结果，表示了此次WAL数据的位置信息。后面的WAL读取，会通过它来找到位置。
 
-接下来看看FileBasedWriteAheadLog的write方法。它会根据时间范围，来判断是否需要新建WAL。
+接下来看看FileBasedWriteAheadLog的write方法。它会根据时间范围，存储到不同的文件中。
 
 ```scala
 private[streaming] class FileBasedWriteAheadLog {
@@ -179,7 +179,7 @@ private[streaming] class FileBasedWriteAheadLog {
 
 ### WAL 读取 ###
 
-WAL的读取由read方法负责，它只是通过FileBasedWriteAheadLogRandomReader来读取。FileBasedWriteAheadLogRandomReader支持seek操作。
+WAL的读取由read方法负责，它只是通过FileBasedWriteAheadLogRandomReader来读取。FileBasedWriteAheadLogRandomReader支持seek操作，所以它支持单次数据的读取。
 
 ```scala
 class FileBasedWriteAheadLog {  
@@ -226,7 +226,7 @@ class FileBasedWriteAheadLogRandomReader(path: String, conf: Configuration)
 
 ### WAL 删除 ###
 
-spark streaming处理的是流数据，它不可能会将所有的数据都保存下来。所以对于处理过的数据，它会定期删除掉。FileBasedWriteAheadLog提供了clean接口，来处理过期的数据
+spark streaming处理的是流数据，它不可能会将所有的数据都保存下来。所以对于处理过的数据，它会定期删除掉。FileBasedWriteAheadLog同样提供了clean接口，来处理过期的数据
 
 ```scala
 class FileBasedWriteAheadLog {
@@ -282,9 +282,9 @@ class FileBasedWriteAheadLog {
 
 ## BatchedWriteAheadLog ##
 
-BatchedWriteAheadLog只运行在driver端，还需要spark配置中指定spark.streaming.driver.writeAheadLog.allowBatching选项为true。
+BatchedWriteAheadLog只运行在driver端，还需要spark配置中指定spark.streaming.driver.writeAheadLog.allowBatching选项为true。它会将数据线缓存起来，然后一次取多条数据，封装成一个批次存储到文件中。这样提高了系统的吞吐量。
 
-BatchedWriteAheadLog将每次请求写入的数据，先缓存到一个队列。
+BatchedWriteAheadLog首先将每次请求写入的数据，先缓存到一个队列。
 
 ```scala
 class BatchedWriteAheadLog(val wrappedLog: WriteAheadLog, conf: SparkConf) {
