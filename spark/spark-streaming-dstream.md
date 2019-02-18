@@ -32,19 +32,17 @@ ssc.awaitTermination()
 
 
 
- 
+整个Spark Streaming的运行，先由DStream将数据分批，然后生成RDD，最后将任务提交给Spark Core 运行。
+
+
 
 ## DStream的原理 ##
 
-DStream 是 spark streaming 的基本单位，表示数据流。它会将数据按照时间间隔，将数据分批，每个批次的数据都会转换为RDD，然后提交给spark core执行。首先我们先来看看DStream是如何
-
-接下来看看各种DStream是如何转换为RDD的
-
-Dstream的compute方法，负责将流转换为RDD。
+DStream 是 spark streaming 的基本单位，表示数据流。它会将数据按照时间间隔，将数据分批，每个批次的数据都会转换为RDD。Dstream的 compute 方法，负责将流转换为RDD，它接收时间参数，表示上次时间到此次时间生成的RDD。不同种类的DStream，生成RDD的原理也不一样，下面依次介绍
 
 ### 数据源流 ###
 
-ReceiverInputDStream表示数据源流，它的数据存在spark的Block里。 ReceiverInputDStream流会从receiverTracker服务中获取数据存放的Block位置，然后根据位置生成BlockRDD。
+ReceiverInputDStream表示数据源流，它的数据存在spark的BlockManager里。 ReceiverInputDStream流会从ReceiverTracker服务中获取存放数据的Block位置，然后根据位置生成BlockRDD。
 
 ```scala
 abstract class ReceiverInputDStream[T: ClassTag](_ssc: StreamingContext)
@@ -52,7 +50,6 @@ abstract class ReceiverInputDStream[T: ClassTag](_ssc: StreamingContext)
   
   override def compute(validTime: Time): Option[RDD[T]] = {
     val blockRDD = {
-
       if (validTime < graph.startTime) {
         // If this is called for any time before the start time of the context,
         // then this returns an empty RDD. This may happen when recovering from a
@@ -79,7 +76,7 @@ abstract class ReceiverInputDStream[T: ClassTag](_ssc: StreamingContext)
       // 查看是否所有的Block都是wal日志
       val areWALRecordHandlesPresent = blockInfos.forall { _.walRecordHandleOption.nonEmpty }
       if (areWALRecordHandlesPresent) {
-        // 如果所有的Block都是wal日志，那么返回WALBackedBlockRDD
+        // 如果所有的Block都支持wal，那么返回WALBackedBlockRDD
         val isBlockIdValid = blockInfos.map { _.isBlockIdValid() }.toArray
         val walRecordHandles = blockInfos.map { _.walRecordHandleOption.get }.toArray
         new WriteAheadLogBackedBlockRDD[T](
@@ -98,11 +95,6 @@ abstract class ReceiverInputDStream[T: ClassTag](_ssc: StreamingContext)
         val validBlockIds = blockIds.filter { id =>
           ssc.sparkContext.env.blockManager.master.contains(id)
         }
-        if (validBlockIds.length != blockIds.length) {
-          logWarning("Some blocks could not be recovered as they were not found in memory. " +
-            "To prevent such data loss, enable Write Ahead Log (see programming guide " +
-            "for more details.")
-        }
         // 返回BlockRDD
         new BlockRDD[T](ssc.sc, validBlockIds)
       }
@@ -116,9 +108,10 @@ abstract class ReceiverInputDStream[T: ClassTag](_ssc: StreamingContext)
       }
     }
   }
+}
 ```
 
-
+这里简单介绍下BlockRDD和WALBackedBlockRDD。BlockRDD会去对应 executor 节点上的BlockManager服务，获取对应的数据。WALBackedBlockRDD支持WAL读取，只有在BlockManager的数据遭到损坏时，才会读取WAL。
 
 ### map数据流 ###
 
@@ -172,7 +165,7 @@ class FlatMappedDStream[T: ClassTag, U: ClassTag](
 
 ### reduce 数据流 ###
 
-当Dsteam调用reduceByKey后，会返回ShuffledDStream。Dsteam可以隐式转换PairDStreamFunctions类
+当Dsteam调用reduceByKey后，会返回ShuffledDStream。Dsteam可以隐式转换PairDStreamFunctions类，reduceByKey的方法定义是在PairDStreamFunctions类。
 
 ```scala
 def reduceByKey(reduceFunc: (V, V) => V): DStream[(K, V)] = ssc.withScope {
@@ -518,7 +511,7 @@ final private[streaming] class DStreamGraph extends Serializable with Logging {
 
 ### Job集合 ###
 
-JobSet类包含了Job的集合，和记录了处理信息（开始时间，结束时间）。它提供了对应的接口，来更新JobSet的信息。
+JobSet类包含了Job的集合，和记录了处理信息（开始时间，结束时间）。它提供了对应的接口，来更新JobSet的状态。
 
 
 
