@@ -336,7 +336,11 @@ class ForEachDStream[T: ClassTag] (
 
 ## 任务提交 ##
 
-首先介绍 EventLoop类和RecurringTimer类，它们在任务提交中都有使用到。
+spark streaming会定时的生成rdd，然后生成Job，通过JobScheduler提交给spark context，过程如下图所示
+
+
+
+首先介绍两个工具类EventLoop类和RecurringTimer，它们在任务提交中都有使用到。
 
 ### 时间处理器  EventLoop
 
@@ -640,8 +644,7 @@ class JobScheduler(val ssc: StreamingContext) extends Logging {
         }
     }
   }
-}    
-  
+}
 ```
 
 
