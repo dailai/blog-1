@@ -1,38 +1,71 @@
 # Spark Streaming Kafka 原理 #
 
-Spark Streaming支持Kafka数据源，Kafka作为一个消息队列，具有很高的吞吐量，和Spark Streaming结合起来，可以实现高速实时的处理数据。
+Spark Streaming支持Kafka数据源，Kafka作为一个消息队列，具有很高的吞吐量，和Spark Streaming结合起来，可以实现高速实时的处理数据。Spark Streaming在以前的版本支持两种方式读取Kafka，一种是通过 receiver 读取的方式，另一种是直接读取的方式。基于 receiver 方式的读取，不太稳定，已经被最新版遗弃了，所以下面只讲直接读取的方式。
 
 
 
-以前的版本支持两种方式读取Kafka，一种是通过 receiver 读取的方式，另一种是直接读取的方式。基于 receiver 方式的读取，不太稳定，已经被最新版遗弃了，所以下面只讲直接读取的方式。
+## Kafka数据流生成RDD ##
+
+Kafka数据流由DirectKafkaInputDStream类表示，它会定期生成分片数据的RDD。DirectKafkaInputDStream每次生成任务的时候，都会从Kafka中获取该topic的所有分区的最新offset，生成RDD包括上次提交的offset一直到最新的offset。
+
+DirectKafkaInputDStream的compute方法负责生成RDD
+
+```scala
+class DirectKafkaInputDStream[K, V](
+    _ssc: StreamingContext,
+    locationStrategy: LocationStrategy,
+    consumerStrategy: ConsumerStrategy[K, V],
+    ppc: PerPartitionConfig
+  ) extends InputDStream[ConsumerRecord[K, V]](_ssc) with Logging with CanCommitOffsets {
+
+  // 记录上次提交的offset
+  protected var currentOffsets = Map[TopicPartition, Long]()
+  
+  override def compute(validTime: Time): Option[KafkaRDD[K, V]] = {
+    // 这里调用了latestOffsets方法，实时获取topic partition的最新offset
+    // clamp方法增加了限速的功能，计算出限速条件下，允许获取最大的offset
+    val untilOffsets = clamp(latestOffsets())
+    // 为每一个topic partition生成一个OffsetRange
+    val offsetRanges = untilOffsets.map { case (tp, uo) =>
+      // 获取上次提交的offset
+      val fo = currentOffsets(tp)
+      // 这批数据在kafka中的offset范围，是上次提交的offset到现在kafka中最新的offset
+      OffsetRange(tp.topic, tp.partition, fo, uo)
+    }
+    
+    val useConsumerCache = context.conf.getBoolean("spark.streaming.kafka.consumer.cache.enabled",
+      true)
+    // 生成KafkaRDD
+    val rdd = new KafkaRDD[K, V](context.sparkContext, executorKafkaParams, offsetRanges.toArray,
+      getPreferredHosts, useConsumerCache)
+    // 更新currentOffsets
+    currentOffsets = untilOffsets
+    // 这里commitAll会去提交offset，但是DirectKafkaInputDStream是不管理offset，
+    // 只有用户主动调用了它的commitAsync方法，才会提交
+    commitAll()
+    // 返回 rdd
+    Some(rdd)
+  }
+}
+```
 
 
 
-首先介绍下DirectKafkaInputDStream类，它表示Kafka数据流。它会生成分片数据的RDD。
+## KafkaRDD 原理 ##
 
-它每次生成RDD的时候，都会从Kafka中获取该topic的所有分区的最新offset，生成RDD包括上次提交的offset一直到最新的offset。
+### KafkaRDD 分区原理 ###
 
+DirectKafkaInputDStream会定时生成KafkaRDD，我们首先看看 KafkaRDD是如何划分分区的，它会根据从DirectKafkaInputDStream获取到的offset信息，生成KafkaRDDPartition分区，每个分区对应着Kafka的一个topic partition 的一段数据。这段数据的信息由OffsetRange表示， 它保存了数据的位置。
 
+```scala
+final class OffsetRange private(
+    val topic: String,   // Kafka的topic名称
+    val partition: Int,  // 该topic的partition
+    val fromOffset: Long,  // 起始offset
+    val untilOffset: Long);  // 截至offset
+```
 
-DirectKafkaInputDStream还支持限速
-
-
-
-
-
-
-
-
-
-KafkaRDD
-
-
-
-KafkaRDD为compute生成的RDD，将Kafka的分区数目切断，
-
-
-
-首先看KafkaRDD是如何划分分区的，
+KafkaRDD的getPartitions负责生成分区
 
 ```scala
 private[spark] class KafkaRDD[K, V](
@@ -47,24 +80,10 @@ private[spark] class KafkaRDD[K, V](
 }
 ```
 
-
-
-KafkaRDD的分区，对应着Kafka的一个topic partition 的一段数据，由KafkaRDDPartition表示。
-
-每个KafkaRDDPartition对应这一个OffsetRange， OffsetRange保存了数据的位置。
+接下来看看KafkaRDD的分区数据是如何读取的。它使用KafkaRDDIterator遍历数据，而KafkaRDDIterator的原理，是调用CachedKafkaConsumer的get方法获取数据
 
 ```scala
-final class OffsetRange private(
-    val topic: String,   // Kafka的topic名称
-    val partition: Int,  // 该topic的partition
-    val fromOffset: Long,  // 起始offset
-    val untilOffset: Long);  // 截至offset
-```
-
-接下来看看KafkaRDD是如何读取分区数据的
-
-```scala
-private[spark] class KafkaRDD[K, V] {
+class KafkaRDD[K, V] {
   override def compute(thePart: Partition, context: TaskContext): Iterator[ConsumerRecord[K, V]] =   {
     // 向下转型为KafkaRDDPartition
     val part = thePart.asInstanceOf[KafkaRDDPartition]
@@ -75,8 +94,8 @@ private[spark] class KafkaRDD[K, V] {
       new KafkaRDDIterator(part, context)
     }
   }
-  
-  private class KafkaRDDIterator(
+
+  class KafkaRDDIterator(
       part: KafkaRDDPartition,
       context: TaskContext) extends Iterator[ConsumerRecord[K, V]] {
 
@@ -102,8 +121,6 @@ private[spark] class KafkaRDD[K, V] {
       CachedKafkaConsumer.getUncached[K, V](groupId, part.topic, part.partition, kafkaParams)
     }
 
-    
-
     // 关闭kafka消费者
     def closeIfNeeded(): Unit = {
       if (!useConsumerCache && consumer != null) {
@@ -126,7 +143,9 @@ private[spark] class KafkaRDD[K, V] {
 }
 ```
 
-接下来看看CachedKafkaConsumer是如何读取kafka数据的
+### CachedKafkaConsumer原理 ###
+
+CachedKafkaConsumer包含了KafkaConsumer实例，它是Kafka的消费者。CachedKafkaConsumer使用KafkaConsumer的assign模式，这种模式需要客户端自己管理offset。CachedKafkaConsumer是运行在 executor 节点上的，它只负责从kafka中读取指定的一段数据，所以不需要管理offset。
 
 ```scala
 class CachedKafkaConsumer[K, V] private(
@@ -158,6 +177,7 @@ class CachedKafkaConsumer[K, V] private(
     // 如果要获取数据的offset不等于下一条数据的offset，则调用seek移动KafKaConsumer的位置
     if (offset != nextOffset) {
       logInfo(s"Initial fetch for $groupId $topic $partition $offset")
+      // 移动读取位置
       seek(offset)
       // 从kafka获取数据
       poll(timeout)
@@ -207,4 +227,5 @@ class CachedKafkaConsumer[K, V] private(
 
 
 
-从上面的代码可以看到，CachedKafkaConsumer会按照offset顺序的读取数据，并且offset还必须是连续的。如果Kafka开启了日志压缩功能，就会将相同key的数据压缩成一条，那么这样消息的offset就不会是连续的。这种情况下，spark streaming就会报错。上面的代码是spark 2.2版本的，后面的版本修复了这个问题，参见 pull request。
+从上面的代码可以看到，CachedKafkaConsumer会按照offset顺序的读取数据，并且offset还必须是连续的。如果Kafka开启了日志压缩功能，就会将相同key的数据压缩成一条，那么这样消息的offset就不会是连续的。这种情况下，spark streaming就会报错。上面的代码是spark 2.2版本的，后面的版本修复了这个问题，参见 [pull request](https://github.com/apache/spark/pull/20572)，增加了spark.streaming.kafka.allowNonConsecutiveOffsets配置。
+
