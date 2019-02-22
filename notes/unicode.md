@@ -42,3 +42,45 @@ Java中嵌套的包名没有关系，比如java.utils包与java.utils.jar毫无�
 Java包名中的类，需要与目录对应
 
 Java的jar包就属于一个类路径
+
+Java判断实例是否为该类的，instance instanceof class  (如果class是该实例的父类，也会返回true)
+
+Java获取实例的类，getClass
+
+Java接收可变参数，使用 类名 + 三个点号，比如 Object... args
+
+Java的枚举都是继承Enum类，定义枚举需要全部定义好它的实例。
+
+比如下面定义了枚举Size，并且定义了三个实例
+
+```java
+public enum Size {
+    SMALL("S"), MEDIUM("M"),LARGE("L");
+    
+    private String value;
+    
+    private Size(String value) {this.value = value}
+}
+```
+
+Enum提供了valueOf的方法，例如Size s = Enum.valueOf(Size.class, "SMALL");
+
+Class.forName方法，可以通过字符串获取对应的类。注意类名是包括包名的。例如：Class cl = CLass.forName("java.utils.Random")
+
+Class的newInstance方法，创建实例
+
+ 
+
+
+
+对于只有一个抽象方法的接口，需要这种接口的对象时，就可以提供一个 lambda 表达式，这种接口称为函数式接口。
+
+lambda表达式中捕获的变量必须实际上是最终变量。
+
+lambda表达式与嵌套块有相同的作用域
+
+引进内部类的类名为 OutClass$InnerClass，外部类和内部类用$隔开
+
+
+
+守护线程永远不应该去访问资源，如文件，数据库，因为它会在任何时候甚至在一个操作的中间发生中断。
