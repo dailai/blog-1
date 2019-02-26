@@ -92,3 +92,38 @@ Jvm的堆分为年轻代和老年代。
 Jstack -l pid， 查看Jvm栈的情况，常常用于查看死锁的问题
 
 jmap 用于生产堆转存快照，支持生成hprof文件。然后调用jhat 分析，它会启动一个浏览器。
+
+
+
+
+
+Thread的isInterrupted成员方法，简单的判断是否被中断
+
+Thread的interrupted静态方法，返回当前线程是否被中断，并且会将interrupt状态复位
+
+当线程进入阻塞状态，被调用interrupt方法，会抛出InterruptedException异常。在catch异常后，会自动将interrupt状态复位
+
+synchronized 不支持超时，也不支持中断
+
+
+
+在消费者和生产者共用同一个监控锁，因为你不知道
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
