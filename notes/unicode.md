@@ -105,25 +105,59 @@ Thread的interrupted静态方法，返回当前线程是否被中断，并且会
 
 synchronized 不支持超时，也不支持中断
 
+wait方法会将监控锁释放，并且将当前线程放入监控锁的等待池中。
+
+notify只通知等待池中的一个线程进入到锁池，而notifyall会通知等待池中的所有线程进入到锁池。
+
+wait方法需要在while循环里，while的条件需要再次判断条件是否满足。因为有多个线程在等待池中，被notifyall都唤醒，这些线程都会进入锁池去竞争锁，这样第一个获取的线程是满足条件的。但之后的线程不一定满足，所以需要在while里面再次判断条件，如果不满足，继续调用wait方法。
+
+wait原理
+
+```java
+wait() {
+   unlock(mutex);//解锁mutex
+   wait_condition(condition);//等待内置条件变量condition
+   lock(mutex);//竞争锁
+}
+```
+
+  
+
+一般使用方式
+
+```java
+synchronized(obj) { // 此处相当于mutex=obj，lock(mutex)
+    while(!cond) {// 判断外部条件cond，不满足时让线程wait();
+        obj.wait();
+    }
+    
+    ..... // 执行满足条件cond时的逻辑过程
+}
+```
 
 
-在消费者和生产者共用同一个监控锁，因为你不知道
+
+
+
+Thread实例可以通过setUncaughtExceptionHandler方法，设置异常处理器
+
+通过RunTime.getRunTime().addShutdownHook方法，传入Thread，可以在Jvm退出时回调。支持添加多个钩子线程。一般用于资源释放
+
+
+
+线程上下文类加载器
+
+当高层提供了统一接口让低层去实现，同时又要是在高层加载（或实例化）低层的类时，必须通过线程上下文类加载器来帮助高层的ClassLoader找到并加载该类。
+
+当使用本类托管类加载，然而加载本类的ClassLoader未知时，为了隔离不同的调用者，可以取调用者各自的线程上下文类加载器代为托管。
 
 
 
 
 
+ByteBuffer提取某一段字节，转换为utf-8字符串。ByteArray的数据存储在byte[ ] 数组里，但是数据的起始位置不一定是数组的起始位置，需要调用ByteBuffer的arrayOffset方法返回。ByteBuffer的position方法，返回相对于数据起始位置的偏移量。比如我们需要提取ByteBuffer当前位置，长度为3的字符串，那么该代码为
 
-
-
-
-
-
-
-
-
-
-
-
-
+```
+ new String(buffer.array(), buffer.arrayOffset() + buffer.position(), 3, StandardCharsets.UTF_8);
+```
 

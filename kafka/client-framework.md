@@ -101,3 +101,53 @@ AbstractRequest继承AbstractRequestResponse，它有一个内部类Builder，�
 AbstractRequest的数据通过Struct，Field，Schema来序列化。
 
 NetworkClient会将请求序列化，转换为NetworkSend，然后交给Selector发送出去。 
+
+
+
+Schema定义了数据组成部分，每个部分由Field表示。Schema包含了Field列表，
+
+Field有自己类型，类型由Type的子类表示，数据的读写由Type负责。
+
+Field还有自己的字段名
+
+
+
+Struct表示数据，
+
+Schema负责将Struct数据序列化，它会一次按照Field的顺序，将每个字段的数据写入ByteBuffer。
+
+Schema支持嵌套列表，它的Field类型为ArrayOf
+
+
+
+Kafka的request和response都会使用Schema序列化请求
+
+因为所有的请求都有一个共同的数据格式，所以kafka会将这部分的数据单独提起出来，作为请求头。
+
+Kafka的一个完整请求由RequestHeader和AbstractRequest组成。RequestHeader表示请求头部，AbstractRequest表示请求数据。
+
+RequestHeader包括
+
+```shell
+---------------------------------------------------------------
+request type  |   version    | correlation_id  |   client id   |
+```
+
+Kafka的一个完整请求由ResponseHeader和AbstractResponse组成。ResponseHeader表示响应头部，AbstractResponse表示响应数据。
+
+ResponseHeader包括
+
+```shell
+----------------
+correlation_id  |  
+```
+
+
+
+
+
+使用NetworkClient的newClientRequest方法，生成ClientRequest
+
+NetworkClient的send方法接收ClientRequest，将请求发送出去。并且生成InflightRequest。
+
+NetworkClient的poll方法，处理响应时，生成ClientResponse。
