@@ -1,8 +1,10 @@
 # Kafka NetworkClient 原理 #
 
-无论是Kafka的生产者，还是Kakfa的消费者，都会通过NetworkClient发送消息。
 
-使用NetworkClient的方法是
+
+Kafka的所有消息，都是通过NetworkClient发送消息。无论是Kafka的生产者，还是Kakfa的消费者，都会包含NetworkClient，才能将请求发送出去。
+
+客户使用NetworkClient的方法是
 
 1. 调用NetworkClient的ready方法，连接服务端
 2. 调用NetworkClient的poll方法，处理连接
@@ -12,12 +14,22 @@
 
 
 
-NetworkClient发送请求之前，都需要先和服务端创建连接。NetworkClient负责管理与集群的所有连接。
+一条完整的请求分为下列几个阶段
 
-元数据描述了集群的节点状态，如果元数据更新
+1. 创建连接过程，这个过程包括建立底层的socket连接，和查询客户端的版本与服务端版本是否支持
+2. 创建请求过程
+3. 发送响应过程，这个过程包括请求序列化，网络发送
+4. 处理响应过程
+
+
+
+## 创建连接过程 ##
+
+NetworkClient发送请求之前，都需要先和服务端创建连接。NetworkClient负责管理与集群的所有连接。
 
 ```java
 public class NetworkClient implements KafkaClient {
+    
     // Kafka的Selector，用来异步发送网络数据
     private final Selectable selector;  
     // 保存与每个节点的连接状态
@@ -71,10 +83,13 @@ public class NetworkClient implements KafkaClient {
 
 
 
-接下来看是如何处理连接的，poll方法会调用handleConnections处理连接，并且会创建版本请求。
+上面讲述了如何建立socket连接，当socket连接建立后，NetworkClient还需要请求服务端的版本号。
+
+poll 方法会调用 handleConnections处理连接，并且会创建版本请求。
 
 ```java
 public class NetworkClient implements KafkaClient {
+    
     // Kafka的Selector，用来异步发送网络数据
     private final Selectable selector;    
     // 是否需要与服务器的版本协调，默认都为true
@@ -91,17 +106,15 @@ public class NetworkClient implements KafkaClient {
                 this.connectionStates.checkingApiVersions(node);
                 // 将请求保存到nodesNeedingApiVersionsFetch集合里
                 nodesNeedingApiVersionsFetch.put(node, new ApiVersionsRequest.Builder());
-                log.debug("Completed connection to node {}. Fetching API versions.", node);
             } else {
                 this.connectionStates.ready(node);
-                log.debug("Completed connection to node {}. Ready.", node);
             }
         }
     }
 }
 ```
 
-创建完版本请求，接下来看看是如何发送的。poll方法会调用handleInitiateApiVersionRequests发送版本协调请求，然后调用handleApiVersionsResponse负责处理响应。
+创建完版本请求，接下来看看是如何发送请求和处理响应的。poll方法会调用handleInitiateApiVersionRequests发送版本协调请求，然后调用handleApiVersionsResponse负责处理响应。
 
 ```java
 // 发送版本协调请求
@@ -113,7 +126,6 @@ private void handleInitiateApiVersionRequests(long now) {
         String node = entry.getKey();
         // 判断是否允许发送请求
         if (selector.isChannelReady(node) && inFlightRequests.canSendMore(node)) {
-            log.debug("Initiating API versions fetch from node {}.", node);
             ApiVersionsRequest.Builder apiVersionRequestBuilder = entry.getValue();
             // 调用newClientRequest生成请求
             ClientRequest clientRequest = newClientRequest(node, apiVersionRequestBuilder, now, true);
@@ -142,7 +154,9 @@ private void handleApiVersionsResponse(List<ClientResponse> responses,
 
 
 
-生成请求
+## 生成请求过程 ##
+
+NetworkClient使用ClientRequest类表示请求，它只是一些属性的集合。
 
 ```java
 public final class ClientRequest {
@@ -163,11 +177,13 @@ public final class ClientRequest {
 }
 ```
 
-NetworkClient的newClientRequest，也只是简单的实例化ClientRequest
+NetworkClient的newClientRequest方法负责生成ClientRequest，它的原理只是简单的实例化ClientRequest
 
 ```java
 public class NetworkClient implements KafkaClient {
-    
+    // nodeId是请求地址，requestBuilder是请求体的构造实例
+    // createdTimeMs是请求创建时间，expectResponse表示是否需要响应
+    // callback是处理响应的回调函数
     public ClientRequest newClientRequest(String nodeId, AbstractRequest.Builder<?> requestBuilder, long createdTimeMs, boolean expectResponse, RequestCompletionHandler callback) {
         return new ClientRequest(nodeId, requestBuilder, correlation++, clientId, createdTimeMs, expectResponse, callback);
     }
@@ -176,9 +192,9 @@ public class NetworkClient implements KafkaClient {
 
 
 
-发送请求
+## 发送请求过程 ##
 
-NetworkClient首先根据ClientRequest，生成请求，然后将序列化，通过Selector异步发送出去，并且将请求封装成InFlightRequest，保存到队列InFlightRequests里。
+NetworkClient创建完ClientRequest，会将它序列化，通过Selector异步发送出去，并且将请求封装成InFlightRequest，保存到队列InFlightRequests里。它的send方法定义如下
 
 ```java
 public class NetworkClient implements KafkaClient {
@@ -239,11 +255,9 @@ public class NetworkClient implements KafkaClient {
 
 
 
-InFlightRequest存储着请求所有的信息，不仅如此，它还支持
+InFlightRequest表示正在发送的请求，它存储着请求发送前的所有的信息。
 
-当正常收到响应时，completed 方法会根据响应内容生成ClientRespon se。
-
-当连接突然断开，disconnected方法会生成ClientResponse。
+不仅如此，它还支持生成响应ClientResponse。当正常收到响应时，completed 方法会根据响应内容生成ClientResponse。当连接突然断开，disconnected方法会生成ClientResponse。
 
 ```java
 static class InFlightRequest {
@@ -278,7 +292,7 @@ static class InFlightRequest {
 
 
 
-接下来看看集合InFlightRequests，它为每个连接生成一条队列，存储着还未收到响应的请求。根据队列的实时长度，它能控制发送的速度。这里简单介绍下它的几个方法
+接下来看看集合InFlightRequests，它为每个连接生成一条队列，存储着已发送但还未收到响应的请求。根据队列的长度，它能控制发送的速度。它的原理比较简单，这里介绍下它的几个重要方法
 
 ```java
 final class InFlightRequests {
@@ -309,6 +323,10 @@ final class InFlightRequests {
 
 
 
+## 处理响应过程 ##
+
+### 请求发送完成 ###
+
 当请求发送完成后，会触发handleCompletedSends函数，处理那些不需要响应的请求。
 
 ```java
@@ -318,8 +336,9 @@ private void handleCompletedSends(List<ClientResponse> responses, long now) {
         // 从队列中取出最新的请求
         InFlightRequest request = this.inFlightRequests.lastSent(send.destination());
         if (!request.expectResponse) {
-            // 如果这个请求不要求响应，则调用completed方法生成ClientResponse
+            // 如果这个请求不要求响应，则提取最新的请求
             this.inFlightRequests.completeLastSent(send.destination());
+            // 调用completed方法生成ClientResponse
             responses.add(request.completed(null, now));
         }
     }
@@ -328,28 +347,99 @@ private void handleCompletedSends(List<ClientResponse> responses, long now) {
 
 这里可能有点疑惑，怎么能保证从Selector返回的请求，是对应到队列中最新的请求。仔细想一下，每个请求发送，都要等待前面的请求发送完成，这样就能保证同一时间只有一个请求正在发送   。因为Selector返回的请求，是从上一次poll开始的，所以这样就能够保证。
 
+### 请求收到响应 ###
 
-
-当请求收到响应后，会触发
+当请求收到响应后，会触发handleCompletedReceives函数，处理响应。
 
 ```java
 private void handleCompletedReceives(List<ClientResponse> responses, long now) {
+    // 遍历响应，通过Selector返回未处理的响应
     for (NetworkReceive receive : this.selector.completedReceives()) {
+        
         String source = receive.source();
+        // 提取最老的请求
         InFlightRequest req = inFlightRequests.completeNext(source);
+        // 解析响应，并且验证响应头，生成Struct实例
         Struct responseStruct = parseStructMaybeUpdateThrottleTimeMetrics(receive.payload(), req.header,
             throttleTimeSensor, now);
-        if (log.isTraceEnabled()) {
-            log.trace("Completed receive from node {} for {} with correlation id {}, received {}", req.destination,
-                req.header.apiKey(), req.header.correlationId(), responseStruct);
-        }
+        // 生成响应体
         AbstractResponse body = AbstractResponse.parseResponse(req.header.apiKey(), responseStruct);
+        // 处理元数据请求响应
         if (req.isInternalRequest && body instanceof MetadataResponse)
             metadataUpdater.handleCompletedMetadataResponse(req.header, now, (MetadataResponse) body);
         else if (req.isInternalRequest && body instanceof ApiVersionsResponse)
+            // 处理版本协调响应
             handleApiVersionsResponse(responses, req, now, (ApiVersionsResponse) body);
         else
+            // 生成ClientResponse添加到列表中
             responses.add(req.completed(body, now));
+    }
+}
+
+private static Struct parseStructMaybeUpdateThrottleTimeMetrics(ByteBuffer responseBuffer, RequestHeader requestHeader, Sensor throttleTimeSensor, long now) {
+    // 解析响应头
+    ResponseHeader responseHeader = ResponseHeader.parse(responseBuffer);
+    // 解析响应体
+    Struct responseBody = requestHeader.apiKey().parseResponse(requestHeader.apiVersion(), responseBuffer);
+    // 验证请求头与响应头的 correlation id 必须相等
+    correlate(requestHeader, responseHeader);
+    return responseBody;
+}
+```
+
+
+
+### 执行处理响应函数 ###
+
+NetworkClient的 poll 方法，会将已完成的请求，生成ClientReponse收集起来，然后逐一执行它的回调函数。
+
+```java
+public List<ClientResponse> poll(long timeout, long now) {
+    long updatedNow = this.time.milliseconds();
+    // 响应列表
+    List<ClientResponse> responses = new ArrayList<>();
+    // 处理各种情况，生成响应，添加到列表中
+    handleCompletedSends(responses, updatedNow);
+    handleCompletedReceives(responses, updatedNow);
+    handleDisconnections(responses, updatedNow);
+    handleConnections();
+    handleInitiateApiVersionRequests(updatedNow);
+    handleTimedOutRequests(responses, updatedNow);
+    // 执行处理响应函数
+    completeResponses(responses);
+
+    return responses;
+}
+```
+
+在InFlightRequest类中，我们已经看到了它是如何生成ClientReponse实例的。首先看看ClientReponse的几个重要属性和方法
+
+```java
+public class ClientResponse {
+    
+    // 回调函数，由ClientRequest指定
+    private final RequestCompletionHandler callback;
+    // 响应体
+    private final AbstractResponse responseBody;
+    
+    // 响应完成的回调函数
+    public void onComplete() {
+        // 调用RequestCompletionHandler回调
+        if (callback != null)
+            callback.onComplete(this);
+    }    
+```
+
+下面继续看看NetworkClient的completeResponses方法，这里依次执行了每个ClientResponse的onComplete回调方法
+
+```java
+private void completeResponses(List<ClientResponse> responses) {
+    for (ClientResponse response : responses) {
+        try {
+            response.onComplete();
+        } catch (Exception e) {
+            log.error("Uncaught error in request completion:", e);
+        }
     }
 }
 ```

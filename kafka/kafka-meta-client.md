@@ -2,49 +2,37 @@
 
 
 
-元数据保存在Cluster类，Metadata在Cluster基础之上，
+## 元数据结构 ##
 
-
-
-Metadata的更新由NetworkClient内部的DefaultMetadataUpdater类，里面handleCompletedMetadataResponse会更新
-
-
-
-Metadata提供了update方法，来更新数据。
-
-提供了awaitUpdate，等待下次更新
-
-提供了add方法添加需要获取信息的topic，如果Cluster信息不包含这个topic的信息，它会主动发送请求。
-
-添加了requestUpdate方法
-
-
-
-Cluster主要描述了topic在Kafka的集群分布情况，比如以下图为例，
+元数据主要描述了topic在Kafka的集群分布情况，比如以下图为例，
 
 
 
 当我们需要发送信息给 topic_A ，首先我们回去Kafka集群获取这个 topic 的分布情况。我们知道一个 topic 由多个 partition 组成， 每个partition 存储在不同的主机上，并且每个 partition还有多个副本，也分布在集群里。每个partition的副本。
 
-以topic_A为例，它有三个分区，分别分布在集群的三台机器上，并且每个分区都有一个副本。注意到副本也是有状态的，因为副本的数据都是从主副本同步过来的，如果同步的时间相差很久，那么kafka就认为此副本为异常状态。
+以topic_A为例，它有三个分区，分别分布在集群的三台机器上，并且每个分区都有两个个副本。注意到副本也是有状态的，因为follower副本的数据都是从leader副本同步过来的，如果同步的数据量相差很多，那么kafka就认为此follower副本为异常状态。
 
 
 
-
-
-Metadata的请求过程
-
+## 元数据的请求和响应协议 ##
 
 
 
+### 请求协议 ###
 
-请求协议
+请求协议由MetadataRequest类定义
+
+
 
 topics字段，表示要请求获取topic的列表
 
 allow_auto_topic_creation字段，表示如果要请求的topic不存在时，是否需要自动创建它
 
-响应协议
+
+
+### 响应协议 ###
+
+响应协议由MetadataResponse定义
 
 
 
@@ -86,41 +74,29 @@ offline_replicas 字段，表示目前同步异常的follower副本
 
 
 
-响应的数据，都会保存到Cluster类里。
+## 相关类简介 ##
+
+元数据都是保存在Cluster类，Cluster类的属性都是只读的。
+
+Metadata类封装了Cluster，提供了多线程的访问和更新。
+
+MetadataUpdater是提供了更新Metadata的接口
+
+NetworkClient的内部类DefaultMetadataUpdater，实现了MetadataUpdater的接口。
 
 
 
-因为元数据会经常更新，并且涉及到多线程的读取。Metadata类封装了Cluster，提供了多线程的访问和更新。
+## 元数据的读取 ##
 
-Kafka Producer发送消息之前，都会调用Metadata获取对应topic的信息，包括分区和副本信息。然后等待Sender线程发送请求和处理响应。
-
-Kafka Consumer 如果使用assign模式，它会将指定分区的topic添加到Metadata里。
-
-
-
-使用Metadata的步骤，
-
-首先调用add方法，添加需要更新元数据的topic
-
-然后调用requestUpdate方法，请求更新
-
-调用awaitUpdate方法，等待更新完成
-
-
+如果想要获取某个topic的分布信息，首先调用Metadata的add方法，将topic添加到Metadata里。然后调用 requestUpdate  方法，请求更新元数据。最后调用awaitUpdate方法，等待更新完成。
 
 接下来看看这几个方法的定义
 
 ```java
 public final class Metadata {
-    // 是否需要更新
-    private boolean needUpdate;
-   
-    // 表示上次更新的时间
-    private long lastRefreshMs;
-    // 更新间隔时间，防止更新过快
-    private final long refreshBackoffMs;
-    // 版本号，每次数据更新，版本号都会递增
-    private int version;
+    private boolean needUpdate;  // 是否需要更新
+    private long lastRefreshMs;  // 表示上次更新的时间
+    private int version;  // 版本号，每次数据更新，版本号都会递增
 
     public static final long TOPIC_EXPIRY_MS = 5 * 60 * 1000;
     private static final long TOPIC_EXPIRY_NEEDS_UPDATE = -1L;
@@ -145,7 +121,7 @@ public final class Metadata {
     public synchronized int requestUpdate() {
         // 设置needUpdate属性为true
         this.needUpdate = true;
-        // 返回更新前的版本号
+        // 返回当前的版本号
         return this.version;
     }
     
@@ -174,47 +150,9 @@ public final class Metadata {
 
 
 
+## 元数据的更新 ##
 
-
-更新操作
-
-Metadata的数据更新操作，由MetadataUpdater接口负责，NetworkClient有一个内部类DefaultMetadataUpdater，实现了更新接口。NetworkClient在调用poll方法，会解析元数据请求的响应，然后将响应传递给DefaultMetadataUpdater，实现数据更新。
-
-```java
-public class NetworkClient implements KafkaClient {
-    // 元数据更新接口
-    private final MetadataUpdater metadataUpdater;
-
-    private void handleCompletedReceives(List<ClientResponse> responses, long now) {
-        for (NetworkReceive receive : this.selector.completedReceives()) {
-            String source = receive.source();
-            InFlightRequest req = inFlightRequests.completeNext(source);
-            Struct responseStruct = parseStructMaybeUpdateThrottleTimeMetrics(receive.payload(), req.header, throttleTimeSensor, now);
-            AbstractResponse body = AbstractResponse.parseResponse(req.header.apiKey(), responseStruct);
-            if (req.isInternalRequest && body instanceof MetadataResponse)
-                // 这里处理了元数据响应，调用了更新接口的handleCompletedMetadataResponse方法
-                metadataUpdater.handleCompletedMetadataResponse(req.header, now, (MetadataResponse) body);
-            ......
-        }
-    }
-    
-    class DefaultMetadataUpdater implements MetadataUpdater {
-        @Override
-        public void handleCompletedMetadataResponse(RequestHeader requestHeader, long now, MetadataResponse response) {
-            // 从响应结果，获取新的Cluster
-            Cluster cluster = response.cluster();
-            if (cluster.nodes().size() > 0) {
-                // 调用Metadata的udpate方法更新
-                this.metadata.update(cluster, response.unavailableTopics(), now);
-            } else {
-                this.metadata.failedUpdate(now, null);
-            }
-        }
-    }
-}
-```
-
-接下来看看Metadata的update接口
+Metadata提供了update方法，用来更新Cluster数据。
 
 ```java
 public final class Metadata {
@@ -266,9 +204,9 @@ public final class Metadata {
 
 
 
+## 发送网络请求 ##
 
-
-NetworkClient每次poll的时候，都会检查Metadata是否需要更新。Metadata的timeToNextUpdate方法，会返回当前时间离下次更新时间的间隔。
+NetworkClient每次poll的时候，都会调用MetadataUpdater的maybeUpdate方法， 检查Metadata是否需要更新。Metadata的timeToNextUpdate方法，会返回当前时间离下次更新时间的间隔。如果间隔为0，则表示需要立即更新
 
 ```java
 public final class Metadata {
@@ -287,5 +225,76 @@ public final class Metadata {
 
 
 
-因为Kafka的集群的每个节点，都会存储着集群的元数据。所以Kafka客户端，请求元数据时，会从中挑选出负载最轻的节点。至于如何判断负载程度，是以每个节点的发送队列的长度为准，这个队列就是以前介绍的InflightRequest队列。
+因为Kafka的集群的每个节点，都会存储着元数据。Kafka客户端在请求元数据时，会从中挑选出负载最轻的节点。至于如何判断负载程度，是以每个节点的发送队列的长度为准，这个队列就是以前介绍的InflightRequest队列。算法如下：
+
+```java
+public Node leastLoadedNode(long now) {
+    // 获取目前所涉及到的节点列表
+    List<Node> nodes = this.metadataUpdater.fetchNodes();
+    int inflight = Integer.MAX_VALUE;
+    Node found = null;
+    // 生成一个随机数，用来选择随机的初始地址
+    int offset = this.randOffset.nextInt(nodes.size());
+    // 遍历节点
+    for (int i = 0; i < nodes.size(); i++) {
+        int idx = (offset + i) % nodes.size();
+        Node node = nodes.get(idx);
+        // 获取当前节点的请求数
+        int currInflight = this.inFlightRequests.count(node.idString());
+        // 如果该节点的请求数为0，并且允许发送请求，则直接返回
+        if (currInflight == 0 && isReady(node, now)) {
+            return node;
+        } else if (!this.connectionStates.isBlackedOut(node.idString(), now) && currInflight < inflight) {
+            // 查看该节点的连接是否被禁止，然后比较请求数，选择请求数最小的那个
+            inflight = currInflight;
+            found = node;
+        }
+    }
+
+    return found;
+}
+```
+
+
+
+## 处理网络响应 ##
+
+NetworkClient有一个内部类DefaultMetadataUpdater，实现了更新接口。NetworkClient在调用poll方法，会解析元数据请求的响应，然后将响应传递给DefaultMetadataUpdater，实现数据更新。
+
+```java
+public class NetworkClient implements KafkaClient {
+    // 元数据更新接口
+    private final MetadataUpdater metadataUpdater;
+
+    private void handleCompletedReceives(List<ClientResponse> responses, long now) {
+        for (NetworkReceive receive : this.selector.completedReceives()) {
+            // 从队列中剔除请求
+            String source = receive.source();
+            InFlightRequest req = inFlightRequests.completeNext(source);
+            // 解析响应
+            AbstractResponse body = AbstractResponse.parseResponse(req.header.apiKey(), responseStruct);
+            if (req.isInternalRequest && body instanceof MetadataResponse)
+                // 这里处理了元数据响应，调用了更新接口的handleCompletedMetadataResponse方法
+                metadataUpdater.handleCompletedMetadataResponse(req.header, now, (MetadataResponse) body);
+            ......
+        }
+    }
+    
+    class DefaultMetadataUpdater implements MetadataUpdater {
+        @Override
+        public void handleCompletedMetadataResponse(RequestHeader requestHeader, long now, MetadataResponse response) {
+            // 从响应结果，获取新的Cluster
+            Cluster cluster = response.cluster();
+            if (cluster.nodes().size() > 0) {
+                // 调用Metadata的udpate方法更新
+                this.metadata.update(cluster, response.unavailableTopics(), now);
+            } else {
+                this.metadata.failedUpdate(now, null);
+            }
+        }
+    }
+}
+```
+
+
 
