@@ -1,8 +1,6 @@
 # Kafka ConsumerNetworkClient 原理 #
 
-ConsumerNetworkClient在NetworkClient之外封装了一层，目的提供了简单的回调机制。
-
-ConsumerNetworkClient每次发送请求，会返回RequestFuture。RequestFuture支持添加事件回调函数。这样在编程时，会更加方便。
+Kafka消费者会使用ConsumerNetworkClient发送和处理请求。ConsumerNetworkClient是在NetworkClient之外封装了一层，提供了异步的请求方法。它每次发送请求，会返回RequestFuture。RequestFuture实现了类似Future的功能，而且 支持添加事件回调函数。
 
 
 
@@ -61,7 +59,6 @@ public class RequestFuture<T> implements ConsumerNetworkClient.PollCondition {
             // 如果结果已经完成，并且结果成功，则执行回调函数
             fireSuccess();
     }
-    
     
     private void fireSuccess() {
         // 获取值
@@ -161,9 +158,10 @@ public void chain(final RequestFuture<T> future) {
 
 
 
-compose方法，负责转换RequestFuture的泛型。比如一个RequestFuture<String> 类型，我需要将结果转换为Integer类型，并且返回RequestFuture<Integer> ，那么就需要compose方法。
+compose方法，负责转换RequestFuture的泛型。比如一个RequestFuture<String> 类型，表示它的结果是String类型的。现在需要将结果转换为Integer类型，返回RequestFuture<Integer> ，那么就需要compose方法。
 
 ```java
+// T 表示源类型，S表示目标类型
 public <S> RequestFuture<S> compose(final RequestFutureAdapter<T, S> adapter) {
     // 这里生成S类型的RequestFuture
     final RequestFuture<S> adapted = new RequestFuture<>();
@@ -188,11 +186,11 @@ public <S> RequestFuture<S> compose(final RequestFutureAdapter<T, S> adapter) {
 
 
 
-这里注意下传递的RequestFutureAdapter参数，RequestFutureAdapter它是一个接口。用户必须实现它的onSuccess和onFailure方法。
+这里注意下传递的RequestFutureAdapter参数。RequestFutureAdapter它是一个接口，用户必须实现它的onSuccess和onFailure方法。
 
-它的onSuccess方法，必须根据value参数，生成结果，并且赋予给S类型的RequestFuture。
+onSuccess方法，必须根据value参数，生成结果，并且赋予给S类型的RequestFuture。
 
-同样它的onFailure方法，必须根据exception参数，生成结果，并且赋予给S类型的RequestFuture。
+onFailure方法，必须根据exception参数，生成结果，并且赋予给S类型的RequestFuture。
 
 
 
@@ -200,11 +198,11 @@ public <S> RequestFuture<S> compose(final RequestFutureAdapter<T, S> adapter) {
 
 ## 构造请求 ##
 
-ConsumerNetworkClient发送请求，本质上是通过NetworkClient发送。注意到使用NetworkClient 发送请求之前，是需要先构造ClientRequest的。
+ConsumerNetworkClient发送请求，本质上是通过NetworkClient发送。注意到以前讲述NetworkClient的原理，它发送请求之前，是需要先构造ClientRequest的。
 
 ConsumerNetworkClient在构建请求时，传递了包含回调函数的类。回调类由RequestFutureCompletionHandler表示，它实现了RequestCompletionHandler接口。
 
-这里着重看下onComplete函数，当请求响应完成后，会调用onComplete方法。这里只是将自身保存在一个队列里，等待之后的统一调用。
+这里着重看下RequestFutureCompletionHandler的onComplete函数，当请求响应完成后，会调用onComplete方法。这里只是将自身保存在一个队列里，等待之后的统一调用。
 
 ```java
 private class RequestFutureCompletionHandler implements RequestCompletionHandler {
@@ -222,9 +220,7 @@ private class RequestFutureCompletionHandler implements RequestCompletionHandler
 
 
 
-ConsumerNetworkClient的send方法，负责构建请求，然后将请求保存到UnsentRequests集合里。
-
-UnsentRequests为每个节点都保存了一个请求队列。
+ConsumerNetworkClient的send方法，负责构建请求，然后将请求保存到UnsentRequests集合里。UnsentRequests为每个节点都保存了一个请求队列。
 
 ```java
 public class ConsumerNetworkClient implements Closeable {
@@ -361,7 +357,7 @@ public class ConsumerNetworkClient implements Closeable {
 }
 ```
 
-继续看看RequestFutureCompletionHandler的fireCompletion方法，它会根据响应结果，来设置RequestFuture的结果。
+最后看看RequestFutureCompletionHandler的fireCompletion方法，它会根据响应结果，来设置RequestFuture的结果。
 
 ```java
 private class RequestFutureCompletionHandler implements RequestCompletionHandler {

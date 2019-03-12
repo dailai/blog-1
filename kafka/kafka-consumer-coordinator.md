@@ -174,5 +174,86 @@ public abstract class AbstractCoordinator implements Closeable {
 
 上面调用了lookupCoordinator方法，构建和发送请求
 
+```java
+public abstract class AbstractCoordinator implements Closeable {
+    
+    protected final ConsumerNetworkClient client;
+    private RequestFuture<Void> findCoordinatorFuture = null;
+    
 
+    protected synchronized RequestFuture<Void> lookupCoordinator() {
+        if (findCoordinatorFuture == null) {
+            // 找到负载最轻的节点
+            Node node = this.client.leastLoadedNode();
+            if (node == null) {
+                return RequestFuture.noBrokersAvailable();
+            } else
+                // 发送请求
+                findCoordinatorFuture = sendFindCoordinatorRequest(node);
+        }
+        return findCoordinatorFuture;
+    }
+    
+    private RequestFuture<Void> sendFindCoordinatorRequest(Node node) {
+        // 构建请求
+        FindCoordinatorRequest.Builder requestBuilder =
+                new FindCoordinatorRequest.Builder(FindCoordinatorRequest.CoordinatorType.GROUP, this.groupId);
+        // 这里先调用了client的send方法，返回RequestFuture<ClientResponse>类型
+        // 然后调用了compose方法，转换为RequestFuture<Void>类型
+        return client.send(node, requestBuilder)
+                     .compose(new FindCoordinatorResponseHandler());
+    } 
+}
+```
+
+接下来看看FindCoordinatorResponseHandler的原理，在响应完成时会触发的它的回调函数。
+
+```java
+private class FindCoordinatorResponseHandler extends RequestFutureAdapter<ClientResponse, Void> {
+    
+    @Override
+    public void onSuccess(ClientResponse resp, RequestFuture<Void> future) {
+        clearFindCoordinatorFuture();
+        // 强制转换为FindCoordinatorResponse类型
+        FindCoordinatorResponse findCoordinatorResponse = (FindCoordinatorResponse) resp.responseBody();
+        // 查看响应是否有错误
+        Errors error = findCoordinatorResponse.error();
+        if (error == Errors.NONE) {
+            synchronized (AbstractCoordinator.this) {
+                // use MAX_VALUE - node.id as the coordinator id to allow separate connections
+                // for the coordinator in the underlying network client layer
+                int coordinatorConnectionId = Integer.MAX_VALUE - findCoordinatorResponse.node().id();
+                // 保存coordinator地址
+                AbstractCoordinator.this.coordinator = new Node(
+                        coordinatorConnectionId,
+                        findCoordinatorResponse.node().host(),
+                        findCoordinatorResponse.node().port());
+                // 连接 Coordinator节点
+                client.tryConnect(coordinator);
+                // 设置心跳的超时时间
+                heartbeat.resetTimeouts(time.milliseconds());
+            }
+            // 设置future的结果
+            future.complete(null);
+        } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
+            // 设置future的异常
+            future.raise(new GroupAuthorizationException(groupId));
+        } else {
+            // 设置future的异常
+            future.raise(error);
+        }
+    }
+```
+
+
+
+心跳线程
+
+心跳线程有三种状态
+
+运行
+
+暂停
+
+关闭
 
