@@ -99,7 +99,7 @@ sync_group类型
 * member_id
 * member_assignment
 
-
+ 
 
 SyncGroupResponse响应
 
@@ -122,3 +122,57 @@ public interface PartitionAssignor {
 ```
 
 客户端负责实现分配，并且将结果序列化。服务端仅仅是各个消费者的沟通桥梁，它不负责解析数据。
+
+
+
+
+
+寻找Coordinator地址
+
+```java
+public abstract class AbstractCoordinator implements Closeable {
+    
+    protected synchronized boolean ensureCoordinatorReady(final long timeoutMs) {
+        final long startTimeMs = time.milliseconds();
+        long elapsedTime = 0L;
+        // 调用coordinatorUnknown方法，检测Coordinator地址是否已经获取了
+        while (coordinatorUnknown()) {
+            // 发送寻找Coordinator的请求
+            final RequestFuture<Void> future = lookupCoordinator();
+            // 等待响应，remainingTimeAtLeastZero方法计算等待时长
+            client.poll(future, remainingTimeAtLeastZero(timeoutMs, elapsedTime));
+            if (!future.isDone()) {
+                // 如果超时，还没有收到响应
+                break;
+            }
+
+            if (future.failed()) {
+                // 检测是否可以重试
+                if (future.isRetriable()) {
+                    elapsedTime = time.milliseconds() - startTimeMs;
+                    if (elapsedTime >= timeoutMs) break;
+                    // 更新元数据并且等待完成
+                    client.awaitMetadataUpdate(remainingTimeAtLeastZero(timeoutMs, elapsedTime));
+                    elapsedTime = time.milliseconds() - startTimeMs;
+                } else
+                    throw future.exception();
+            } else if (coordinator != null && client.isUnavailable(coordinator)) {
+                // 虽然找到了Coordinator地址，但是连接失败
+                markCoordinatorUnknown();
+                final long sleepTime = Math.min(retryBackoffMs, remainingTimeAtLeastZero(timeoutMs, elapsedTime));
+                time.sleep(sleepTime);
+                elapsedTime += sleepTime;
+            }
+        }
+        // 返回是否与Coordinator建立连接
+        return !coordinatorUnknown();
+    }
+}
+```
+
+
+
+上面调用了lookupCoordinator方法，构建和发送请求
+
+
+
