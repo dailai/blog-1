@@ -145,7 +145,62 @@ public class RangeAssignor extends AbstractPartitionAssignor {
 
 
 
+RoundRobinAssignor算法
 
+首先依次遍历订阅的 topic，将每个 topic 的 partition 列表合成一个大的列表。
+
+然后依次遍历 partition 列表，轮询分配给consumer。
+
+```java
+public class RoundRobinAssignor extends AbstractPartitionAssignor {
+    
+    // 返回分配算法的名称
+    public String name() {
+        return "roundrobin";
+    }
+
+    @Override
+    public Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
+                                                    Map<String, Subscription> subscriptions) {
+        // 初始化结果集
+        Map<String, List<TopicPartition>> assignment = new HashMap<>();
+        for (String memberId : subscriptions.keySet())
+            assignment.put(memberId, new ArrayList<TopicPartition>());
+        // 这里使用了CircularIterator，它的作用是循环遍历 consumer列表
+        CircularIterator<String> assigner = new CircularIterator<>(Utils.sorted(subscriptions.keySet()));
+        // 遍历 TopicPartition 列表
+        for (TopicPartition partition : allPartitionsSorted(partitionsPerTopic, subscriptions)) {
+            final String topic = partition.topic();
+            // 查看当前consumer是否订阅了这个topic
+            // 一直循环consumer列表，直到找到订阅这个topic的consumer
+            while (!subscriptions.get(assigner.peek()).topics().contains(topic))
+                assigner.next();
+            // 将分区分配给这个consumer
+            assignment.get(assigner.next()).add(partition);
+        }
+        return assignment;
+    }
+
+    // 生成 partition 列表
+    public List<TopicPartition> allPartitionsSorted(Map<String, Integer> partitionsPerTopic,
+                                                    Map<String, Subscription> subscriptions) {
+        // 获取所有的订阅topic
+        SortedSet<String> topics = new TreeSet<>();
+        for (Subscription subscription : subscriptions.values())
+            topics.addAll(subscription.topics());
+        
+        List<TopicPartition> allPartitions = new ArrayList<>();
+        for (String topic : topics) {
+            // 遍历topic，获取它的分区数
+            Integer numPartitionsForTopic = partitionsPerTopic.get(topic);
+            if (numPartitionsForTopic != null)
+                // 生成 TopicPartition 列表，添加到结果列表中 allPartitions
+                allPartitions.addAll(AbstractPartitionAssignor.partitions(topic, numPartitionsForTopic));
+        }
+        return allPartitions;
+    }
+}
+```
 
 
 
