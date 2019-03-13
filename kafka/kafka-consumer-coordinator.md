@@ -61,7 +61,7 @@ JoinGroupRequest请求
 * session_timeout
 * rebalance_timeout
 * protocol_type
-* group_protocols,，protocol列表
+* group_protocols，protocol列表
 
 group_protocol定义
 
@@ -75,7 +75,7 @@ JoinGroupResponse响应，Kafka为每个group的consumer都分配了一个 id �
 * throttle_time_ms
 * error_code
 * generation_id
-* group_protocol
+* group_protocol，分配算法
 * leader_id，这个 consumer group 的 leader 所在的consumer id
 * member_id，这consumer的 id 号
 * members，member类型列表
@@ -104,10 +104,6 @@ sync_group类型
 SyncGroupResponse响应
 
 * member_assignment
-
-
-
-
 
 
 
@@ -249,11 +245,232 @@ private class FindCoordinatorResponseHandler extends RequestFutureAdapter<Client
 
 心跳线程
 
-心跳线程有三种状态
+心跳线程有三种状态，运行，暂停和关闭。心跳线程是AbstractCoordinator的内部类
 
-运行
+```java
+public abstract class AbstractCoordinator implements Closeable {
+    // 与coordinator之间的状态
+    private MemberState state = MemberState.UNJOINED;
+    
+    private class HeartbeatThread extends KafkaThread {
+        // 如果为false，表示暂停状态
+        // 如果为true，表示运行状态
+        private boolean enabled = false;
+        // 是否为关闭状态
+        private boolean closed = false;
+        private AtomicReference<RuntimeException> failed = new AtomicReference<>(null);
+        
+        @Override
+        public void run() {
+            try {
+                while (true) {
+                    synchronized (AbstractCoordinator.this) {
+                        // 如果是关闭状态，则退出
+                        if (closed)
+                            return;
+                        // 如果是暂停状态，则等待
+                        if (!enabled) {
+                            AbstractCoordinator.this.wait();
+                            continue;
+                        }
 
-暂停
+                        if (state != MemberState.STABLE) {
+                            // 如果与coordinator的连接状态有问题，则进入暂停状态
+                            disable();
+                            continue;
+                        }
 
-关闭
+                        client.pollNoWakeup();
+                        long now = time.milliseconds();
+
+                        if (coordinatorUnknown()) {
+                            if (findCoordinatorFuture != null || lookupCoordinator().failed())
+                                // 检查是否找到
+                                AbstractCoordinator.this.wait(retryBackoffMs);
+                        } else if (heartbeat.sessionTimeoutExpired(now)) {
+                            // 如果第一次心跳超时，则认为与coordinator的连接失败
+                            markCoordinatorUnknown();
+                        } else if (heartbeat.pollTimeoutExpired(now)) {
+                            // 如果心跳超时，则认为与coordinator的连接失败，需要退出组
+                            maybeLeaveGroup();
+                        } else if (!heartbeat.shouldHeartbeat(now)) {
+                            // 心跳发送必须保持一定的间隔，这里检查是否能发送
+                            AbstractCoordinator.this.wait(retryBackoffMs);
+                        } else {
+                            // 设置最新发送心跳的时间
+                            heartbeat.sentHeartbeat(now);
+                            // 发送心跳
+                            sendHeartbeatRequest().addListener(new RequestFutureListener<Void>() {
+                                @Override
+                                public void onSuccess(Void value) {
+                                    synchronized (AbstractCoordinator.this) {
+                                        // 设置最新接收心跳的时间
+                                        heartbeat.receiveHeartbeat(time.milliseconds());
+                                    }
+                                }
+
+                                @Override
+                                public void onFailure(RuntimeException e) {
+                                    synchronized (AbstractCoordinator.this) {
+                                        if (e instanceof RebalanceInProgressException) {
+                                            // 接收到Rebalance异常，这个coordinator正在处在reblance状态
+                                            heartbeat.receiveHeartbeat(time.milliseconds());
+                                        } else {
+                                            heartbeat.failHeartbeat();
+                                            AbstractCoordinator.this.notify();
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            } catch (...) {
+                // 处理各种异常
+                ....
+                this.failed.set(e);
+            } 
+        }
+
+    }        
+}
+```
+
+
+
+心跳请求字段
+
+group_id
+
+generation_id
+
+member_id
+
+
+
+心跳响应字段
+
+error_code
+
+
+
+发送加入group请求
+
+```java
+private synchronized RequestFuture<ByteBuffer> initiateJoinGroup() {
+    if (joinFuture == null) {
+        // 暂停心跳线程
+        disableHeartbeatThread();
+
+        state = MemberState.REBALANCING;
+        // 发送加入group请求
+        joinFuture = sendJoinGroupRequest();
+        // 添加监听器，当接收到响应后，会继续启动心跳线程
+        joinFuture.addListener(new RequestFutureListener<ByteBuffer>() {
+            @Override
+            public void onSuccess(ByteBuffer value) {
+                synchronized (AbstractCoordinator.this) {
+                    //更新状态
+                    state = MemberState.STABLE;
+                    // 设置rejoinNeeded为false，因为join请求已经完成了
+                    rejoinNeeded = false;
+                    if (heartbeatThread != null)
+                        // 启动心跳线程
+                        heartbeatThread.enable();
+                }
+            }
+
+            @Override
+            public void onFailure(RuntimeException e) {
+                synchronized (AbstractCoordinator.this) {
+                    // 设置状态
+                    state = MemberState.UNJOINED;
+                }
+            }
+        });
+    }
+    return joinFuture;
+}
+
+RequestFuture<ByteBuffer> sendJoinGroupRequest() {
+    if (coordinatorUnknown())
+        return RequestFuture.coordinatorNotAvailable();
+
+    // 构建请求
+    JoinGroupRequest.Builder requestBuilder = new JoinGroupRequest.Builder(
+        groupId,
+        this.sessionTimeoutMs,
+        this.generation.memberId,
+        protocolType(),
+        metadata()).setRebalanceTimeout(this.rebalanceTimeoutMs);
+
+    int joinGroupTimeoutMs = Math.max(rebalanceTimeoutMs, rebalanceTimeoutMs + 5000);
+    // 调用client的send发送请求，返回 RequestFuture<ClientResponse>
+    // 这里调用compose方法，转换为 RequestFuture<ByteBuffer>
+    return client.send(coordinator, requestBuilder, joinGroupTimeoutMs)
+        .compose(new JoinGroupResponseHandler());
+}
+```
+
+
+
+
+
+```java
+private class JoinGroupResponseHandler extends CoordinatorResponseHandler<JoinGroupResponse, ByteBuffer> {
+    
+    @Override
+    public void handle(JoinGroupResponse joinResponse, RequestFuture<ByteBuffer> future) {
+        Errors error = joinResponse.error();
+        if (error == Errors.NONE) {
+            synchronized (AbstractCoordinator.this) {
+                if (state != MemberState.REBALANCING) {
+                    // 检查是否为REBALANCING状态，那么说明需要重新加入group，所以这次请求响应需要退出
+                    future.raise(new UnjoinedGroupException());
+                } else {
+                    // 更新generation数据，从响应中获取generationId，memberId和groupProtocol
+                    AbstractCoordinator.this.generation = new Generation(joinResponse.generationId(),
+                            joinResponse.memberId(), joinResponse.groupProtocol());
+                    // 如果这个consumer被认为是leader角色，那么调用onJoinLeader执行分区分配
+                    if (joinResponse.isLeader()) {
+                        // 注意到这里使用了chain，当onJoinLeader的结果完成后，才会调用future完成
+                        onJoinLeader(joinResponse).chain(future);
+                    } else {
+                        // 如果这个consumer被认为是follower角色，那么调用onJoinFollower获取分配结果
+                        // 注意到这里使用了chain，当onJoinFollower的结果完成后，才会调用future完成
+                        onJoinFollower().chain(future);
+                    }
+                }
+            }
+        } else if (error ) {
+            // 处理各种错误
+            ......
+            future.raise(error);
+        }
+    }
+}
+```
+
+
+
+
+
+leader执行分配算法
+
+```java
+private RequestFuture<ByteBuffer> onJoinLeader(JoinGroupResponse joinResponse) {
+    try {
+        // 子类负责实现performAssignment方法，分区分配
+        Map<String, ByteBuffer> groupAssignment = performAssignment(joinResponse.leaderId(), joinResponse.groupProtocol(),
+                joinResponse.members());
+        // 
+        SyncGroupRequest.Builder requestBuilder =
+                new SyncGroupRequest.Builder(groupId, generation.generationId, generation.memberId, groupAssignment);
+        // 
+        return sendSyncGroupRequest(requestBuilder);
+    } catch (RuntimeException e) {
+        return RequestFuture.failure(e);
+    }
+}
+```
 
