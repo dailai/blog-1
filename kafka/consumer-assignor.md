@@ -358,5 +358,248 @@ sortedPartitions只包含了即将要分配的partition。如果一个partition�
 
 目前unassignedPartitions集合，包含了需要分配的分区
 
-目前currentPartitionConsumer
+目前currentPartitionConsumer包含了currentAssignment的partition到consumer的对应表
 
+
+
+将unassignedPartitions的partition分配到consumer，结果保存在currentAssignment集合里
+
+
+
+找到那些有多个consumer可以订阅的partition列表，然后将这些 partition 从 sortedPartitions 集合中去除掉
+
+找到那些不能参与 partition balance 的 consumer。需要满足以下条件：如果该consumer的分配的partition数目 小于 可以订阅的partition数目 。或者它所分配的partition 有多个consumer 订阅
+
+这些不能参与 balance 的 partition 保存在 fixedAssignments 集合里。而且还需要把sortedCurrentSubscriptions的这些consumer删除掉
+
+
+
+
+
+  isBalanced函数判断当前分区的分配情况是否平衡
+
+```java
+/*
+  currentAssignment：当前consumer的分配partition情况
+  sortedCurrentSubscriptions：排序的consumer列表，按照分配的partition数目规则排序
+  allSubscriptions：consumer可以订阅的 partition 对应表
+*/
+
+private boolean isBalanced(Map<String, List<TopicPartition>> currentAssignment,
+                           TreeSet<String> sortedCurrentSubscriptions,
+                           Map<String, List<TopicPartition>> allSubscriptions) {
+    int min = currentAssignment.get(sortedCurrentSubscriptions.first()).size();
+    int max = currentAssignment.get(sortedCurrentSubscriptions.last()).size();
+    if (min >= max - 1)
+        // 当consumer分配的分区数，最大数和最小数相差不大于 1，则认为已经平衡
+        return true;
+
+    // 根据当前的分区分配情况，创建 partition 到 consumer 的对应表
+    final Map<TopicPartition, String> allPartitions = new HashMap<>();
+    // 遍历当前分布情况的 currentAssignment 集合 
+    Set<Entry<String, List<TopicPartition>>> assignments = currentAssignment.entrySet();
+    for (Map.Entry<String, List<TopicPartition>> entry: assignments) {
+        List<TopicPartition> topicPartitions = entry.getValue();
+        for (TopicPartition topicPartition: topicPartitions) {
+            if (allPartitions.containsKey(topicPartition))
+                log.error(topicPartition + " is assigned to more than one consumer.");
+            // 将此partition 和 consumer 的记录，添加到 allPartitions 集合
+            allPartitions.put(topicPartition, entry.getKey());
+        }
+    }
+
+    // 遍历 consumer，按照从小到大的顺序遍历
+    for (String consumer: sortedCurrentSubscriptions) {
+        List<TopicPartition> consumerPartitions = currentAssignment.get(consumer);
+        int consumerPartitionCount = consumerPartitions.size();
+
+        // 如果该 consumer 已经分配的分区数，等于 可以分配分区的最大数，那么认为该consumer不能接收多的partition。因为这是按照从小到大的顺序遍历consumer，后面的consumer已经分配的分区数肯定会大于当前consumer。为了平衡，所以也不可能减少该consumer的partition数，否则这样更加破坏了平衡
+        if (consumerPartitionCount == allSubscriptions.get(consumer).size())
+            continue;
+
+        // 获取当前consumer可以分配的最大分区数
+        List<TopicPartition> potentialTopicPartitions = allSubscriptions.get(consumer);
+        // 遍历可以分配的所有分区，尝试将心分区分配给当前consumer
+        for (TopicPartition topicPartition: potentialTopicPartitions) {
+            // 如果当前consumer还没有分配到此分区，那么尝试将此分区移动到当前consumer
+            if (!currentAssignment.get(consumer).contains(topicPartition)) {
+                // 找到该partition 现在分配给哪个consumer
+                String otherConsumer = allPartitions.get(topicPartition);
+                // 这里只有当别的consumer分配的分区多，才会移动partition
+                int otherConsumerPartitionCount = currentAssignment.get(otherConsumer).size();
+                if (consumerPartitionCount < otherConsumerPartitionCount) {
+                    // 返回false，表示还可以进一步平衡
+                    return false;
+                }
+            }
+        }
+    }
+    // 返回true，表示无法进一步改善平衡了
+    return true;
+}
+```
+
+
+
+
+
+performReassignments方法实现重新分配
+
+```java
+private boolean performReassignments(List<TopicPartition> reassignablePartitions,
+                                     Map<String, List<TopicPartition>> currentAssignment,
+                                     TreeSet<String> sortedCurrentSubscriptions,
+                                     Map<String, List<TopicPartition>> consumer2AllPotentialPartitions,
+                                     Map<TopicPartition, List<String>> partition2AllPotentialConsumers,
+                                     Map<TopicPartition, String> currentPartitionConsumer) {
+    boolean reassignmentPerformed = false;
+    boolean modified;
+
+    // repeat reassignment until no partition can be moved to improve the balance
+    do {
+        modified = false;
+        // 遍历可以重新分配的partition
+        Iterator<TopicPartition> partitionIterator = reassignablePartitions.iterator();
+        
+        // 如果遍历完partition或者分配情况达到平衡
+        while (partitionIterator.hasNext() && !isBalanced(currentAssignment, sortedCurrentSubscriptions, consumer2AllPotentialPartitions)) {
+            
+            TopicPartition partition = partitionIterator.next();
+
+            // the partition must have at least two consumers
+            if (partition2AllPotentialConsumers.get(partition).size() <= 1)
+                log.error("Expected more than one potential consumer for partition '" + partition + "'");
+
+            // 找到该partition现在分配给哪个consumer
+            String consumer = currentPartitionConsumer.get(partition);
+            if (consumer == null)
+                log.error("Expected partition '" + partition + "' to be assigned to a consumer");
+
+            // 遍历可以该 partition 可以分配的consumer
+            for (String otherConsumer: partition2AllPotentialConsumers.get(partition)) {
+                // 如果其他consumer分配的分区数 小于 该 consumer分配的分区数，并且插值至少为2
+                // 那么将此partition重新分配
+                if (currentAssignment.get(consumer).size() > currentAssignment.get(otherConsumer).size() + 1) {
+                    // 重新分配该partition
+                    reassignPartition(partition, currentAssignment, sortedCurrentSubscriptions, currentPartitionConsumer, consumer2AllPotentialPartitions);
+                    reassignmentPerformed = true;
+                    modified = true;
+                    break;
+                }
+            }
+        }
+    } while (modified);
+
+    return reassignmentPerformed;
+}
+```
+
+
+
+reassignPartition方法负责重新分配单个partition，它尽量将partition分配给，分区数目最小的那个consumer。
+
+```java
+private void reassignPartition(TopicPartition partition,
+                               Map<String, List<TopicPartition>> currentAssignment,
+                               TreeSet<String> sortedCurrentSubscriptions,
+                               Map<TopicPartition, String> currentPartitionConsumer,
+                               Map<String, List<TopicPartition>> consumer2AllPotentialPartitions) {
+    String consumer = currentPartitionConsumer.get(partition);
+    String newConsumer = null;
+    // 按照分区数从小到大的遍历consumer，如果遇到consumer可以订阅该partition，那么就移动partition
+    for (String anotherConsumer: sortedCurrentSubscriptions) {
+        if (consumer2AllPotentialPartitions.get(anotherConsumer).contains(partition)) {
+            newConsumer = anotherConsumer;
+            break;
+        }
+    }
+
+    assert newConsumer != null;
+
+    // find the correct partition movement considering the stickiness requirement
+    TopicPartition partitionToBeMoved = partitionMovements.getTheActualPartitionToBeMoved(partition, consumer, newConsumer);
+    processPartitionMovement(partitionToBeMoved, newConsumer, currentAssignment, sortedCurrentSubscriptions, currentPartitionConsumer);
+
+    return;
+}
+```
+
+
+
+
+
+balance平衡
+
+
+
+```java
+private void balance(Map<String, List<TopicPartition>> currentAssignment,
+                     List<TopicPartition> sortedPartitions,
+                     List<TopicPartition> unassignedPartitions,
+                     TreeSet<String> sortedCurrentSubscriptions,
+                     Map<String, List<TopicPartition>> consumer2AllPotentialPartitions,
+                     Map<TopicPartition, List<String>> partition2AllPotentialConsumers,
+                     Map<TopicPartition, String> currentPartitionConsumer) {
+    boolean initializing = currentAssignment.get(sortedCurrentSubscriptions.last()).isEmpty();
+    boolean reassignmentPerformed = false;
+
+    // 遍历未分配的partition
+    for (TopicPartition partition: unassignedPartitions) {
+        if (partition2AllPotentialConsumers.get(partition).isEmpty())
+            continue;
+        // 将partition尽量分配给分区数目小的consumer
+        assignPartition(partition, sortedCurrentSubscriptions, currentAssignment,
+                        consumer2AllPotentialPartitions, currentPartitionConsumer);
+    }
+    
+    // 目前所有的partition都已经分配完了，结果保存在currentAssignment集合里
+
+    // 找到那些只能被一个consumer订阅的partition，这样的partition是不能重新分配的
+    Set<TopicPartition> fixedPartitions = new HashSet<>();
+    for (TopicPartition partition: partition2AllPotentialConsumers.keySet())
+        // canParticipateInReassignment方法，判断partition是否被多个consumer订阅
+        if (!canParticipateInReassignment(partition, partition2AllPotentialConsumers))
+            fixedPartitions.add(partition);
+    // 从sortedPartitions删除掉不能重新分配的 partition
+    sortedPartitions.removeAll(fixedPartitions);
+    
+    // 目前sortedPartitions列表只包含了可以重新分配的partition
+    
+    Map<String, List<TopicPartition>> fixedAssignments = new HashMap<>();
+    // 遍历consumer
+    for (String consumer: consumer2AllPotentialPartitions.keySet())
+        // 找到那些不能参与重新分配的consumer，不能参与重新分配的条件是该consumer已经分配的分区数达到可以分配的最大值，并且所有的分区只有这么一个consumer可以订阅
+        if (!canParticipateInReassignment(consumer, currentAssignment,
+                                          consumer2AllPotentialPartitions, partition2AllPotentialConsumers)) {
+            // 从sortedCurrentSubscriptions中删除掉这些consumer
+            sortedCurrentSubscriptions.remove(consumer);
+            // 从currentAssignment删除掉这些consumer的分配信息，这样避免影响到重新分区
+            fixedAssignments.put(consumer, currentAssignment.remove(consumer));
+        }
+
+    // 目前sortedCurrentSubscriptions列表只包含了可以参与重新分配的partition
+   
+    Map<String, List<TopicPartition>> preBalanceAssignment = deepCopy(currentAssignment);
+    Map<TopicPartition, String> preBalancePartitionConsumers = new HashMap<>(currentPartitionConsumer);
+    // 执行重新分配，尽量保证分区的平衡
+    reassignmentPerformed = performReassignments(sortedPartitions, currentAssignment, sortedCurrentSubscriptions,
+            consumer2AllPotentialPartitions, partition2AllPotentialConsumers, currentPartitionConsumer);
+
+
+    if (!initializing && reassignmentPerformed && getBalanceScore(currentAssignment) >= getBalanceScore(preBalanceAssignment)) {
+        deepCopy(preBalanceAssignment, currentAssignment);
+        currentPartitionConsumer.clear();
+        currentPartitionConsumer.putAll(preBalancePartitionConsumers);
+    }
+
+    // 将没有参与重新分配的consumer，添加到sortedCurrentSubscriptions列表里
+    // 将这些consumer的分区分配情况，添加currentAssignment集合里
+    for (Entry<String, List<TopicPartition>> entry: fixedAssignments.entrySet()) {
+        String consumer = entry.getKey();
+        currentAssignment.put(consumer, entry.getValue());
+        sortedCurrentSubscriptions.add(consumer);
+    }
+
+    fixedAssignments.clear();
+}
+```
