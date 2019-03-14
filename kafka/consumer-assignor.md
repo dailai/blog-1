@@ -14,6 +14,9 @@ public interface PartitionAssignor {
     // 返回该分配算法的名称
     String name();
     
+    // 根据订阅的topic列表，实例化Subscription，可以添加自定义的数据
+    Subscription subscription(Set<String> topics);
+    
 }
 ```
 
@@ -21,7 +24,7 @@ public interface PartitionAssignor {
 
 上面的输入参数涉及到Subscription类，Subscription包含了订阅的topic列表，和用户上传的自定义数据。
 
-返回结果涉及到Assignment类，Assignment包含了分配的topic partition 列表，和用户上传的自定义数据。
+返回结果涉及到Assignment类，Assignment包含了的分配结果。分配结果包含了该consumer的 topic partition 列表，和用户上传的自定义数据。
 
 
 
@@ -203,4 +206,157 @@ public class RoundRobinAssignor extends AbstractPartitionAssignor {
 ```
 
 
+
+StickyAssignor
+
+StickyAssignor算法涉及到自定义数据，consumer会将上一次的分区分配结果，作为自定义数据，上传到Coordinator。
+
+
+
+
+
+1. 首先根据每个consumer上传的自定义数据，得到这次分配前的结果，保存了每个consumer订阅的分区列表。
+2. 为每个consumer，都生成一个 分区列表。这些分区只属于了它订阅的topic。
+3. 为每个分区，都生成一个 consumer 列表。这些consumer只订阅了 该分区所属的 topic。
+4. 根据步骤1的结果，计算出每个topic partition 和 consumer 的哈希表
+5.  分为两种情况
+   1. 第一次分配的情况，将步骤3的结果的分区按照PartitionComparator排序，生成topic partition 列表
+   2. 再次分配，并且步骤2和步骤3的结果，是相同的。
+6. 步骤3的结果中，去除那些退出的consumer的分配的partition
+7. 删除掉没有consumer订阅的partition
+
+
+
+输入数据：
+
+Map<String, Integer> partitionsPerTopic， topic 拥有的 partition 数目
+
+Map<String, Subscription> subscriptions， consumer 的订阅 信息
+
+Map<String, List<TopicPartition>> currentAssignment， 上次分配的结果。每个consumer分配的 partition列表
+
+isFreshAssignment， 是否为第一次分配
+
+
+
+中间重要字段：
+
+Map<TopicPartition, List<String>> partition2AllPotentialConsumers，根据订阅信息，生成的partition 和 consumer 的对应关系，两种之间有topic的订阅关系
+
+Map<String, List<TopicPartition>>  consumer2AllPotentialPartitions， 根据订阅信息，生成consumer和partition的对应关系，两种之间有topic的订阅关系
+
+Map<TopicPartition, String> currentPartitionConsumer，上次分配的结果，partition 和 consumer的关系
+
+
+
+判断partition2AllPotentialConsumers中，每个partition对应的consumer列表，是否相同。
+
+判断consumer2AllPotentialPartitions中，每个consumer对应的partition列表，是否相同。
+
+
+
+复制currentAssignment集合，删除那么没有consumer订阅的partition，然后将consumer按照SubscriptionComparator排序。然后一次按照consumer的排序规则遍历，将其对应的partition添加到 sortedPartitions列表。
+
+
+
+按照订阅信息，如果一些consumer退出了，那么需要从currentPartitionConsumer，删除掉对应的partition
+
+如果topic没有被consumer订阅，那么currentPartitionConsumer删除掉对应的partition。还需要从currentAssignment删除。
+
+如果topic不在被之前的consumer订阅，那么需要从currentAssignment删除。
+
+否则从unassignedPartitions删除掉 partition
+
+
+
+
+
+SubscriptionComparator 排序规则，先按照consumer订阅的partition的数目拍戏，然后按照consumer的字符串排序。
+
+PartitionComparator 排序 规则， 先按照 所属 topic 被 consumer订阅的数目排序，之后按照 topic 的字符串排序，最后按照分数索引排序。
+
+
+
+```java
+private void balance(Map<String, List<TopicPartition>> currentAssignment,
+                     List<TopicPartition> sortedPartitions,
+                     List<TopicPartition> unassignedPartitions,
+                     TreeSet<String> sortedCurrentSubscriptions,
+                     Map<String, List<TopicPartition>> consumer2AllPotentialPartitions,
+                     Map<TopicPartition, List<String>> partition2AllPotentialConsumers,
+                     Map<TopicPartition, String> currentPartitionConsumer)
+```
+
+
+
+currentAssignment： 在上次分配结果之上，根据这次的订阅信息，减少那些不在使用的consumer和partition
+
+unassignedPartitions： 在上次分配结果之上，保留那些需要重新分配的partition
+
+sortedCurrentSubscriptions：consumer列表
+
+consumer2AllPotentialPartitions：
+
+partition2AllPotentialConsumers：
+
+currentPartitionConsumer：partition到consumer的对应表
+
+
+
+如果某个consumer加入，
+
+
+
+生成currentAssignment集合，如果该consumer之前分配过，会保存之前的订阅的partition。如果之前没有分配过，则创建空的列表。
+
+根据新的订阅信息，生成partition 到 consumer的对应表，和consumer到 partition的对应表。
+
+根据currentAssignment集合，生成partition 到 consumer的对应表。
+
+
+
+生成排序后的partition列表：
+
+ 如果不是第一次分配，并且每个consumer订阅的topic都是一样。
+
+1. 复制currentAssignment集合，保存到临时集合assignments里。 如果以前的partition，现在没有被consumer订阅，那么将其从assignments中删掉。
+2. 将所有订阅的consumer 排序，按照之前分配的分区数，排序
+3. 然后按照从大到小的顺寻，遍历consumer。依次将consumer之前分配的分区，添加到列表sortedPartitions中
+4. 因为sortedPartitions只包含了之前的分区，如果有consumer订阅了新的topic，那么需要将新的topic的partition添加到sortedPartitions列表中
+
+否则
+
+   将订阅的partition，按照被订阅的consumer数目排序，保存到sortedPartitions
+
+
+
+sortedPartitions只包含了即将要分配的partition。如果一个partition在上次分配中存在，但这次没有，则不会保存到sortedPartitions集合里。
+
+
+
+目前currentAssignment集合，既包含了以前的consumer，也包含了新的consumer。
+
+
+
+
+
+复制sortedPartitions列表，保存到临时列表unassignedPartitions。
+
+如果一些consumer退出了，那么需要从currentPartitionConsumer，删除掉对应的partition。还需要从currentAssignment删除掉旧的consumer。
+
+如果该consumer不再订阅该topic，那么currentPartitionConsumer删除掉topic对应的partition。还需要从currentAssignment删除。
+
+如果topic不在被之前的consumer订阅，那么需要从currentAssignment删除。
+
+否则从unassignedPartitions删除掉 partition。
+
+
+
+
+
+目前currentAssignment集合，只包含了订阅的consumer，而且只包含了consumer订阅的有效partition分区。
+
+目前unassignedPartitions集合，包含了需要分配的分区
+
+目前currentPartitionConsumer
 
