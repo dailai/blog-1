@@ -1,6 +1,10 @@
 # Kafka Consumer 分区分配算法 #
 
+当Consumer加入到一个组后，会触发订阅的分区重新分配。组里的成员可以订阅不同的topic，当组的成员发生变化时，Coordinator会从组里面选出一个成员作为leader角色，它会执行分配算法，然后将结果发送给Coordinator。注意到分区分配的执行，是在客户端执行的。Coordinator更多的是作为各个客户端的沟通桥梁。
 
+Kafka支持多种分配算法，不仅自身实现了三种算法，而且还支持自定义，需要在partition.assignment.strategy配置项，添加算法的实现类路径。接下来看看Kafka提供的三种分配算法
+
+## 分配算法接口 ##
 
 分配算法由PartitionAssignor接口表示
 
@@ -16,19 +20,16 @@ public interface PartitionAssignor {
     
     // 根据订阅的topic列表，实例化Subscription，可以添加自定义的数据
     Subscription subscription(Set<String> topics);
-    
 }
 ```
 
+输入参数涉及到Subscription类，Subscription包含了订阅的topic列表，和consumer的自定义数据。
 
-
-上面的输入参数涉及到Subscription类，Subscription包含了订阅的topic列表，和用户上传的自定义数据。
-
-返回结果涉及到Assignment类，Assignment包含了的分配结果。分配结果包含了该consumer的 topic partition 列表，和用户上传的自定义数据。
+分配结果涉及到Assignment类，它包含了该consumer 分配的 topic partition 列表，和自定义数据。
 
 
 
-目前consumer有三种分配算法。这三个算法都继承了AbstractPartitionAssignor，AbstractPartitionAssignor提供了公共的部分，根据元数据生成每个topic的分区数目表。
+Kafka的三种分配算法，都继承了AbstractPartitionAssignor。AbstractPartitionAssignor提供了公共的部分，根据元数据生成每个topic的分区数目表。
 
 ```java
 public abstract class AbstractPartitionAssignor implements PartitionAssignor {
@@ -70,13 +71,11 @@ public abstract class AbstractPartitionAssignor implements PartitionAssignor {
 
 
 
+## RangeAssignor算法 ##
 
+RangeAssignor算法，就是计算出每个consumer订阅的分区区间。算法如下：
 
-RangeAssignor算法
-
-首先找出每个topic被哪些consumer订阅，然后根据该topic的分区数，平均分配
-
-以下列为例，topic_a有5个分区，有3个consumer订阅了topic_a。策略执行如下：
+首先找出每个topic被哪些consumer订阅，然后根据该topic的分区数，平均分配。以下列为例，topic_a有5个分区，有3个consumer订阅了topic_a。策略执行如下：
 
 1. 首先确定每个consumer至少分配多少个分区， 这里为 5 / 3 = 1 个
 2. 计算剩余的分区数目，这里为 5 % 3 = 2
@@ -84,8 +83,6 @@ RangeAssignor算法
 排在前面的consumer分配的分区数为 平均数加1，比如consumer_0和consumer_1的分区数为2
 
 排在后面的consumer分配的分区数为 平均数，比如consumer_2的分区数为1
-
-
 
 ```java
 public class RangeAssignor extends AbstractPartitionAssignor {
@@ -144,15 +141,9 @@ public class RangeAssignor extends AbstractPartitionAssignor {
 
 
 
- 
+## RoundRobinAssignor算法 ##
 
-
-
-RoundRobinAssignor算法
-
-首先依次遍历订阅的 topic，将每个 topic 的 partition 列表合成一个大的列表。
-
-然后依次遍历 partition 列表，轮询分配给consumer。
+RoundRobinAssignor的基本思想，是采用了轮询的思想。首先依次遍历订阅的 topic，将每个 topic 的 partition 列表合成一个大的列表。然后依次遍历 partition 列表，轮询分配给consumer。
 
 ```java
 public class RoundRobinAssignor extends AbstractPartitionAssignor {
@@ -207,9 +198,151 @@ public class RoundRobinAssignor extends AbstractPartitionAssignor {
 
 
 
-StickyAssignor
+## StickyAssignor 算法 ##
 
-StickyAssignor算法涉及到自定义数据，consumer会将上一次的分区分配结果，作为自定义数据，上传到Coordinator。
+StickyAssignor算法比较复杂，它的目的是为了每个重新分配时，尽量保持原来的分区情况，减少需要移动的分区。
+
+使用StickyAssignor算法时，consumer都会保存每次的分配结果。当触发重新分配时，会将上次分配的结果作为自定义数据，上传给Coordinator。这样leader角色就可以获取到上次每个组成员的分配情况，然后执行重新分配。
+
+
+
+StickyAssignor算法分为两个部分：
+
+第一部分是根据上次的分配情况，结合目前各个consumer的订阅信息，处理consumer退出或者consumer订阅topic的情况发生改变。然后将这些需要新的分区重新分配。
+
+第二部分是将第一步的结果，需要进行平衡处理。防止单个consumer分配的分区数过大或过小。
+
+
+
+### 处理订阅 ###
+
+StickyAssignor算法首先获取到上次分配的结果之后，会再此基础之上，将失效的分区删除掉。失效的分区包含下面两种：
+
+* 如果以前的分配结果中，包含一些分区，现在被删除掉了，那么需要将这些分区删除掉。
+
+* 如果以前的分配结果中，包含一些分区，它们的topic现在不再被订阅，那么也需要将这些分区删除掉。
+
+经过这样处理后，就能在分区有效的情况下，尽量的保证旧有的分配不变。
+
+
+
+然后将订阅的topic，涉及到的分区，排序。
+
+
+
+
+
+
+
+上次的分配结果保存在currentAssignment集合里，然后根据不同的情况，做不同的处理。
+
+
+
+
+
+需要注意，partitionsPerTopic的topic数据是从订阅信息中，挑选出有元数据的topic。
+
+这里没有考虑topic无效的情况。这是一个bug，暂且不考虑这个问题。这里假设partitionsPerTopic和subscriptions拥有的topic是相同的
+
+
+
+
+
+```java
+public Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
+                                                Map<String, Subscription> subscriptions) {
+    // key为consumer的id，value为分配的分区列表
+    Map<String, List<TopicPartition>> currentAssignment = new HashMap<>();
+    // subscriptions的自定义数据，包含了上次consumer分配的情况
+    // 这里会解析数据，将上次分配的情况保存到currentAssignment集合
+    prepopulateCurrentAssignments(subscriptions, currentAssignment);
+    // 如果是第一次分配，那么currentAssignment为空
+    boolean isFreshAssignment = currentAssignment.isEmpty();
+
+    // 根据topic的分区信息，生成 partition列表。 然后根据订阅信息，生成 这些partition可以被哪些 consumer 订阅的对应表
+    final Map<TopicPartition, List<String>> partition2AllPotentialConsumers = new HashMap<>();
+    // 根据订阅信息，生成 consumer 可以订阅 哪些 partition 的对应表
+    final Map<String, List<TopicPartition>> consumer2AllPotentialPartitions = new HashMap<>();
+
+    // 遍历所有topic的分区，初始化partition2AllPotentialConsumers
+    for (Entry<String, Integer> entry: partitionsPerTopic.entrySet()) {
+        for (int i = 0; i < entry.getValue(); ++i)
+            partition2AllPotentialConsumers.put(new TopicPartition(entry.getKey(), i), new ArrayList<String>());
+    }
+    
+    // 遍历订阅信息
+    for (Entry<String, Subscription> entry: subscriptions.entrySet()) {
+        String consumer = entry.getKey();
+        consumer2AllPotentialPartitions.put(consumer, new ArrayList<TopicPartition>());
+        // 遍历consumer订阅的所有topic
+        for (String topic: entry.getValue().topics()) {
+            // 获取topic的分区，将分区和consumer的关系，添加到consumer2AllPotentialPartitions和partition2AllPotentialConsumers集合里
+            for (int i = 0; i < partitionsPerTopic.get(topic); ++i) {
+                TopicPartition topicPartition = new TopicPartition(topic, i);
+                consumer2AllPotentialPartitions.get(consumer).add(topicPartition);
+                partition2AllPotentialConsumers.get(topicPartition).add(consumer);
+            }
+        }
+
+        // 如果有新的consumer加入，同样也需要将新的consumer添加到currentAssignment集合里
+        if (!currentAssignment.containsKey(consumer))
+            currentAssignment.put(consumer, new ArrayList<TopicPartition>());
+    }
+    
+    // 根据currentAssignment集合，生成partition到consumer的关系。注意这里对应表，是旧有分配的分区情况
+    Map<TopicPartition, String> currentPartitionConsumer = new HashMap<>();
+    for (Map.Entry<String, List<TopicPartition>> entry: currentAssignment.entrySet())
+        for (TopicPartition topicPartition: entry.getValue())
+            currentPartitionConsumer.put(topicPartition, entry.getKey());
+    
+    // 将需要订阅的partition，进行排序
+    // 如果是第一次分配，那么就按照该partition可以被订阅的consumer数排序
+    // 如果是再次分配，那么首先根据上次分配的情况，将consumer按照分配的分区数排序，然后将consumer的分配的分区数
+    List<TopicPartition> sortedPartitions = sortPartitions(
+            currentAssignment, isFreshAssignment, partition2AllPotentialConsumers, consumer2AllPotentialPartitions);
+
+    // 计算有哪些分区需要分配
+    List<TopicPartition> unassignedPartitions = new ArrayList<>(sortedPartitions);
+    // 遍历currentAssignment集合
+    for (Iterator<Map.Entry<String, List<TopicPartition>>> it = currentAssignment.entrySet().iterator(); it.hasNext();) {
+        Map.Entry<String, List<TopicPartition>> entry = it.next();
+        if (!subscriptions.containsKey(entry.getKey())) {
+            // 这里不太明白，因为currentAssignment是根据订阅信息subscriptions生成，
+            // 不知道什么情况下，会出现这种情况
+            for (TopicPartition topicPartition: entry.getValue())
+                currentPartitionConsumer.remove(topicPartition);
+            it.remove();
+        } else {
+
+            for (Iterator<TopicPartition> partitionIter = entry.getValue().iterator(); partitionIter.hasNext();) {
+                TopicPartition partition = partitionIter.next();
+                if (!partition2AllPotentialConsumers.containsKey(partition)) {
+                    // 如果该分区不存在
+                    partitionIter.remove();
+                    currentPartitionConsumer.remove(partition);
+                } else if (!subscriptions.get(entry.getKey()).topics().contains(partition.topic())) {
+                    // 如果该consumer之前订阅了这个topic，并且也分配了该分区。但是现在不在订阅该topic
+                    partitionIter.remove();
+                } else
+                    // 如果该consumer能够继续订阅该分区，那么就认为该分区已经分配给consumer了。
+                    unassignedPartitions.remove(partition);
+            }
+        }
+    }
+    
+    // 将consumer排序
+    TreeSet<String> sortedCurrentSubscriptions = new TreeSet<>(new SubscriptionComparator(currentAssignment));
+    sortedCurrentSubscriptions.addAll(currentAssignment.keySet());
+    // 进行平衡操作
+    balance(currentAssignment, sortedPartitions, unassignedPartitions, sortedCurrentSubscriptions,
+            consumer2AllPotentialPartitions, partition2AllPotentialConsumers, currentPartitionConsumer);
+    return currentAssignment;
+}
+```
+
+
+
+
 
 
 
@@ -601,5 +734,163 @@ private void balance(Map<String, List<TopicPartition>> currentAssignment,
     }
 
     fixedAssignments.clear();
+}
+```
+
+
+
+
+
+assign
+
+```java
+public Map<String, List<TopicPartition>> assign(Map<String, Integer> partitionsPerTopic,
+                                                Map<String, Subscription> subscriptions) {
+    Map<String, List<TopicPartition>> currentAssignment = new HashMap<>();
+    partitionMovements = new PartitionMovements();
+    // subscriptions的自定义数据，包含了上次consumer分配的情况
+    // 这里会解析数据，将上次分配的情况保存到currentAssignment集合
+    prepopulateCurrentAssignments(subscriptions, currentAssignment);
+    // 如果是第一次分配，那么currentAssignment为空
+    boolean isFreshAssignment = currentAssignment.isEmpty();
+
+    // 根据订阅信息，生成 partition 可以被哪些 consumer 订阅的对应表
+    final Map<TopicPartition, List<String>> partition2AllPotentialConsumers = new HashMap<>();
+    // 根据订阅信息，生成 consumer 可以订阅 哪些 partition 的对应表
+    final Map<String, List<TopicPartition>> consumer2AllPotentialPartitions = new HashMap<>();
+
+    // 遍历所有topic的分区，初始化partition2AllPotentialConsumers
+    for (Entry<String, Integer> entry: partitionsPerTopic.entrySet()) {
+        for (int i = 0; i < entry.getValue(); ++i)
+            partition2AllPotentialConsumers.put(new TopicPartition(entry.getKey(), i), new ArrayList<String>());
+    }
+    // 遍历订阅信息
+    for (Entry<String, Subscription> entry: subscriptions.entrySet()) {
+        String consumer = entry.getKey();
+        consumer2AllPotentialPartitions.put(consumer, new ArrayList<TopicPartition>());
+        // 遍历consumer订阅的所有topic
+        for (String topic: entry.getValue().topics()) {
+            // 获取topic的分区，将分区和consumer的关系，添加到consumer2AllPotentialPartitions和partition2AllPotentialConsumers集合里
+            for (int i = 0; i < partitionsPerTopic.get(topic); ++i) {
+                TopicPartition topicPartition = new TopicPartition(topic, i);
+                consumer2AllPotentialPartitions.get(consumer).add(topicPartition);
+                partition2AllPotentialConsumers.get(topicPartition).add(consumer);
+            }
+        }
+
+        // 如果有新的consumer加入，同样也需要将新的consumer添加到currentAssignment集合里
+        if (!currentAssignment.containsKey(consumer))
+            currentAssignment.put(consumer, new ArrayList<TopicPartition>());
+    }
+    
+    // 目前currentAssignment集合，包含了所有最新的consumer
+
+    // 根据currentAssignment集合，生成partition到consumer的关系。注意这里对应表，是旧有分配的分区情况
+    Map<TopicPartition, String> currentPartitionConsumer = new HashMap<>();
+    for (Map.Entry<String, List<TopicPartition>> entry: currentAssignment.entrySet())
+        for (TopicPartition topicPartition: entry.getValue())
+            currentPartitionConsumer.put(topicPartition, entry.getKey());
+    // 将需要订阅的partition，进行排序
+    // 如果是第一次分配，那么就按照该partition可以被订阅的consumer数排序
+    // 如果是再次分配，那么首先根据上次分配的情况，将consumer按照分配的分区数排序，然后将consumer的分配的分区数
+    List<TopicPartition> sortedPartitions = sortPartitions(
+            currentAssignment, isFreshAssignment, partition2AllPotentialConsumers, consumer2AllPotentialPartitions);
+
+    // 计算有哪些分区需要分配
+    List<TopicPartition> unassignedPartitions = new ArrayList<>(sortedPartitions);
+    // 遍历currentAssignment集合
+    for (Iterator<Map.Entry<String, List<TopicPartition>>> it = currentAssignment.entrySet().iterator(); it.hasNext();) {
+        Map.Entry<String, List<TopicPartition>> entry = it.next();
+        if (!subscriptions.containsKey(entry.getKey())) {
+            // 这里不太明白，因为currentAssignment是根据订阅信息subscriptions生成，
+            // 不知道什么情况下，会出现这种情况
+            for (TopicPartition topicPartition: entry.getValue())
+                currentPartitionConsumer.remove(topicPartition);
+            it.remove();
+        } else {
+
+            for (Iterator<TopicPartition> partitionIter = entry.getValue().iterator(); partitionIter.hasNext();) {
+                TopicPartition partition = partitionIter.next();
+                if (!partition2AllPotentialConsumers.containsKey(partition)) {
+                    // 如果该consumer不在订阅了这个分区的topic，那么应该删除掉这种情况
+                    partitionIter.remove();
+                    currentPartitionConsumer.remove(partition);
+                } else if (!subscriptions.get(entry.getKey()).topics().contains(partition.topic())) {
+                    // 这里同样不太明白，因为partition2AllPotentialConsumers集合也是由subscriptions生成的，如果上面的条件不满足，这个条件同样不满足
+                    partitionIter.remove();
+                } else
+                    // 如果该consumer能够继续订阅该分区，那么就认为该分区已经分配给consumer了。
+                    unassignedPartitions.remove(partition);
+            }
+        }
+    }
+    // 将consumer排序
+    TreeSet<String> sortedCurrentSubscriptions = new TreeSet<>(new SubscriptionComparator(currentAssignment));
+    sortedCurrentSubscriptions.addAll(currentAssignment.keySet());
+    // 进行平衡
+    balance(currentAssignment, sortedPartitions, unassignedPartitions, sortedCurrentSubscriptions,
+            consumer2AllPotentialPartitions, partition2AllPotentialConsumers, currentPartitionConsumer);
+    return currentAssignment;
+}
+```
+
+
+
+
+
+排序分区
+
+```java
+private List<TopicPartition> sortPartitions(Map<String, List<TopicPartition>> currentAssignment,
+                                            boolean isFreshAssignment,
+                                            Map<TopicPartition, List<String>> partition2AllPotentialConsumers,
+                                            Map<String, List<TopicPartition>> consumer2AllPotentialPartitions) {
+    List<TopicPartition> sortedPartitions = new ArrayList<>();
+
+    if (!isFreshAssignment && areSubscriptionsIdentical(partition2AllPotentialConsumers, consumer2AllPotentialPartitions)) {
+        // 如果不是第一次分配，而且所有consumer订阅的topic列表都相同
+        // 复制currentAssignment集合，保存到assignments
+        Map<String, List<TopicPartition>> assignments = deepCopy(currentAssignment);
+        // 因为assignments集合包含了上次分配的结果。如果没有一个consumer订阅了topic，那么需要将topic的分区信息删除掉
+        for (Entry<String, List<TopicPartition>> entry: assignments.entrySet()) {
+            List<TopicPartition> toRemove = new ArrayList<>();
+            // 如果该topic没有被consumer订阅，需要删除掉
+            for (TopicPartition partition: entry.getValue())
+                if (!partition2AllPotentialConsumers.keySet().contains(partition))
+                    toRemove.add(partition);
+            for (TopicPartition partition: toRemove)
+                entry.getValue().remove(partition);
+        }
+        // 使用SubscriptionComparator规则将consumer排序，
+        // 排序规则是按照consumer分配的分区数排序
+        TreeSet<String> sortedConsumers = new TreeSet<>(new SubscriptionComparator(assignments));
+        sortedConsumers.addAll(assignments.keySet());
+        
+        // 从大到小，遍历排序后的consumer，依次它的分配的分区，添加到结果集sortedPartitions
+        while (!sortedConsumers.isEmpty()) {
+            String consumer = sortedConsumers.pollLast();
+            List<TopicPartition> remainingPartitions = assignments.get(consumer);
+            if (!remainingPartitions.isEmpty()) {
+                sortedPartitions.add(remainingPartitions.remove(0));
+                sortedConsumers.add(consumer);
+            }
+        }
+        // 如果有consumer订阅了新的分区，那么需要将这些分区添加到sortedPartitions的最后
+        for (TopicPartition partition: partition2AllPotentialConsumers.keySet()) {
+            if (!sortedPartitions.contains(partition))
+                sortedPartitions.add(partition);
+        }
+
+    } else {
+        // 按照PartitionComparator规则将分区排序
+        // 排序规则是按照分区可以被订阅的consumer数排序
+        TreeSet<TopicPartition> sortedAllPartitions = new TreeSet<>(new PartitionComparator(partition2AllPotentialConsumers));
+        sortedAllPartitions.addAll(partition2AllPotentialConsumers.keySet());
+
+        while (!sortedAllPartitions.isEmpty())
+            sortedPartitions.add(sortedAllPartitions.pollFirst());
+    }
+
+    return sortedPartitions;
 }
 ```
