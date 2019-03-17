@@ -2,6 +2,30 @@
 
 
 
+请求过程
+
+1. consumer首先从Kafka集群中选择出一个节点，并且发出请求，寻找Coordinator的地址
+2. 获取Coordinator的地址后，consumer向Coordinator发送请求加入，请求会包含自己的订阅信息
+3. Coordinator发送请求加入的响应，响应会包含了分配的id号，和leader角色的id号。如果该consumer被选择是leader角色，响应还包含了分配的算法和所有consumer的订阅信息
+4. consumer收到响应后，如果是被选择是leader橘色，那么执行分配算法，将所有consumer的分区分配结果发送给Coordinator。如果是follower角色，那么向Coordinator发送请求获取该consumer的分配结果。
+5. Coordinator会将每个分配的结果发送给对应的consumer
+
+
+
+寻找Coordinator地址
+
+请求加入
+
+leader执行分配
+
+follower请求分配结果
+
+
+
+心跳线程
+
+
+
 ```java
 public void ensureActiveGroup() {
     // always ensure that the coordinator is ready because we may have been disconnected
@@ -92,18 +116,18 @@ SyncGroupRequest请求
 * group_id
 * generation_id
 * member_id
-* group_assignment，sync_group类型列表
+* group_assignment，每个consumer分配的结果。如果是leader，那么就是分配结果。如果是follower，那么就为空
 
 sync_group类型
 
 * member_id
-* member_assignment
+* member_assignment，分配结果
 
  
 
 SyncGroupResponse响应
 
-* member_assignment
+* member_assignment，该consumer的分配结果
 
 
 
@@ -474,3 +498,10 @@ private RequestFuture<ByteBuffer> onJoinLeader(JoinGroupResponse joinResponse) {
 }
 ```
 
+
+
+
+
+
+
+SubscriptionState类包含了订阅的topic，也包含了分区分配的结果。
