@@ -304,13 +304,11 @@ private class JoinGroupResponseHandler extends CoordinatorResponseHandler<JoinGr
 
 ## leader执行分配 ##
 
-
+Coordinator会为组里的每个consumer分配 id 号，并且从组里选择出leader角色。Coordinator返回给leader角色的响应中，包含了分配算法和组里所有consumer的订阅信息。leader角色收到响应后，会执行分区的分配算法，然后将结果保存到group_assignment字段里，发送给Coordinator。
 
 ### 协议格式 ###
 
 请求格式的主要字段：
-
-member 数据格式
 
 | 字段名           | 字段类型            | 字段含义                 |
 | ---------------- | ------------------- | ------------------------ |
@@ -339,7 +337,7 @@ assignment 类型格式
 
 ### 源码分析 ###
 
-onJoinLeader方法负责执行分配算法，关于分配算法可以参考后续博客
+onJoinLeader方法负责执行分配算法，关于分配算法的原理可以参考后续博客
 
 ```java
 private RequestFuture<ByteBuffer> onJoinLeader(JoinGroupResponse joinResponse) {
@@ -367,7 +365,7 @@ private RequestFuture<ByteBuffer> sendSyncGroupRequest(SyncGroupRequest.Builder 
 }
 ```
 
-SyncGroupResponseHandler
+SyncGroupResponseHandler将分配的结果保存到RequestFuture里
 
 ```java
 private class SyncGroupResponseHandler extends CoordinatorResponseHandler<SyncGroupResponse, ByteBuffer> {
@@ -408,7 +406,31 @@ private RequestFuture<ByteBuffer> onJoinFollower() {
 
 ## 心跳线程 ##
 
-心跳线程有三种状态，运行，暂停和关闭。
+consumer会启动一个线程，这个线程会定时的向Coordinator发送心跳请求，来通知Coordinator自己还活着。如果Coordinator没有收到心跳信息，那么它就会认为该consumer已经挂了。
+
+### 协议格式 ###
+
+请求格式的主要字段：
+
+| 字段名        | 字段类型 | 字段含义                 |
+| ------------- | -------- | ------------------------ |
+| group_id      | 字符串   | consumer 所在的 group id |
+| generation_id | 整数     | coordinator的版本号      |
+| member_id     | 整数     | consumer的 id            |
+
+
+
+响应格式的主要字段：
+
+| 字段名     | 字段类型 | 字段含义 |
+| ---------- | -------- | -------- |
+| error_code | 整数     | 错误码   |
+
+
+
+### 源码分析 ###
+
+心跳线程有三种状态，运行，暂停和关闭。它将每次心跳时间信息，都会保存到Heartbeat类。线程一直循环检测，现在是否到了需要发送心跳的时间。
 
 ```java
 public abstract class AbstractCoordinator implements Closeable {
@@ -501,24 +523,22 @@ public abstract class AbstractCoordinator implements Closeable {
 
 
 
-
-
-
-
-
-
  ## ConsumerCoordinator 原理 ##
 
 ConsumerCoordinator类继承AbstractCoordinator类，实现了几个关键的回调函数。
 
-onJoinPrepare，在发送加入请求之前
+* onJoinPrepare，在发送加入请求之前
 
-onJoinComplete，在获得分配结果之后
+* onJoinComplete，在获得分配结果之后
+
+在介绍源码之前，需要提下SubscriptionState类，它包含了订阅信息和订阅结果。当consumer是leader角色时，它还包含了这个消费组订阅的所有topic。
 
 ```java
 public final class ConsumerCoordinator extends AbstractCoordinator {
     // 保存了上次分配结果中，所有分区涉及到的topic
     private Set<String> joinedSubscription;
+    // 保存了分配结果
+    private final SubscriptionState subscriptions;
     
     @Override
     protected void onJoinPrepare(int generation, String memberId) {
@@ -537,6 +557,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         }
         // 因为每次加入组，都是由Coordinator负责选出leader角色的
         isLeader = false;
+        // 重置消费组订阅的topic列表，为当前consumer的订阅列表
         subscriptions.resetGroupSubscription();
     }
     
@@ -558,23 +579,23 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         // 保存分区分配的结果，到subscriptions里
         subscriptions.assignFromSubscribed(assignment.partitions());
 
-        // 检查有哪些新topic，这次分配到了它的分区
+        // 检查有哪些新topic
         Set<String> addedTopics = new HashSet<>();
         for (TopicPartition tp : subscriptions.assignedPartitions()) {
             if (!joinedSubscription.contains(tp.topic()))
                 addedTopics.add(tp.topic());
         }
-
+        // 当有新的topic时，说明只有订阅的模式是正则匹配，才会有新的topic
         if (!addedTopics.isEmpty()) {
             Set<String> newSubscription = new HashSet<>(subscriptions.subscription());
             Set<String> newJoinedSubscription = new HashSet<>(joinedSubscription);
             newSubscription.addAll(addedTopics);
             newJoinedSubscription.addAll(addedTopics);
-
+            // 更新订阅信息
             this.subscriptions.subscribeFromPattern(newSubscription);
             this.joinedSubscription = newJoinedSubscription;
         }
-
+        // 添加这些topic到元数据里
         this.metadata.setTopics(subscriptions.groupSubscription());
 
         // 执行assignor的回调函数
@@ -596,73 +617,3 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     }    
 }
 ```
-
-
-
-
-
-
-
-```java
-public void ensureActiveGroup() {
-    // always ensure that the coordinator is ready because we may have been disconnected
-    // when sending heartbeats and does not necessarily require us to rejoin the group.
-    ensureCoordinatorReady();
-    startHeartbeatThreadIfNeeded();
-    joinGroupIfNeeded();
-}
-```
-
-ensureCoordinatorReady负责寻找到Coordinator的位置，然后创建好连接。
-
-发送FindCoordinatorRequest请求，处理响应的回调在FindCoordinatorResponseHandler里。
-
-
-
-startHeartbeatThreadIfNeeded负责开启心跳线程
-
-
-
-joinGroupIfNeeded加入Kafka的消费组，分为三个阶段
-
-onJoinPrepare，加入之前
-
-发送JoinGroupRequest请求，JoinGroupResponseHandler负责处理响应。
-
-根据响应查看返回的角色，如果是leader则调用onJoinLeader回调。如果是follower则调用onJoinFollower回调。
-
-onJoinLeader函数会执行分区的分配，然后发送SyncGroupRequest请求给coordinator
-
-onJoinFollower函数会发送SyncGroupRequest请求给coordinator
-
-
-
-SyncGroupRequest的响应处理回调，在SyncGroupResponseHandler类里
-
-
-
-
-
-心跳线程
-
-心跳请求字段
-
-group_id
-
-generation_id
-
-member_id
-
-
-
-心跳响应字段
-
-error_code
-
-
-
-
-
-
-
-SubscriptionState类包含了订阅的topic，也包含了分区分配的结果。
