@@ -166,6 +166,7 @@ GroupMetadata还负责状态机的维护，如下图所示：
 
 ```scala
 class GroupCoordinator(） {
+    
   def handleJoinGroup(groupId: String,
                       memberId: String,
                       clientId: String,
@@ -208,6 +209,107 @@ class GroupCoordinator(） {
 ```
 
 
+
+doJoinGroup方法会依据GroupMetadata的状态，做不同的处理。
+
+```scala
+private def doJoinGroup(group: GroupMetadata,
+                        memberId: String,
+                        clientId: String,
+                        clientHost: String,
+                        rebalanceTimeoutMs: Int,
+                        sessionTimeoutMs: Int,
+                        protocolType: String,
+                        protocols: List[(String, Array[Byte])],
+                        responseCallback: JoinCallback) {
+  group.inLock {
+    if (!group.is(Empty) && (!group.protocolType.contains(protocolType) || !group.supportsProtocols(protocols.map(_._1).toSet))) {
+      // 检查是否支持协议类型和分配算法
+      responseCallback(joinError(memberId, Errors.INCONSISTENT_GROUP_PROTOCOL))
+    } else if (group.is(Empty) && (protocols.isEmpty || protocolType.isEmpty)) {
+      // 检查group是否新建并且还未指定协议或分配算法
+      responseCallback(joinError(memberId, Errors.INCONSISTENT_GROUP_PROTOCOL))
+    } else if (memberId != JoinGroupRequest.UNKNOWN_MEMBER_ID && !group.has(memberId)) {
+      // 检查该成员是否在group里
+      responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
+    } else {
+      group.currentState match {
+        case Dead =>
+          // if the group is marked as dead, it means some other thread has just removed the group
+          // from the coordinator metadata; this is likely that the group has migrated to some other
+          // coordinator OR the group is in a transient unstable phase. Let the member retry
+          // joining without the specified member id,
+          responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
+        case PreparingRebalance =>
+          // 如果是新成员加入，则调用addMemberAndRebalance方法处理
+          if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+            addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
+              protocols, group, responseCallback)
+          } else {
+            // 如果是旧有成员加入，则调用updateMemberAndRebalance方法处理
+            val member = group.get(memberId)
+            updateMemberAndRebalance(group, member, protocols, responseCallback)
+          }
+
+        case CompletingRebalance =>
+          // 如果是新成员加入，则调用addMemberAndRebalance方法处理
+          if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+            addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
+              protocols, group, responseCallback)
+          } else {
+            val member = group.get(memberId)
+            if (member.matches(protocols)) {
+              // 成员之前已经发送了 JoinGroup请求，但是因为超时等原因，没有收到响应。
+              // 这里直接返回响应
+              responseCallback(JoinGroupResult(
+                members = if (group.isLeader(memberId)) {
+                  group.currentMemberMetadata
+                } else {
+                  Map.empty
+                },
+                memberId = memberId,
+                generationId = group.generationId,
+                subProtocol = group.protocolOrNull,
+                leaderId = group.leaderOrNull,
+                error = Errors.NONE))
+            } else {
+              // 成员的请求与上次请求不一致，说明是新的请求，需要重新平衡
+              updateMemberAndRebalance(group, member, protocols, responseCallback)
+            }
+          }
+
+        case Empty | Stable =>
+          if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+            // if the member id is unknown, register the member to the group
+            addMemberAndRebalance(rebalanceTimeoutMs, sessionTimeoutMs, clientId, clientHost, protocolType,
+              protocols, group, responseCallback)
+          } else {
+            val member = group.get(memberId)
+            if (group.isLeader(memberId) || !member.matches(protocols)) {
+              // force a rebalance if a member has changed metadata or if the leader sends JoinGroup.
+              // The latter allows the leader to trigger rebalances for changes affecting assignment
+              // which do not affect the member metadata (such as topic metadata changes for the consumer)
+              updateMemberAndRebalance(group, member, protocols, responseCallback)
+            } else {
+              // for followers with no actual change to their metadata, just return group information
+              // for the current generation which will allow them to issue SyncGroup
+              responseCallback(JoinGroupResult(
+                members = Map.empty,
+                memberId = memberId,
+                generationId = group.generationId,
+                subProtocol = group.protocolOrNull,
+                leaderId = group.leaderOrNull,
+                error = Errors.NONE))
+            }
+          }
+      }
+
+      if (group.is(PreparingRebalance))
+        joinPurgatory.checkAndComplete(GroupKey(group.groupId))
+    }
+  }
+}
+```
 
 
 
