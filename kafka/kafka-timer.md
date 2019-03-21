@@ -20,3 +20,58 @@ TimingWheel表示时间轮，它有wheelSize块，每块的时间长度为tickMs
 
 
 
+
+
+
+
+Timer提供延迟超时功能，
+
+
+
+DelayedOperation表示延迟操作
+
+DelayedOperationPurgatory提供了延迟操作的线程，它支持提前完成任务
+
+
+
+```scala
+private[server] def maybeTryComplete(): Boolean = {
+  var retry = false
+  var done = false
+  do {
+    if (lock.tryLock()) {
+      try {
+        
+        tryCompletePending.set(false)
+          // A1
+        done = tryComplete()
+      } finally {
+        lock.unlock()
+      }
+      
+      retry = tryCompletePending.get()
+    } else {
+        // B1
+      retry = !tryCompletePending.getAndSet(true)
+      
+    }
+  } while (!isCompleted && retry)
+  done
+}
+```
+
+
+
+maybeTryComplete方法实现得很精巧，它能保证尽量及时的检测任务是否可以完成。如果线程A首先获取锁，但是这时没有满足条件。之后线程B获取锁失败，但是此时说不定满足条件，所以这里需要再次检查条件，至于是哪个线程执行都可以。
+
+如果线程A成功获取锁，它会设置tryCompletePending为false，并且尝试检测任务是否可以提前完成。
+
+如果线程B获取锁失败，说明线程B是在线程A之后运行maybeTryComplete方法的。如果此时线程B设置tryCompletePending为true，在线程A设置tryCompletePending之前，那么线程B会继续尝试获取锁，线程A也会继续获取锁。
+
+如果此时线程B设置tryCompletePending为true，在线程A设置tryCompletePending之后，那么线程
+
+
+
+一个线程获取锁，执行tryComplete方法尝试完成，并且设置tryCompletePending为false。
+
+另一个线程获取锁失败，就会获取tryCompletePending的值，取反向，并且将tryCompletePending为true。

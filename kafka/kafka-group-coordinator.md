@@ -133,6 +133,7 @@ MemberMetadata描述一个consumer的信息，它主要包含以下字段：
 | rebalanceTimeoutMs | 整数     | 等待rebalance的最大时间      |
 | sessionTimeoutMs   | 整数     |                              |
 | supportedProtocols | 列表     | 该consumer支持的分配算法列表 |
+| assignment         | 字节数组 | 分配结果                     |
 
 
 
@@ -547,7 +548,7 @@ GroupCoordinator的handleSyncGroup方法负责处理分配结果的请求，这�
 private def doSyncGroup(group: GroupMetadata,
                         generationId: Int,
                         memberId: String,
-                        groupAssignment: Map[String, Array[Byte]],
+                        groupAssignment: Map[String, Array[Byte]],   // key为成员id，value为分配结果
                         responseCallback: SyncCallback) {
   group.inLock {
     if (!group.has(memberId)) {
@@ -569,10 +570,8 @@ private def doSyncGroup(group: GroupMetadata,
           // 设置该成员的awaitingSyncCallback函数，用来发送响应的
           group.get(memberId).awaitingSyncCallback = responseCallback
 
-          // 如果是leader角色，那么保存分配结果，而且为成员发送分配结果
+          // 这里只处理来自leader角色的请求。这里会保存分配结果，而且为成员发送分配结果
           if (group.isLeader(memberId)) {
-            info(s"Assignment received from leader for group ${group.groupId} for generation ${group.generationId}")
-
             // fill any missing members with an empty assignment
             val missing = group.allMembers -- groupAssignment.keySet
             val assignment = groupAssignment ++ missing.map(_ -> Array.empty[Byte]).toMap
@@ -587,6 +586,7 @@ private def doSyncGroup(group: GroupMetadata,
                     resetAndPropagateAssignmentError(group, error)
                     maybePrepareRebalance(group)
                   } else {
+                    // 保存分配结果，并且返回响应
                     setAndPropagateAssignment(group, assignment)
                     // 更新状态为Stable
                     group.transitionTo(Stable)
@@ -597,9 +597,11 @@ private def doSyncGroup(group: GroupMetadata,
           }
 
         case Stable =>
-          // if the group is stable, we just return the current assignment
+          // 有些follower角色成员的请求，可能在leader角色之后，这里状态已经转为Stable了。
+          // 所以只是返回该成员的分配结果
           val memberMetadata = group.get(memberId)
           responseCallback(memberMetadata.assignment, Errors.NONE)
+          // 设置心跳时间
           completeAndScheduleNextHeartbeatExpiration(group, group.get(memberId))
       }
     }
@@ -609,7 +611,35 @@ private def doSyncGroup(group: GroupMetadata,
 
 
 
+注意到上面的setAndPropagateAssignment方法，它会执行每个成员的awaitingSyncCallback回调，将分配结果发送给成员。
 
+```scala
+private def setAndPropagateAssignment(group: GroupMetadata, assignment: Map[String, Array[Byte]]) {
+  assert(group.is(CompletingRebalance))
+  // 为每个成员设置分配结果
+  group.allMemberMetadata.foreach(member => member.assignment = assignment(member.memberId))
+  // 为发送SyncGroup请求的成员，发送响应
+  propagateAssignment(group, Errors.NONE)
+}
+
+private def propagateAssignment(group: GroupMetadata, error: Errors) {
+    for (member <- group.allMemberMetadata) {
+        // 只有发送SyncGroup请求的成员，它的awaitingSyncCallback才不为空
+        if (member.awaitingSyncCallback != null) {
+            // 执行awaitingSyncCallback函数
+            member.awaitingSyncCallback(member.assignment, error)
+            // 执行完设置awaitingSyncCallback为空
+            member.awaitingSyncCallback = null
+
+            // reset the session timeout for members after propagating the member's assignment.
+            // This is because if any member's session expired while we were still awaiting either
+            // the leader sync group or the storage callback, its expiration will be ignored and no
+            // future heartbeat expectations will not be scheduled.
+            completeAndScheduleNextHeartbeatExpiration(group, member)
+        }
+    }
+}
+```
 
 
 
