@@ -645,3 +645,78 @@ private def propagateAssignment(group: GroupMetadata, error: Errors) {
 
 
 
+## 处理心跳请求 ##
+
+group的每个成员需要实时与GroupCoordinator保持心跳，这样GroupCoordinator才知道这个成员是正常运行的。
+
+GroupCoordinator接收到成员的心跳请求后，会为它生成一个心跳超时的延迟任务。如果在超时之前，接收到心跳请求，就会更新最后一次的心跳时间，并且生成新的心跳延迟任务。如果超时了，还没收到心跳请求，GroupCoordinator会将此成员从组里删除掉。
+
+处理心跳请求的程序，主要是由completeAndScheduleNextHeartbeatExpiration方法负责
+
+```scala
+private def completeAndScheduleNextHeartbeatExpiration(group: GroupMetadata, member: MemberMetadata) {
+  // 更新最后一次的心跳时间
+  member.latestHeartbeat = time.milliseconds()
+  val memberKey = MemberKey(member.groupId, member.memberId)
+  // 试图完成上次心跳的延迟任务
+  heartbeatPurgatory.checkAndComplete(memberKey)
+
+  // 更新下次的心跳截止时间
+  val newHeartbeatDeadline = member.latestHeartbeat + member.sessionTimeoutMs
+  // 生成新的心跳延迟任务，超时时间为下次的心跳截止时间
+  val delayedHeartbeat = new DelayedHeartbeat(this, group, member, newHeartbeatDeadline, member.sessionTimeoutMs)
+  // 添加延迟任务
+  heartbeatPurgatory.tryCompleteElseWatch(delayedHeartbeat, Seq(memberKey))
+}
+```
+
+
+
+接下来看看心跳延迟任务的定义
+
+```scala
+private[group] class DelayedHeartbeat(coordinator: GroupCoordinator,
+                                      group: GroupMetadata,
+                                      member: MemberMetadata,
+                                      heartbeatDeadline: Long,
+                                      sessionTimeout: Long)
+  extends DelayedOperation(sessionTimeout, Some(group.lock)) {
+
+  override def tryComplete(): Boolean = coordinator.tryCompleteHeartbeat(group, member, heartbeatDeadline, forceComplete _)
+  override def onExpiration() = coordinator.onExpireHeartbeat(group, member, heartbeatDeadline)
+  override def onComplete() = coordinator.onCompleteHeartbeat()
+}
+```
+
+DelayedHeartbeat都是简单的调用了GroupCoordinator的方法，
+
+```scala
+def tryCompleteHeartbeat(group: GroupMetadata, member: MemberMetadata, heartbeatDeadline: Long, forceComplete: () => Boolean) = {
+  group.inLock {
+    // 如果需要保留该成员或者该成员离开，那么提前完成该心跳任务
+    if (shouldKeepMemberAlive(member, heartbeatDeadline) || member.isLeaving)
+      forceComplete()
+    else false
+  }
+}
+
+// 如果该成员正在申请加入组，或者心跳时间还没有超时，那么返回true
+private def shouldKeepMemberAlive(member: MemberMetadata, heartbeatDeadline: Long) =
+  member.awaitingJoinCallback != null ||
+    member.awaitingSyncCallback != null ||
+    member.latestHeartbeat + member.sessionTimeoutMs > heartbeatDeadline
+```
+
+当心跳任务超时，会调用onExpiration回调函数，GroupCoordinator的onExpireHeartbeat方法会处理心跳超时。
+
+```scala
+def onExpireHeartbeat(group: GroupMetadata, member: MemberMetadata, heartbeatDeadline: Long) {
+  group.inLock {
+    if (!shouldKeepMemberAlive(member, heartbeatDeadline)) {
+      // 删除该成员
+      removeMemberAndUpdateGroup(group, member)
+    }
+  }
+}
+```
+
