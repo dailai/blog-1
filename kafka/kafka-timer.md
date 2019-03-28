@@ -1,4 +1,4 @@
-# Kafka 定时器 #
+# Kafka 延迟任务 #
 
 
 
@@ -63,6 +63,8 @@ TimingWheel表示时间轮，它有wheelSize格时间块，每块的时间长度
 当添加任务时，任务超过了当前时间轮的范围，TimingWheel会自动创建父时间轮，直到父时间轮的范围可以包含此任务。
 
 我们可以看到TimingWheel仍然使用了Java的DelayQueue类，实现定时作用。既然使用了DelayQueue，那为什么还会用到时间轮。根本原因就是性能，DelayQueue添加任务的复杂度是复杂度是O( n log(n) )，如果任务量太多，那么DelayQueue的性能会不好。Kafka引用了时间轮，使得添加任务的复杂度降低到了O（1），不过它将时间相差不大的任务，都添加到了一个队列里，这样就降低了时间精确性。
+
+TimingWheel提供add方法添加任务，还提供了advanceClock方法更新时间。
 
 ```scala
 // tickMs表示时间轮的时间单位，比如分钟时间轮的时间单位为1分钟
@@ -138,7 +140,7 @@ private[timer] class TimingWheel(tickMs: Long, wheelSize: Int, startMs: Long, ta
 
 ## 定时器 ##
 
-时间轮只是保存任务，而定时器负责管理时间轮和执行过期的任务。 定时器的接口由Timer表示
+时间轮只是保存了任务，而定时器负责管理时间轮和执行过期的任务。 定时器的接口由Timer表示
 
 ```scala
 trait Timer {
@@ -295,7 +297,7 @@ maybeTryComplete方法实现得很精巧，它能保证尽量及时的检测任�
 
 ## 延迟任务管理 ##
 
-DelayedOperationPurgatory负责延迟任务，支持任务分组。分组信息由Watchers类表示，它包含了延迟任务列表和任务类型。Watchers提供了tryCompleteWatched方法，会尝试完成列表中的任务。
+DelayedOperationPurgatory负责管理延迟任务，支持任务分组。分组信息由Watchers类表示，它包含了延迟任务列表和任务类型。Watchers提供了tryCompleteWatched方法，会尝试完成列表中的任务。
 
 ```scala
 // key为任务类型
@@ -349,7 +351,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](...) {
   
   // timeoutMs参数，表示此次操作的超时时间
   def advanceClock(timeoutMs: Long) {
-    // 调用SystemTimer的advanceClock方法，推动时间轮的运转，执行过期的任务
+    // 调用SystemTimer的advanceClock方法，执行过期的任务
     timeoutTimer.advanceClock(timeoutMs)
     // estimatedTotalOperations表示 DelayedOperationPurgatory的任务数，包含已经完成的任务
     // delayed表示时间轮还未完成的任务数
