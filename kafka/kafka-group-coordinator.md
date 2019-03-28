@@ -1,57 +1,28 @@
 # Kafka Group Coordinator 原理 #
 
+从这篇博客，我们知道客户端与服务端的交互，分为三种请求。
 
+1. 第一种，寻找GroupCoordinator地址请求。consumer客户端首先需要知道GroupCoordinator的地址。
 
-## DelayOperation 原理 ##
+2. 第二种，加入组请求。consumer客户端向GroupCoordinator发起加入指定组。
 
-DelayOperation有两个回调方法，子类需要实现：
+3. 第三种，获取分配结果请求。consumer客户端向GroupCoordinator，申请获取分配结果
 
-* onComplete，任务完成时的函数
+4. 第四种，心跳请求。consumer客户端获取到分配结果后，需要和GroupCoordinator保持线条。
 
-* onExpiration，任务过期的函数
-
-客户在时间过期前，会调用tryComplete方法，检查是否达到完成条件，如果达到，则调用forceComplete执行onComplete回调。
-
-如果等待任务过期了，则会调用forceComplete执行onComplete回调，并且还会调用onExpiration的回调。
-
-下面举个例子，这里使用MyDelayOperation实现一个延迟任务。比如我们在某个餐厅排队吃饭，最多排队半个小时。
-
-```scala
-class MyDelayOperation extends DelayedOperation(is_my_turn: Boolean) {
-    
-    val logger = Logger(LoggerFactory.getLogger(loggerName))
-    
-    def onComplete() = {
-        logger.info("we are eating meal !")
-    }
-    
-    def onExpiration() = {
-        logger.info("we hava waited for 30 minutes !")
-    }
-    
-    def tryComplete(): Boolean = {
-        if (is_my_turn) {
-            logger.info("we hava waited for less than 30 minutes !")
-            return forceComplete()
-        }
-        return false
-    }
-}
-```
-
-
-
-
-
-
+下面依次介绍GroupCoordinator是如何处理这几种请求的
 
 
 
 ## 处理寻找GroupCoordinator地址请求 ##
 
-在介绍这之前，需要先了解下Kafka是如何存储consumer group的消费位置。Kafka内部保存了一个名称为__consumer_offsets的 topic，里面存储着每个consumer group对于各个topic partition的消费offset。我们知道topic是分为多个partition，一个consumer group的消费位置只存在一个partition里。而这个partition的leader副本所在的主机，就是负责该consumer group的GroupCoordinator的地址。
+在介绍这之前，需要先了解下Kafka是如何存储consumer group的消费位置。Kafka内部保存了一个名称为_consumer_offsets 的 topic，这个 topic 是按照 consumer group 来分区的。一个 consumer group 的消费位置，只存在 
 
-Kafka的所有请求都是在KafkaApis类里定义怎么处理的
+
+
+里面存储着每个 consumer group 对于各个 topic partition 的消费 offset 。我们知道 topic 是分为多个 partition，一个 consumer group 的消费位置只存在 _consumer_offsets 的一个 partition 里。而这个partition的leader副本所在的主机，就是负责该consumer group的GroupCoordinator的地址。
+
+Kafka的所有请求都是在KafkaApis类里定义怎么处理的 
 
 ```scala
 class KafkaApis(...) {

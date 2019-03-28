@@ -233,7 +233,7 @@ DelayedOperation表示延迟任务，它在TimerTask的基础上，提供了支�
 
 * 当任务因为到期才执行，会调用onComplete方法和onExpire方法
 
-DelayedOperation提供了tryComplete方法，子类需要实现这个方法，判断是否满足提前完成条件，如果满足则执行forceComplete方法执行任务。
+DelayedOperation提供了tryComplete方法，供使用者调用，来尝试提前完成任务。子类需要实现这个方法，判断是否满足提前完成条件，如果满足则执行forceComplete方法执行任务。
 
 ```scala
 abstract class DelayedOperation {
@@ -260,7 +260,7 @@ abstract class DelayedOperation {
 DelayedOperation还提供了maybeTryComplete方法，在tryComplete方法的基础之上，提供了多线程的优化。maybeTryComplete方法实现得很精巧，它能保证尽量及时的检测任务是否可以完成。
 
 ```scala
-// 
+// 是否需要再次尝试
 private val tryCompletePending = new AtomicBoolean(false)
 
 private[server] def maybeTryComplete(): Boolean = {
@@ -280,7 +280,9 @@ private[server] def maybeTryComplete(): Boolean = {
       // 获取tryCompletePending的值，有可能此时外部线程修改了值
       retry = tryCompletePending.get()
     } else {
-      // 如果获取锁失败，设置tryCompletePending为true
+      // 如果获取锁失败，设置tryCompletePending为true，通知获取锁的线程再次尝试。
+      // 如果tryCompletePending之前为false，表示获取所的线程尝试操作已完成，不能保证。获取所失败的线程，需要自己尝试
+      // 如果tryCompletePending之前为true，表示现在已有一个获取锁失败的线程在运行，所以当前线程不用再尝试
       retry = !tryCompletePending.getAndSet(true)
       
     }
@@ -289,32 +291,14 @@ private[server] def maybeTryComplete(): Boolean = {
 }
 ```
 
-
-
 maybeTryComplete方法实现得很精巧，它能保证尽量及时的检测任务是否可以完成。如果线程A首先获取锁，但是这时没有满足条件。之后线程B获取锁失败，但是此时说不定满足条件，所以这里需要再次检查条件，至于是哪个线程执行都可以。
-
-如果线程A成功获取锁，它会设置tryCompletePending为false，并且尝试检测任务是否可以提前完成。
-
-如果线程B获取锁失败，说明线程B是在线程A之后运行maybeTryComplete方法的。如果此时线程B设置tryCompletePending为true，在线程A设置tryCompletePending之前，那么线程B会继续尝试获取锁，线程A也会继续获取锁。
-
-如果此时线程B设置tryCompletePending为true，在线程A设置tryCompletePending之后，那么线程
-
-
-
-一个线程获取锁，执行tryComplete方法尝试完成，并且设置tryCompletePending为false。
-
-另一个线程获取锁失败，就会获取tryCompletePending的值，取反向，并且将tryCompletePending为true。
-
-
 
 ## 延迟任务管理 ##
 
-DelayedOperationPurgatory支持将延迟操作，按照事件类型分组。
-
-分组信息由Watchers类表示，它包含了延迟任务列表和事件类型。Watchers提供了tryCompleteWatched方法，会尝试完成列表中的任务。
+DelayedOperationPurgatory负责延迟任务，支持任务分组。分组信息由Watchers类表示，它包含了延迟任务列表和任务类型。Watchers提供了tryCompleteWatched方法，会尝试完成列表中的任务。
 
 ```scala
-// key为事件类型
+// key为任务类型
 private class Watchers(val key: Any) {
     // 延迟任务列表
     private[this] val operations = new ConcurrentLinkedQueue[T]()
@@ -346,7 +330,7 @@ private class Watchers(val key: Any) {
 
 
 
-DelayedOperationPurgatory里包含了一个线程，用来更新时间轮的时间。
+DelayedOperationPurgatory里包含了一个线程，用来更新时间轮的时间，并且执行过期任务。
 
 ```scala
 final class DelayedOperationPurgatory[T <: DelayedOperation](...) {
@@ -365,7 +349,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](...) {
   
   // timeoutMs参数，表示此次操作的超时时间
   def advanceClock(timeoutMs: Long) {
-    // 调用SystemTimer的advanceClock方法，推动时间轮的运转
+    // 调用SystemTimer的advanceClock方法，推动时间轮的运转，执行过期的任务
     timeoutTimer.advanceClock(timeoutMs)
     // estimatedTotalOperations表示 DelayedOperationPurgatory的任务数，包含已经完成的任务
     // delayed表示时间轮还未完成的任务数
@@ -381,12 +365,10 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](...) {
 
 
 
-DelayedOperationPurgatory提供了两个重要方法，供外部使用。
+DelayedOperationPurgatory提供了两个重要方法，供外部使用。使用者首先调用tryCompleteElseWatch方法，添加延迟任务。添加完后，不定时的调用checkAndComplete方法，尝试提前完成任务。
 
 * tryCompleteElseWatch方法，提供添加延迟任务
 * checkAndComplete方法，负责尝试提前完成任务
-
-
 
 ```scala
 final class DelayedOperationPurgatory[T <: DelayedOperation] (...) {
@@ -431,8 +413,6 @@ final class DelayedOperationPurgatory[T <: DelayedOperation] (...) {
     false
   }
 
-
-
   def checkAndComplete(key: Any): Int = {
     // 获取该事件类型的任务列表
     val watchers = inReadLock(removeWatchersLock) { watchersForKey.get(key) }
@@ -441,9 +421,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation] (...) {
     else
       // 调用Watchers的tryCompleteWatched方法，尝试提前完成任务
       watchers.tryCompleteWatched()
-  }
-
-      
+  }  
 }
 ```
 
