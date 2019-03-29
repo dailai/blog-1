@@ -16,20 +16,18 @@
 
 ## 处理寻找GroupCoordinator地址请求 ##
 
-在介绍这之前，需要先了解下Kafka是如何存储consumer group的消费位置。Kafka内部保存了一个名称为_consumer_offsets 的 topic，这个 topic 是按照 consumer group 来分区的。一个 consumer group 的消费位置，只存在 
+在介绍这之前，需要先了解下Kafka是如何存储consumer group的消费位置。Kafka内部保存了一个名称为_consumer_offsets 的 topic，这个 topic 是按照 consumer group 来分区的。一个 consumer group 订阅的所有 topic 的消费位置，只存在 一个分区里。而这个分区的 leader 副本所在的主机，就是负责该consumer group的GroupCoordinator的地址。
 
-
-
-里面存储着每个 consumer group 对于各个 topic partition 的消费 offset 。我们知道 topic 是分为多个 partition，一个 consumer group 的消费位置只存在 _consumer_offsets 的一个 partition 里。而这个partition的leader副本所在的主机，就是负责该consumer group的GroupCoordinator的地址。
-
-Kafka的所有请求都是在KafkaApis类里定义怎么处理的 
+当GroupCoordinator收到此请求后，会主动创建_consumer_offsets 的 topic，分区数目由 offsets.topic.num.partitions 配置项指定。
 
 ```scala
 class KafkaApis(...) {
 
   def handleFindCoordinatorRequest(request: RequestChannel.Request) {
       val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+      
       .... // 认证和校检
+      
       val (partition, topicMetadata) = findCoordinatorRequest.coordinatorType match {
         case FindCoordinatorRequest.CoordinatorType.GROUP =>
           // 计算该consumer group被分配到哪个partition
@@ -43,6 +41,7 @@ class KafkaApis(...) {
           throw new InvalidRequestException("Unknown coordinator type in FindCoordinator request")
       }
 
+      // createResponse函数负责生成响应
       def createResponse(requestThrottleMs: Int): AbstractResponse = {
         val responseBody = if (topicMetadata.error != Errors.NONE) {
           new FindCoordinatorResponse(requestThrottleMs, Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
@@ -91,9 +90,9 @@ class GroupMetadataManager(...) {
 
 
 
-## Group 元数据 ##
+## GroupCoordinator 相关元数据 ##
 
-GroupCoordinator为每个consumer group保存元数据，由GroupMetadata类表示。GroupMetadata类保存了组里每个成员的元数据，由MemberMetadata类表示。
+在介绍GroupCoordinator的原理之前，首先看看它维护了哪些数据。GroupCoordinator为每个consumer group保存元数据，由GroupMetadata类表示。GroupMetadata类保存了组里每个成员的元数据，由MemberMetadata类表示。
 
 MemberMetadata描述一个consumer的信息，它主要包含以下字段：
 
@@ -102,7 +101,7 @@ MemberMetadata描述一个consumer的信息，它主要包含以下字段：
 | memberId           | 字符串   | 成员 id                      |
 | groupId            | 字符串   | 组名称                       |
 | rebalanceTimeoutMs | 整数     | 等待rebalance的最大时间      |
-| sessionTimeoutMs   | 整数     |                              |
+| sessionTimeoutMs   | 整数     | 心跳超时的最大时间           |
 | supportedProtocols | 列表     | 该consumer支持的分配算法列表 |
 | assignment         | 字节数组 | 分配结果                     |
 
@@ -118,11 +117,7 @@ GroupMetadata描述了一个consumer group的信息，它主要包含以下字�
 
 
 
-GroupMetadata还负责状态机的维护，如下图所示：
-
-
-
-
+GroupMetadata本身也是一个状态机，如下图所示：
 
 
 
@@ -130,9 +125,11 @@ GroupMetadata还负责状态机的维护，如下图所示：
 
 ## 处理加入请求 ##
 
-处理加入请求的过程比较复杂。首先我们先梳理一下简单的流程，沿着GroupMetadata的状态，按照Empty --> PrepareRebalance --> CompletingRebalance --> Stable的方向。
+处理加入请求的过程比较复杂。首先我们先梳理一下简单的流程，沿着GroupMetadata的状态图，按照Empty --> PrepareRebalance --> CompletingRebalance --> Stable的方向。
 
-对于加入请求的处理，KafkaApis会调用GroupCoordinator的handleJoinGroup方法处理。它会首先检测请求参数和检测，然后调用doJoinGroup方法处理请求。
+ ### 处理请求 ###
+
+对于加入请求的处理，最终是由 GroupCoordinator 的 handleJoinGroup 方法负责。它会首先检测请求参数和 group 状态，然后调用doJoinGroup方法处理请求。
 
 ```scala
 class GroupCoordinator(） {
@@ -151,7 +148,7 @@ class GroupCoordinator(） {
       responseCallback(joinError(memberId, error))
       return
     }
-    // consumer的sessionTimeoutMs时间设置，必须在group组的设定区间内
+    // consumer的sessionTimeoutMs时间设置，必须在group组的设定范围内
     if (sessionTimeoutMs < groupConfig.groupMinSessionTimeoutMs ||
       sessionTimeoutMs > groupConfig.groupMaxSessionTimeoutMs) {
       responseCallback(joinError(memberId, Errors.INVALID_SESSION_TIMEOUT))
@@ -168,7 +165,6 @@ class GroupCoordinator(） {
             // 调用doJoinGroup函数，处理请求
             doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
           }
-
         case Some(group) =>
           // 如果该group之前存在，那么直接调用doJoinGroup函数
           doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
@@ -189,8 +185,8 @@ private def doJoinGroup(group: GroupMetadata,
                         clientHost: String,
                         rebalanceTimeoutMs: Int,
                         sessionTimeoutMs: Int,
-                        protocolType: String,
-                        protocols: List[(String, Array[Byte])],
+                        protocolType: String,   // 这里协议类型是 consumer
+                        protocols: List[(String, Array[Byte])],  // 支持的分配算法列表
                         responseCallback: JoinCallback) {
   group.inLock {
     if (!group.is(Empty) && (!group.protocolType.contains(protocolType) || !group.supportsProtocols(protocols.map(_._1).toSet))) {
@@ -210,6 +206,7 @@ private def doJoinGroup(group: GroupMetadata,
           // coordinator OR the group is in a transient unstable phase. Let the member retry
           // joining without the specified member id,
           responseCallback(joinError(memberId, Errors.UNKNOWN_MEMBER_ID))
+          
         case PreparingRebalance =>
           // 如果是新成员加入，则调用addMemberAndRebalance方法处理
           if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
@@ -256,9 +253,8 @@ private def doJoinGroup(group: GroupMetadata,
           } else {
             val member = group.get(memberId)
             if (group.isLeader(memberId) || !member.matches(protocols)) {
-              // force a rebalance if a member has changed metadata or if the leader sends JoinGroup.
-              // The latter allows the leader to trigger rebalances for changes affecting assignment
-              // which do not affect the member metadata (such as topic metadata changes for the consumer)
+              // 如果是leader角色重新加入，那么需要重新平衡
+              // 如果该consumer的分配算法改变了，那么也需要重新平衡
               updateMemberAndRebalance(group, member, protocols, responseCallback)
             } else {
               // 如果是旧有成员，并且是follower角色，而且与上次请求一样，
@@ -275,6 +271,7 @@ private def doJoinGroup(group: GroupMetadata,
       }
 
       if (group.is(PreparingRebalance))
+        // 尝试提前完成，加入请求
         joinPurgatory.checkAndComplete(GroupKey(group.groupId))
     }
   }
@@ -284,6 +281,8 @@ private def doJoinGroup(group: GroupMetadata,
 
 
 上面的处理主要涉及到了两个方法，addMemberAndRebalance方法处理新成员加入，updateMemberAndRebalance方法处理旧有成员加入。两个方法都很简单，只是新建或修改成员的元数据，然后调用maybePrepareRebalance方法，做一些rebalance之前的准备操作。
+
+注意到当成员添加到GroupMetadata里的时候，会选择最早加入的成员为leader。
 
 ```scala
 private def addMemberAndRebalance(rebalanceTimeoutMs: Int,
@@ -306,7 +305,7 @@ private def addMemberAndRebalance(rebalanceTimeoutMs: Int,
   // 设置newMemberAdded为true，在后面延迟rebalance有用到
   if (group.is(PreparingRebalance) && group.generationId == 0)
     group.newMemberAdded = true
-  // 添加成员到组
+  // 添加成员到组，如果此成员是第一个加入该组，那么就选择它为leader角色
   group.add(member)
   // 调用maybePrepareRebalance方法，执行rebalance前的准备操作
   maybePrepareRebalance(group)
@@ -341,17 +340,18 @@ private def maybePrepareRebalance(group: GroupMetadata) {
 }
 ```
 
- prepareRebalance方法会有点复杂，它涉及到了Kafka的延迟操作。这里GroupCoordinator并不会立刻返回响应，而是等待一段时间，尽可能的等待更多的consumer申请加入，这样就可以大大避免了，连续的consumer加入请求引起的多次重平衡。这里简单介绍下：
+ prepareRebalance方法会有点复杂，它涉及到了Kafka的延迟操作。这里GroupCoordinator并不会立刻返回响应，而是延迟一段时间，尽可能的等待更多的consumer申请加入，这样就可以大大避免了，连续的consumer加入请求引起的多次重平衡。这里简单介绍下：
 
 ```scala
 private def prepareRebalance(group: GroupMetadata) {
-  // if any members are awaiting sync, cancel their request and have them rejoin
+  // 如果该group的状态为CompletingRebalance，表示该组的所有成员，都已经完成加入请求，正在等待分配结果
+  // 这时如果有新的成员加入，需要等待结果分配的响应完成之后，才能重新发起加入请求
   if (group.is(CompletingRebalance))
     resetAndPropagateAssignmentError(group, Errors.REBALANCE_IN_PROGRESS)
   
   val delayedRebalance = if (group.is(Empty))
     // group的状态为Empty，表示这是第一个consumer加入
-    // InitialDelayedJoin表示第一个consumer加入，然后它会等待一会儿，接收别的consumer的加入请求
+    // InitialDelayedJoin表示第一个consumer加入，然后它会等待一会儿，这段时间内允许接收别的consumer的加入请求。InitialDelayedJoin只能等待时间过期，不能提前完成
     new InitialDelayedJoin(this,
       joinPurgatory,
       group,
@@ -359,7 +359,7 @@ private def prepareRebalance(group: GroupMetadata) {
       groupConfig.groupInitialRebalanceDelayMs,
       max(group.rebalanceTimeoutMs - groupConfig.groupInitialRebalanceDelayMs, 0))
   else
-    // 如果group的状态不是Empty，那么使用DelayedJoin延迟操作
+    // 如果group的状态不是Empty，那么使用DelayedJoin延迟操作。DelayedJoin允许提前完成
     new DelayedJoin(this, group, group.rebalanceTimeoutMs)
 
   // 设置group的状态为PreparingRebalance
@@ -370,6 +370,10 @@ private def prepareRebalance(group: GroupMetadata) {
   joinPurgatory.tryCompleteElseWatch(delayedRebalance, Seq(groupKey))
 }
 ```
+
+
+
+### 延迟响应 ###
 
 上面涉及到两个延迟操作，InitialDelayedJoin和DelayedJoin。
 
@@ -390,11 +394,13 @@ private[group] class DelayedJoin(coordinator: GroupCoordinator,
 
 InitialDelayedJoin继承DelayedJoin，它们之间主要的区别是，InitialDelayedJoin只有任务过期才会执行，它不会提前完成。InitialDelayedJoin还有可能多次延迟，只要总的延迟时间不超过指定值即可。
 
-delayMs 表示此次操作的延迟时间
+关于时间的参数，主要有下列
 
-configuredRebalanceDelay 表示每次操作的最大延迟时间
+* delayMs 表示此次操作的延迟时间
 
-remainingMs 表示剩余可以延迟的剩余空间
+* configuredRebalanceDelay 表示每次操作的最大延迟时间
+
+* remainingMs 表示剩余可以延迟的剩余空间
 
 ```scala
 private[group] class InitialDelayedJoin(coordinator: GroupCoordinator,
@@ -434,7 +440,7 @@ private[group] class InitialDelayedJoin(coordinator: GroupCoordinator,
 
 
 
-
+### 完成响应 ###
 
 接下来看看GroupCoordinator的tryCompleteJoin方法。tryCompleteJoin会判断旧有的成员是否全部重新加入，如果满足，那么就提前执行Rebalance操作。
 
@@ -451,8 +457,6 @@ def tryCompleteJoin(group: GroupMetadata, forceComplete: () => Boolean) = {
 ```
 
 group判断成员是否加入，是判断成员的awaitingJoinCallback是否为空。因为awaitingJoinCallback在成员发起加入请求后，group才会设置awaitingJoinCallback属性。如果awaitingJoinCallback为空，那么表示旧有的成员还未加入。
-
-
 
 ```scala
 def onCompleteJoin(group: GroupMetadata) {
@@ -494,7 +498,7 @@ def onCompleteJoin(group: GroupMetadata) {
             memberId = member.memberId,              // 成员id
             generationId = group.generationId,       // group数据版本号
             subProtocol = group.protocolOrNull,      // group协议
-            leaderId = group.leaderOrNull,           // 
+            leaderId = group.leaderOrNull,           // leader角色的成员id
             error = Errors.NONE)
 
           member.awaitingJoinCallback(joinResult)    // 调用awaitingJoinCallback
@@ -509,9 +513,9 @@ def onCompleteJoin(group: GroupMetadata) {
 
 
 
-
-
 ## 处理获取分配结果请求 ##
+
+当consumer收到加入请求的响应后，如果被指定为leader角色，会执行分区分配算法，然后将分配结果发送 GroupCoordinator。如果是 follower 角色，只是简单的向GroupCoordinator请求分配结果。
 
 GroupCoordinator的handleSyncGroup方法负责处理分配结果的请求，这里的逻辑比较简单，只是简单的接收leader角色传过来的分配结果，然后将分配结果发送给对应的组成员。
 
@@ -611,8 +615,6 @@ private def propagateAssignment(group: GroupMetadata, error: Errors) {
     }
 }
 ```
-
-
 
 
 
