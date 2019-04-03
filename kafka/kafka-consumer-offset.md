@@ -169,7 +169,7 @@ private static class TopicPartitionState {
 }
 ```
 
-这些分区的消息都会保存在SubscriptionState里
+这些分区的消息都会保存在SubscriptionState
 
  
 
@@ -177,70 +177,121 @@ private static class TopicPartitionState {
 
 KafkaConsumer每次发送请求时，都需要指定消费位置。如果该consumer所属的组，有消费记录，那么就会上次消费记录开始。如果没有，则需要根据auto.offset.reset配置项，来判断从分区开始位置，还是分区末尾位置读取。
 
-KafkaConsumer提供 poll 方法拉取数据。poll 方法会去检查分区的消费位置
+KafkaConsumer提供 poll 方法拉取数据。poll 方法会去检查分区的消费位置，负责检查消费位置由updateAssignmentMetadataIfNeeded方法实现。
 
 ```java
 public class KafkaConsumer<K, V> implements Consumer<K, V> {
     
-    private ConsumerRecords<K, V> poll(final long timeoutMs, final boolean includeMetadataInTimeout) {
-        acquireAndEnsureOpen();
-        try {
-            // 在拉取数据之前，必须先要配置好订阅信息
-            if (this.subscriptions.hasNoSubscriptionOrUserAssignment()) {
-                throw new IllegalStateException("Consumer is not subscribed to any topics or assigned any partitions");
-            }
-
-            long elapsedTime = 0L;
-            do {
-                // 通知NetworkClient，防止它阻塞
-                client.maybeTriggerWakeup();
-                final long metadataEnd;
-                if (includeMetadataInTimeout) {
-                    final long metadataStart = time.milliseconds();
-                    // 调用updateAssignmentMetadataIfNeeded方法，检查消费位置
-                    if (!updateAssignmentMetadataIfNeeded(remainingTimeAtLeastZero(timeoutMs, elapsedTime))) {
-                        return ConsumerRecords.empty();
-                    }
-                    metadataEnd = time.milliseconds();
-                    elapsedTime += metadataEnd - metadataStart;
-                } else {
-                    while (!updateAssignmentMetadataIfNeeded(Long.MAX_VALUE)) {
-                        log.warn("Still waiting for metadata");
-                    }
-                    metadataEnd = time.milliseconds();
-                }
-                // 拉取数据
-                final Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollForFetches(remainingTimeAtLeastZero(timeoutMs, elapsedTime));
-
-                if (!records.isEmpty()) {
-                    if (fetcher.sendFetches() > 0 || client.hasPendingRequests()) {
-                        client.pollNoWakeup();
-                    }
-
-                    return this.interceptors.onConsume(new ConsumerRecords<>(records));
-                }
-                final long fetchEnd = time.milliseconds();
-                elapsedTime += fetchEnd - metadataEnd;
-
-            } while (elapsedTime < timeoutMs);
-
-            return ConsumerRecords.empty();
-        } finally {
-            release();
+    private final ConsumerCoordinator coordinator;    
+    private final SubscriptionState subscriptions;
+        
+    boolean updateAssignmentMetadataIfNeeded(final long timeoutMs) {
+        final long startMs = time.milliseconds();
+        // 调用coordinator的poll方法，处理组相关的事件
+        // 返回ture表示已经成功加入组并且获得分配结果了
+        if (!coordinator.poll(timeoutMs)) {
+            return false;
         }
+        // 调用updateFetchPositions，来获取消费位置
+        return updateFetchPositions(remainingTimeAtLeastZero(timeoutMs, time.milliseconds() - startMs));
     }
+    
+    private boolean updateFetchPositions(final long timeoutMs) {
+        // 查看SubscriptionState是否已经获取了消费位置，如果有则直接返回
+        cachedSubscriptionHashAllFetchPositions = subscriptions.hasAllFetchPositions();
+        if (cachedSubscriptionHashAllFetchPositions) return true;
+
+        // 这里通过coordinator获取，该consumer组的消费位置
+        if (!coordinator.refreshCommittedOffsetsIfNeeded(timeoutMs)) return false;
+
+        // 如果consumer组没有消费位置，那么需要获取它的位置初始化策略
+        subscriptions.resetMissingPositions();
+
+        // 获取分区的开始位置或者末尾位置
+        fetcher.resetOffsetsIfNeeded();
+
+        return true;
+    }
+    
 }    
 ```
 
 
 
+首先查看coordinator的refreshCommittedOffsetsIfNeeded方法，查看它是如何请求的
 
+```java
+public final class ConsumerCoordinator extends AbstractCoordinator {
+    
+    private final SubscriptionState subscriptions;
 
-会调用updateAssignmentMetadataIfNeeded方法来加入组和获取分区的信息。
+    public boolean refreshCommittedOffsetsIfNeeded(final long timeoutMs) {
+        // 查看有哪些分区，它的消费位置还未指定
+        final Set<TopicPartition> missingFetchPositions = subscriptions.missingFetchPositions();
+        // 发送请求获取消费位置
+        final Map<TopicPartition, OffsetAndMetadata> offsets = fetchCommittedOffsets(missingFetchPositions, timeoutMs);
+        if (offsets == null) return false;
+        // 遍历响应
+        for (final Map.Entry<TopicPartition, OffsetAndMetadata> entry : offsets.entrySet()) {
+            final TopicPartition tp = entry.getKey();
+            final long offset = entry.getValue().offset();
+            // 将消费位置设置保存到SubscriptionState
+            this.subscriptions.seek(tp, offset);
+        }
+        return true;
+    }
 
-在加入组后，这里面会调用updateFetchPositions方法，获取分区信息。
+    
+    public Map<TopicPartition, OffsetAndMetadata> fetchCommittedOffsets(final Set<TopicPartition> partitions, final long timeoutMs) {
+        if (partitions.isEmpty()) return Collections.emptyMap();
 
-分区信息分为两部分，一个是该consumer所属组的对于这个分区的消费位置。如果不存在，那么就会根据配置，决定是以该分区的开始位置还是该分区的结束位置，然后获取开始位置或者结束位置。
+        final Generation generation = generation();
+        if (pendingCommittedOffsetRequest != null && !pendingCommittedOffsetRequest.sameRequest(partitions, generation)) {
+            // if we were waiting for a different request, then just clear it.
+            pendingCommittedOffsetRequest = null;
+        }
+
+        final long startMs = time.milliseconds();
+        long elapsedTime = 0L;
+
+        while (true) {
+            // 保证与GroupCoordinator的连接
+            if (!ensureCoordinatorReady(remainingTimeAtLeastZero(timeoutMs, elapsedTime))) return null;
+            elapsedTime = time.milliseconds() - startMs;
+
+            
+            final RequestFuture<Map<TopicPartition, OffsetAndMetadata>> future;
+            if (pendingCommittedOffsetRequest != null) {
+                future = pendingCommittedOffsetRequest.response;
+            } else {
+                // 发送请求
+                future = sendOffsetFetchRequest(partitions);
+                pendingCommittedOffsetRequest = new PendingCommittedOffsetRequest(partitions, generation, future);
+
+            }
+            // 等待请求完成
+            client.poll(future, remainingTimeAtLeastZero(timeoutMs, elapsedTime));
+
+            if (future.isDone()) {
+                pendingCommittedOffsetRequest = null;
+
+                if (future.succeeded()) {
+                    return future.value();
+                } else if (!future.isRetriable()) {
+                    throw future.exception();
+                } else {
+                    elapsedTime = time.milliseconds() - startMs;
+                    final long sleepTime = Math.min(retryBackoffMs, remainingTimeAtLeastZero(startMs, elapsedTime));
+                    time.sleep(sleepTime);
+                    elapsedTime += sleepTime;
+                }
+            } else {
+                return null;
+            }
+        }
+    }
+}
+```
 
 
 

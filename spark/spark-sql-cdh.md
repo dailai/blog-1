@@ -48,9 +48,7 @@ exec $LIB_DIR/spark2/bin/spark-submit "$@" # 执行命令
 
 
 
-spark2-submit命令会设置好环境变量，并且进入到对应的执行目录里。最后执行了/opt/cloudera/parcels/SPARK2-2.2.0.cloudera3-1.cdh5.13.3.p0.556753/lib/spark2/bin/spark-submit文件。
-
-继续看执行文件的定义
+spark2-submit命令会设置好环境变量，并且进入到对应的执行目录里。最后执行了/opt/cloudera/parcels/SPARK2-2.2.0.cloudera3-1.cdh5.13.3.p0.556753/lib/spark2/bin/spark-submit文件，下面看看这个文件的内容
 
 ```shell
 #!/usr/bin/env bash
