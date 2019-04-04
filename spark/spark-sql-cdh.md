@@ -145,7 +145,7 @@ cp jars/hive-* /opt/cloudera/parcels/SPARK2/lib/spark2/jars/ # 注意到这里�
 
 
 
-整个添加的过程就完成了，接下来就可以直接使用spark-sql命令行了
+整个添加的过程就完成了，接下来就可以直接使用spark-sql命令，就可以进入客户端shell
 
 ```shell
 sudo -u hive spark2-sql
@@ -153,4 +153,16 @@ spark-sql> use test;
 spark-sql> show tables;
 .....
 ```
+
+下面简单介绍下spark-sql常用的命令选项
+
+```shell
+# 执行 sql 命令
+sudo -u hive spark2-sql -e "select count(*) from test.my_table;"
+
+# 执行 sql 文件
+sudo -u hive spark2-sql -f my_sql.sql
+```
+
+
 
