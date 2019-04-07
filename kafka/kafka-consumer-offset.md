@@ -177,7 +177,7 @@ private static class TopicPartitionState {
 
 KafkaConsumer每次发送请求时，都需要指定消费位置。如果该consumer所属的组，有消费记录，那么就会上次消费记录开始。如果没有，则需要根据auto.offset.reset配置项，来判断从分区开始位置，还是分区末尾位置读取。
 
-KafkaConsumer提供 poll 方法拉取数据。poll 方法会去检查分区的消费位置，负责检查消费位置由updateAssignmentMetadataIfNeeded方法实现。
+KafkaConsumer提供 poll 方法拉取数据。poll 方法每次都会检查分区的消费位置，负责检查消费位置由updateAssignmentMetadataIfNeeded方法实现。
 
 ```java
 public class KafkaConsumer<K, V> implements Consumer<K, V> {
@@ -523,11 +523,203 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
 
 
 
+## 更改分区信息 ##
+
+除了上面的Offset初始化，可以修改分区的消费offset。当KafkaConsumer调用Fetcher的fetchRecords方法，也会更新分区的offset值。
+
+
+
+
+
+
+
+
+
 ## 提交 Offset ##
 
 
 
+KafkaConsumer提供了commitAsync一系列的方法，提交offset。和同步提交的commitSync方法
+
+```java
+public class KafkaConsumer<K, V> implements Consumer<K, V> {
+
+    private final SubscriptionState subscriptions;
+    private final ConsumerCoordinator coordinator;
+    
+    @Override
+    public void commitAsync() {
+        commitAsync(null);
+    }
+
+    @Override
+    public void commitAsync(OffsetCommitCallback callback) {
+        acquireAndEnsureOpen();
+        try {
+            // 从SubscriptionState获取分区的消费位置，然后提交
+            commitAsync(subscriptions.allConsumed(), callback);
+        } finally {
+            release();
+        }
+    }
+
+    @Override
+    public void commitAsync(final Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
+        acquireAndEnsureOpen();
+        try {
+            // 调用ConsumerCoordinator的commitOffsetsAsync，向服务端发送提交请求
+            coordinator.commitOffsetsAsync(new HashMap<>(offsets), callback);
+        } finally {
+            release();
+        }
+    }
+    
+    @Override
+    public void commitSync(Duration timeout) {
+        acquireAndEnsureOpen();
+        try {
+            // 调用ConsumerCoordinator的commitOffsetsAsync，向服务端发送提交请求
+            if (!coordinator.commitOffsetsSync(subscriptions.allConsumed(), timeout.toMillis())) {
+                throw new TimeoutException("Timeout of " + timeout.toMillis() + "ms expired before successfully " +
+                        "committing the current consumed offsets");
+            }
+        } finally {
+            release();
+        }
+    }
+    
+}
+```
+
+上述的方法，都是从SubscriptionState里获取分区消费位置，然后由ConsumerCoordinator发送请求。
+
+```java
+public ConsumerCoordinator(...) {
+    
+    private final ConsumerInterceptors<?, ?> interceptors; // 拦截器
+    
+    
+    public boolean commitOffsetsSync(Map<TopicPartition, OffsetAndMetadata> offsets, long timeoutMs) {
+        invokeCompletedOffsetCommitCallbacks();
+        if (offsets.isEmpty())
+            return true;
+
+        long now = time.milliseconds();
+        long startMs = now;
+        long remainingMs = timeoutMs;
+        do {
+            if (coordinatorUnknown()) {
+                if (!ensureCoordinatorReady(remainingMs))
+                    return false;
+
+                remainingMs = timeoutMs - (time.milliseconds() - startMs);
+            }
+            // 构造OffsetCommitRequest请求，发送给服务端GroupCoordinator
+            RequestFuture<Void> future = sendOffsetCommitRequest(offsets);
+            // 等待请求完成
+            client.poll(future, remainingMs);
+
+            invokeCompletedOffsetCommitCallbacks();
+
+            if (future.succeeded()) {
+                if (interceptors != null)
+                    // 调用拦截器的onCommit回调
+                    interceptors.onCommit(offsets);
+                // 返回tur表示请求已经完成
+                return true;
+            }
+            // 如果响应出错，那么抛出一样
+            if (future.failed() && !future.isRetriable())
+                throw future.exception();
+            // 暂停一段时间，防止频繁操作
+            time.sleep(retryBackoffMs);
+
+            now = time.milliseconds();
+            // 计算剩余时间
+            remainingMs = timeoutMs - (now - startMs);
+        } while (remainingMs > 0);
+        // 返回false，表示请求还未完成
+        return false;
+    }
+    
+}
+```
 
 
 
 
+
+如果consumer设置了自动提交，那么consumer
+
+KafkaConsumer在每次poll的时候，都会调用ConsumerCoordinator的poll方法。ConsumerCoordinator会定期检查是否到了该提交offset的时间，然后发送请求。
+
+ConsumerCoordinator的poll方法，会调用maybeAutoCommitOffsetsAsync方法，负责提交请求
+
+```java
+public final class ConsumerCoordinator extends AbstractCoordinator {
+    private final SubscriptionState subscriptions;  // 分区信息
+    private final boolean autoCommitEnabled;  // 是否允许自动提交
+    private final int autoCommitIntervalMs;  // 自动提交的时间间隔 
+    private long nextAutoCommitDeadline;   // 下次自动提交时间
+    
+    private final ConcurrentLinkedQueue<OffsetCommitCompletion> completedOffsetCommits;    
+    
+    
+    public void maybeAutoCommitOffsetsAsync(long now) {
+        // 如果允许自动提交，并且时间到了自动提交的时间
+        if (autoCommitEnabled && now >= nextAutoCommitDeadline) {
+            // 更新下次提交时间
+            this.nextAutoCommitDeadline = now + autoCommitIntervalMs;
+            // 提交offset
+            doAutoCommitOffsetsAsync();
+        }
+    }
+    
+    private void doAutoCommitOffsetsAsync() {
+        // 从SubscriptionState获取消费位置信息
+        Map<TopicPartition, OffsetAndMetadata> allConsumedOffsets = subscriptions.allConsumed();
+        // 提交请求
+        commitOffsetsAsync(allConsumedOffsets, new OffsetCommitCallback() {
+            ......
+        });
+    }
+
+    public void commitOffsetsAsync(final Map<TopicPartition, OffsetAndMetadata> offsets, final OffsetCommitCallback callback) {
+        invokeCompletedOffsetCommitCallbacks();
+
+        if (!coordinatorUnknown()) {
+            // 保证与服务端的GroupCoordinator连接是好的，然后发送请求
+            doCommitOffsetsAsync(offsets, callback);
+        } else { 
+            .....
+        }
+
+        client.pollNoWakeup();
+    }
+
+    private void doCommitOffsetsAsync(final Map<TopicPartition, OffsetAndMetadata> offsets, final OffsetCommitCallback callback) {
+        // 发送请求
+        RequestFuture<Void> future = sendOffsetCommitRequest(offsets);
+        final OffsetCommitCallback cb = callback == null ? defaultOffsetCommitCallback : callback;
+        future.addListener(new RequestFutureListener<Void>() {
+            @Override
+            public void onSuccess(Void value) {
+                if (interceptors != null)
+                    interceptors.onCommit(offsets);
+
+                completedOffsetCommits.add(new OffsetCommitCompletion(cb, offsets, null));
+            }
+
+            @Override
+            public void onFailure(RuntimeException e) {
+                Exception commitException = e;
+
+                if (e instanceof RetriableException)
+                    commitException = new RetriableCommitFailedException(e);
+
+                completedOffsetCommits.add(new OffsetCommitCompletion(cb, offsets, commitException));
+            }
+        });
+    }
+}
+```
