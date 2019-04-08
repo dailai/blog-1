@@ -6,8 +6,6 @@
 
 Consumer的元数据分为两部分，订阅信息和分区信息。
 
-
-
 ### 订阅信息 ###
 
 Consumer消费有两种模式，订阅模式和分配模式。
@@ -523,23 +521,48 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
 
 
 
-## 更改分区信息 ##
+## 更改分区Offset ##
 
-除了上面的Offset初始化，可以修改分区的消费offset。当KafkaConsumer调用Fetcher的fetchRecords方法，也会更新分区的offset值。
+除了上面的Offset初始化，可以修改分区的消费offset。当KafkaConsumer从Fetcher里获取消息时，会更新分区的offset值。
+
+Fetcher的fetchRecords方法，负责从指定分区中读取消息，并且调用SubscriptionState类的position方法，来更新分区offset。
+
+```java
+public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
+    private final SubscriptionState subscriptions;    // 分区信息
+    
+    private List<ConsumerRecord<K, V>> fetchRecords(PartitionRecords partitionRecords, int maxRecords) {
+        if (!subscriptions.isAssigned(partitionRecords.partition)) {
+           ......
+        } else if (!subscriptions.isFetchable(partitionRecords.partition)) {
+           ......
+        } else {
+            // 从SubscriptionState类，获取当前的分区offset
+            long position = subscriptions.position(partitionRecords.partition);
+            if (partitionRecords.nextFetchOffset == position) {
+                // 从Fetcher缓存中，获取消息
+                List<ConsumerRecord<K, V>> partRecords = partitionRecords.fetchRecords(maxRecords);
+                long nextOffset = partitionRecords.nextFetchOffset;
+                // 更新SubscriptionState类的分区offset
+                subscriptions.position(partitionRecords.partition, nextOffset);
+
+                ......
+
+                return partRecords;
+            } else {
+              .....
+            }
+        }
+        ......
+    }
+}
+```
 
 
 
+## 提交分区 Offset ##
 
-
-
-
-
-
-## 提交 Offset ##
-
-
-
-KafkaConsumer提供了commitAsync一系列的方法，提交offset。和同步提交的commitSync方法
+KafkaConsumer提供了一系列的方法提交offset，支持同步和异步。
 
 ```java
 public class KafkaConsumer<K, V> implements Consumer<K, V> {
@@ -590,6 +613,8 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     
 }
 ```
+
+
 
 上述的方法，都是从SubscriptionState里获取分区消费位置，然后由ConsumerCoordinator发送请求。
 
@@ -647,9 +672,9 @@ public ConsumerCoordinator(...) {
 
 
 
+## 自动提交 ##
 
-
-如果consumer设置了自动提交，那么consumer
+如果consumer设置了自动提交，那么consumer会每次拉取消息的时候，将当前的offset提交。
 
 KafkaConsumer在每次poll的时候，都会调用ConsumerCoordinator的poll方法。ConsumerCoordinator会定期检查是否到了该提交offset的时间，然后发送请求。
 
@@ -705,21 +730,25 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             @Override
             public void onSuccess(Void value) {
                 if (interceptors != null)
+                    // 调用拦截器的onCommit回调函数
                     interceptors.onCommit(offsets);
-
+                // 将回调添加到队列里，等待后续执行
                 completedOffsetCommits.add(new OffsetCommitCompletion(cb, offsets, null));
             }
 
             @Override
             public void onFailure(RuntimeException e) {
                 Exception commitException = e;
-
                 if (e instanceof RetriableException)
                     commitException = new RetriableCommitFailedException(e);
-
+                // 将回调添加到队列里，等待后续执行
                 completedOffsetCommits.add(new OffsetCommitCompletion(cb, offsets, commitException));
             }
         });
     }
 }
 ```
+
+
+
+这里额外说下使用自动提交的注意点。KafkaConsumer拉取消息时，会先自动向服务端提交offset请求。之后才真正的从Fetcher里拉取数据，而Fetcher在返回数据时，会更新分区的offset。所以如果开启了自动提交，在每次拉取消息后，一定要保证已经处理完这些消息，才去拉取新的消息。
