@@ -4,15 +4,11 @@
 
 ## Consumer 元数据 ##
 
-Consumer的元数据分为两部分，订阅信息和分区信息。
+Consumer本地也保存了关于管理Offset的元数据，它分为两部分，订阅信息和分区信息。consumer拉取消息之前，首先要确认分配到了哪些分区，这些数据就属于订阅相关的信息。之后consumer拉取消息后，会更新客户端本地的offset，这些数据就属于分区相关的信息。
 
 ### 订阅信息 ###
 
-Consumer消费有两种模式，订阅模式和分配模式。
-
-订阅模式是consumer只需要指定哪些topic需要订阅，由GroupCoordinator分配分区。
-
-分配模式是consumer自己指定哪些分区。
+Consumer有两种消费模式，订阅模式和分配模式。订阅模式是consumer只需要指定哪些topic需要订阅，由GroupCoordinator分配分区。分配模式是consumer自己指定哪些分区。这些信息都是保存在SubscriptionState类里
 
 ```java
 public class SubscriptionState {
@@ -37,7 +33,7 @@ public class SubscriptionState {
 
 
 
-当consumer使用订阅模式，收到服务端返回的分区分配结果后，会保存起来。我们回想一下ConsumerCoordinator的原理，当它收到分配结果后，会调用onJoinComplete回调函数。
+当consumer使用订阅模式，收到服务端返回的分区分配结果后，会保存起来。我们回想一下ConsumerCoordinator的原理，当它收到分配结果后，会调用onJoinComplete回调函数，这里会处理分配结果。
 
 ```java
 public final class ConsumerCoordinator extends AbstractCoordinator {
@@ -153,7 +149,7 @@ public class SubscriptionState {
 
 ### 分区信息 ###
 
-consumer为分配的分区，保存了对应的信息，以TopicPartitionState类表示。
+consumer为分配的分区，保存了对应的信息，以TopicPartitionState类表示。这些分区的消息都会保存在SubscriptionState类里。
 
 ```java
 private static class TopicPartitionState {
@@ -167,15 +163,13 @@ private static class TopicPartitionState {
 }
 ```
 
-这些分区的消息都会保存在SubscriptionState
-
  
 
 ## 获取 Offset 初始值 ##
 
-KafkaConsumer每次发送请求时，都需要指定消费位置。如果该consumer所属的组，有消费记录，那么就会上次消费记录开始。如果没有，则需要根据auto.offset.reset配置项，来判断从分区开始位置，还是分区末尾位置读取。
+KafkaConsumer每次发送请求时，都需要先指定开始位置。如果该consumer所属的组，有消费记录，那么就会上次消费位置开始。如果没有，则需要根据auto.offset.reset配置项，来判断从分区的开始位置，还是分区的最新位置读取。
 
-KafkaConsumer提供 poll 方法拉取数据。poll 方法每次都会检查分区的消费位置，负责检查消费位置由updateAssignmentMetadataIfNeeded方法实现。
+KafkaConsumer 的 poll 方法负责拉取数据。poll 方法每次都会先检查分区的初始消费位置，负责检查消费位置由updateAssignmentMetadataIfNeeded方法实现。
 
 ```java
 public class KafkaConsumer<K, V> implements Consumer<K, V> {
@@ -218,7 +212,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
 ### coordinator 获取消费位置 ###
 
-首先查看coordinator的refreshCommittedOffsetsIfNeeded方法，查看它是如何请求的。
+KafkaConsumer 会优先查看该组，是否有消费记录。coordinator的refreshCommittedOffsetsIfNeeded方法，负责向GroupCoordinator请求上次消费位置，并且结果保存到SubscriptionState里。
 
 ```java
 public final class ConsumerCoordinator extends AbstractCoordinator {
@@ -227,7 +221,6 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     
     // 正在发送的获取消费位置的请求
     private PendingCommittedOffsetRequest pendingCommittedOffsetRequest = null;
-
 
     public boolean refreshCommittedOffsetsIfNeeded(final long timeoutMs) {
         // 查看有哪些分区，它的消费位置还没初始化
@@ -300,6 +293,8 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 }
 ```
 
+
+
 消费位置的请求格式由OffsetFetchRequest表示，它主要包含以下字段
 
 ```java
@@ -344,7 +339,7 @@ EARLIEST 策略：选择此时目前分区的开始位置。因为有可能会�
 
 NONE 策略：表示没有指定
 
-KafkaConsumer会在初始化时，实例化策略。
+KafkaConsumer会在初始化时，指定策略。
 
 ```java
 public class KafkaConsumer<K, V> implements Consumer<K, V> {
