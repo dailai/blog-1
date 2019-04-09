@@ -43,3 +43,99 @@ loadTransactionsForTxnTopicPartition 方法负责从 __transaction_state里，�
 
 
 
+请求
+
+```
+FindCoordinatorHandler
+
+
+InitProducerIdHandler
+
+
+AddPartitionsToTxnHandler
+AddOffsetsToTxnHandler
+
+
+TxnOffsetCommitHandler
+
+
+EndTxnHandler
+```
+
+
+
+
+
+Kafka 客户端的 TransactionManager的状态
+
+```java
+private enum State {
+    UNINITIALIZED,
+    INITIALIZING,
+    READY,
+    IN_TRANSACTION,
+    COMMITTING_TRANSACTION,
+    ABORTING_TRANSACTION,
+    ABORTABLE_ERROR,
+    FATAL_ERROR;
+}
+```
+
+
+
+TransactionManager 实例化的时候，状态为UNINITIALIZED。
+
+当发送请求获取produce_id 时，状态变为INITIALIZING。
+
+当成功获取到producer_id的响应时，状态变为READY。
+
+当producer调用了beginTransaction方法时，状态变为IN_TRANSACTION。
+
+之后producer进行一系列的操作，涉及到发送AddPartitionsToTxnRequest请求，和AddOffsetsToTxnRequest请求。
+
+producer最后会发送EndTxnRequest请求，提交本次事务。状态变为COMMITTING_TRANSACTION。
+
+当收到提交事务的响应，状态变为READY。
+
+有可能producer最后需要事务回滚，当它发送EndTxnRequest时，状态变为ABORTING_TRANSACTION。接收到响应后，状态变为READY。
+
+
+
+当请求过程出错时，状态变为ABORTABLE_ERROR或FATAL_ERROR。
+
+
+
+常用例子：
+
+```java
+KafkaProducer producer = createKafkaProducer(
+  “bootstrap.servers”, “localhost:9092”,
+  “transactional.id”, “my-transactional-id”);
+
+producer.initTransactions();
+
+KafkaConsumer consumer = createKafkaConsumer(
+  “bootstrap.servers”, “localhost:9092”,
+  “group.id”, “my-group-id”,
+  "isolation.level", "read_committed");
+
+consumer.subscribe(singleton(“inputTopic”));
+
+while (true) {
+  ConsumerRecords records = consumer.poll(Long.MAX_VALUE);
+  producer.beginTransaction();
+  for (ConsumerRecord record : records)
+    producer.send(producerRecord(“outputTopic”, record));
+  producer.sendOffsetsToTransaction(currentOffsets(consumer), group);  
+  producer.commitTransaction();
+}
+```
+
+
+
+
+
+
+
+
+
