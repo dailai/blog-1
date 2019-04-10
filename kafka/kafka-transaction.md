@@ -137,5 +137,11 @@ while (true) {
 
 
 
+发送EndTxnRequest请求前，必须保证所有请求都已经发送完毕。
+
+
+
+
+
 
 
