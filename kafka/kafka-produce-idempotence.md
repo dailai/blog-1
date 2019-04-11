@@ -271,12 +271,66 @@ private[log] class ProducerAppendInfo(val producerId: Long,
     nextSeq == lastSeq + 1L || (nextSeq == 0 && lastSeq == Int.MaxValue)
   }    
     
-    
 }
-  
-                                      
-                                      
 ```
+
+​                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+
+
+
+
+
+ProducerStateEntry 类包含了消息批次的元数据队列。当有新的消息批次添加进来，会将旧的消息批次删除，来保持队列的长度始终为5。
+
+ProducerStateEntry还包含了produce_id 和 producer_epoch。
+
+消息批次的元数据包含，开始和结束的offset，开始和结束的序列号。
+
+
+
+ProducerAppendInfo 类主要负责处理校检。它会生成一个新的ProducerStateEntry，然后将新的消息批次，都添加到这里。
+
+每次添加消息批次，ProducerStateEntry都会检查epoch 和 sequence。如果消息批次的epoch小，则会报错。如果消息批次的epoch大，ProducerStateEntry会将旧的消息批次清空，并且更新自己的epoch。
+
+
+
+如果消息批次的epoch比较大，它的序列号必须从0开始。否则就会出错。
+
+
+
+
+
+序列号的检查，通过检查上次消息批次的结束序列号，新添加的消息批次的开始序列号，两者的是否是连续的。
+
+
+
+
+
+添加成功后，ProducerAppendInfo会将新的ProducerStateEntry，替换掉旧的。
+
+
+
+
+
+
+
+遇到重复的batch，怎么处理
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ## 错误处理 ##
 
