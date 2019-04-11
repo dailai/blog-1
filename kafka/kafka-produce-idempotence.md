@@ -322,6 +322,8 @@ ProducerAppendInfo 类主要负责处理校检。它会生成一个新的Produce
 
 
 
+消息批次的produce_epoch只有在启动了事务，才会产生变化。当事务完成时，会更新producer_epoch。
+
 
 
 
