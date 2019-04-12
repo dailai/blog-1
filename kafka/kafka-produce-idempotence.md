@@ -1,20 +1,105 @@
 # Kafka Producer 幂等性原理 #
 
+幂等性是指发送同样的请求，对系统资源的影响是一致的。结合 Kafka Producer，是指在多次发送同样的消息，Kafka做到消息的不丢失和不重复。实现幂等性服务，关键的一点是如何处理异常，因为一般请求发生异常，才会重复请求。比如Kafka Producer与服务端的网络异常：
+
+* Producer向服务端发送消息，但是此时连接就断开了，发送的消息经过网络传输时，被丢失了。服务端没有接收到消息。
+
+* 服务端收到Producer发送的消息，处理完毕后，向Producer发送响应，但是此时连接断开了。发送的响应经过网络传输时，被丢失了。Producer没有收到响应。
+
+因为两种情况对于Producer而言，都是没有收到响应，Producer无法确定是哪种情况，所以它必须要重新发送消息，来确保服务端不会漏掉一条消息。但这样服务端有可能会收到重复的消息，所以服务端收到消息后，还要做一次去重操作。只有Producer和服务端的相互配合，才能保证消息不丢失也不重复，达到 Exactly One 的情景。
+
+Kafka的幂等性只支持单个producer向单个分区发送。它会为每个Producer生成一个唯一id号，这样Kafka服务端就可以根据 produce_id来确定是哪个生产者发送的消息。然后Kafka还为每条消息生成了一个序列号，Kafka服务端会保留最近的消息，根据序列号就可以判断该消息，是否近期已经发送过，来达到去重的效果。
+
+## Producer 发送消息 ##
 
 
-## 发送消息 ##
 
-发送消息，都会附加一个序列号
+### 幂等性配置 ###
+
+KafkaProducer 如果要使用幂等性，需要将 enable.idempotence 配置项设置为true。并且它对单个分区的发送，一次性最多发送5条。通过KafkaProducer的 configureInflightRequests 方法，可以看到对max.in.flight.requests.per.connection的限制
+
+```java
+public class KafkaProducer<K, V> implements Producer<K, V> {
+
+    private static int configureInflightRequests(ProducerConfig config, boolean idempotenceEnabled) {
+        if (idempotenceEnabled && 5 < config.getInt(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION)) {
+            throw new ConfigException("Must set " + ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION + " to at most 5" +
+                    " to use the idempotent producer.");
+        }
+        return config.getInt(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
+    }
+    
+}
+    
+```
 
 
 
-KafkaProducer对于单个分区的发送，一次性最多发送5条。
+### 请求获取 producer_id ###
 
-这个在KafkaProducer初始化的时候，就会检测该配置项。
+Sender在发送消息之前，都会去检查是否已经获取到了 produce_id。如果没有，则向服务端发送请求。获取到的响应数据，保存在TransactionManager类里。
 
-如果要使用幂等性，需要将enable.idempotence配置项设置为true。
+```java
+public class Sender implements Runnable {
+
+    private void maybeWaitForProducerId() {
+        // 判断是否获取了produce_id
+        while (!transactionManager.hasProducerId() && !transactionManager.hasError()) {
+            try {
+                // 选择负载最轻的一台节点
+                Node node = awaitLeastLoadedNodeReady(requestTimeoutMs);
+                if (node != null) {
+                    // 发送获取请求，接收响应
+                    ClientResponse response = sendAndAwaitInitProducerIdRequest(node);
+                    // 处理响应
+                    InitProducerIdResponse initProducerIdResponse = (InitProducerIdResponse) response.responseBody();
+                    // 检查错误
+                    Errors error = initProducerIdResponse.error();
+                    if (error == Errors.NONE) {
+                        ProducerIdAndEpoch producerIdAndEpoch = new ProducerIdAndEpoch(
+                                initProducerIdResponse.producerId(), initProducerIdResponse.epoch());
+                        // 保存produce_id 和 produce_epoch结果（produce_epoch是在开启事务才会用到，这里仅仅是开启了幂等性，没有用到事务）
+                        transactionManager.setProducerIdAndEpoch(producerIdAndEpoch);
+                        return;
+                    } else if (error.exception() instanceof RetriableException) {
+                        // 如果该错误是可以重试，那么就等待下次重试
+                        log.debug("Retriable error from InitProducerId response", error.message());
+                    } else {
+                        // 如果发生严重错误，那么保存错误信息，并且退出
+                        transactionManager.transitionToFatalError(error.exception());
+                        break;
+                    }
+                } else {
+                   .....
+                }
+            } catch (UnsupportedVersionException e) {
+                // 发生版本不支持的错误，则退出
+                transactionManager.transitionToFatalError(e);
+                break;
+            } catch (IOException e) {
+                // 发生网络通信问题，则等待下次重试
+                log.debug("Broker {} disconnected while awaiting InitProducerId response", e);
+            }
+            // 等待一段时间，然后重试
+            time.sleep(retryBackoffMs);
+            metadata.requestUpdate();
+        }
+    }
+    
+    private ClientResponse sendAndAwaitInitProducerIdRequest(Node node) throws IOException {
+        String nodeId = node.idString();
+        // 构建InitProducerIdRequest请求
+        InitProducerIdRequest.Builder builder = new InitProducerIdRequest.Builder(null);
+        ClientRequest request = client.newClientRequest(nodeId, builder, time.milliseconds(), true, requestTimeoutMs, null);
+        // 发送请求并且等待响应
+        return NetworkClientUtils.sendAndReceive(client, request, time);
+    }    
+}
+```
 
 
+
+### 发送消息 ###
 
 当开启了幂等性，KafkaProducer发送消息时，会额外设置producer_id 和 baseSequence 字段。producer_id是从Kafka服务端请求获取的，baseSequence是该消息批次的序列号，由TransactionManager负责生成。
 
@@ -210,6 +295,26 @@ class ProducerStateManager(val topicPartition: TopicPartition,
     
 ```
 
+ProducerAppendInfo 类主要负责处理校检。它会生成一个新的ProducerStateEntry，然后将新的消息批次，都添加到这里。
+
+每次添加消息批次，ProducerStateEntry都会检查epoch 和 sequence。如果消息批次的epoch小，则会报错。如果消息批次的epoch大，ProducerStateEntry会将旧的消息批次清空，并且更新自己的epoch。
+
+
+
+如果消息批次的epoch比较大，它的序列号必须从0开始。否则就会出错。
+
+
+
+
+
+序列号的检查，通过检查上次消息批次的结束序列号，新添加的消息批次的开始序列号，两者的是否是连续的。
+
+
+
+
+
+添加成功后，ProducerAppendInfo会将新的ProducerStateEntry，替换掉旧的。
+
 
 
 ```scala
@@ -287,26 +392,6 @@ ProducerStateEntry还包含了produce_id 和 producer_epoch。
 消息批次的元数据包含，开始和结束的offset，开始和结束的序列号。
 
 
-
-ProducerAppendInfo 类主要负责处理校检。它会生成一个新的ProducerStateEntry，然后将新的消息批次，都添加到这里。
-
-每次添加消息批次，ProducerStateEntry都会检查epoch 和 sequence。如果消息批次的epoch小，则会报错。如果消息批次的epoch大，ProducerStateEntry会将旧的消息批次清空，并且更新自己的epoch。
-
-
-
-如果消息批次的epoch比较大，它的序列号必须从0开始。否则就会出错。
-
-
-
-
-
-序列号的检查，通过检查上次消息批次的结束序列号，新添加的消息批次的开始序列号，两者的是否是连续的。
-
-
-
-
-
-添加成功后，ProducerAppendInfo会将新的ProducerStateEntry，替换掉旧的。
 
 
 
