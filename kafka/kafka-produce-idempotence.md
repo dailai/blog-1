@@ -101,9 +101,9 @@ public class Sender implements Runnable {
 
 ### 发送消息 ###
 
-当开启了幂等性，KafkaProducer发送消息时，会额外设置producer_id 和 baseSequence 字段。producer_id是从Kafka服务端请求获取的，baseSequence是该消息批次的序列号，由TransactionManager负责生成。
+当开启了幂等性，KafkaProducer发送消息时，会额外设置producer_id 和 序列号字段。producer_id是从Kafka服务端请求获取的，序列号是Producer自增生成的。这里需要说明下，Kafka发送消息都是以batch的格式发送，batch包含了多条消息。所以Producer发送消息batch的时候，只会设置该batch的第一个消息的序列号，后面的消息的序列号是依次递增的。
 
-当Sender从RecordAccumulator中拉取消息时，会为消息设置上面了两个字段的值。
+当Sender从RecordAccumulator中拉取消息时，会设置produce_id 和 baseSequence两个字段。
 
 ```java
 public final class RecordAccumulator {
@@ -122,6 +122,7 @@ public final class RecordAccumulator {
                 PartitionInfo part = parts.get(drainIndex);
                 TopicPartition tp = new TopicPartition(part.topic(), part.partition());
                 // 当max.in.flight.requests.per.connection配置项为 1 时，Sender发送消息的时候，会暂时关闭此分区的请求发送。当完成响应时，才会开放请求发送。
+                // 这里的isMute方法，是用来判断次分区的请求是否被关闭
                 if (!isMuted(tp, now)) {
                     Deque<ProducerBatch> deque = getDeque(tp);
                     if (deque != null) {
@@ -191,7 +192,7 @@ public final class RecordAccumulator {
 
 
 
-TransactionManager为每个发送的消息batch，都会生成序列号。每个分区都对应单独的序列号
+从上面可以看到，TransactionManager负责为每个发送的消息batch，都会生成序列号。每个分区都有独立的序列号。
 
 ```java
 public class TransactionManager {
@@ -222,34 +223,33 @@ public class TransactionManager {
 
 
 
-
-
 ## 服务端处理请求 ##
 
-
+Kafka服务端接收到请求后，会调用ReplicaManager的方法处理。ReplicaManager最后通过Log类，检测请求的有效性，然后存储起来。Log类的 analyzeAndValidateProducerState 方法，负责检测消息的序列号是否有效。
 
 ```scala
 class Log(...) {
     
   private def analyzeAndValidateProducerState(records: MemoryRecords, isFromClient: Boolean):
   (mutable.Map[Long, ProducerAppendInfo], List[CompletedTxn], Option[BatchMetadata]) = {
+    // 添加信息的表，Key值为produce_id，Value为添加信息，它包含了新添加的消息batch
     val updatedProducers = mutable.Map.empty[Long, ProducerAppendInfo]
     val completedTxns = ListBuffer.empty[CompletedTxn]
-      // 遍历消息batch
+    // 遍历消息 batch
     for (batch <- records.batches.asScala if batch.hasProducerId) {
-      // 获取该producer_id对应的producer，发送的最近请求
+      // 根据producer_id找到，对应producer发送的最近请求
       val maybeLastEntry = producerStateManager.lastEntry(batch.producerId)
 
       // 这里的请求有可能来自客户端，也有可能是从leader分区向follower分区发来的
       // if this is a client produce request, there will be up to 5 batches which could have been duplicated.
       // If we find a duplicate, we return the metadata of the appended batch to the client.
       if (isFromClient) {
-        // 
+        // 检测是否有近期重复的请求，如果有则立马返回
         maybeLastEntry.flatMap(_.findDuplicateBatch(batch)).foreach { duplicate =>
           return (updatedProducers, completedTxns.toList, Some(duplicate))
         }
       }
-
+      // 将消息batch的添加信息，添加到updatedProducers表里
       val maybeCompletedTxn = updateProducers(batch, updatedProducers, isFromClient = isFromClient)
       maybeCompletedTxn.foreach(completedTxns += _)
     }
@@ -260,8 +260,9 @@ class Log(...) {
                               producers: mutable.Map[Long, ProducerAppendInfo],
                               isFromClient: Boolean): Option[CompletedTxn] = {
     val producerId = batch.producerId
+    // 获取该 produce 对应的AppendInfo，如果没有则新建一个
     val appendInfo = producers.getOrElseUpdate(producerId, producerStateManager.prepareUpdate(producerId, isFromClient))
-    // 校检序列号
+    // 将消息batch添加appendInfo里，添加过程中包含了校检序列号
     appendInfo.append(batch)
   }    
 }
@@ -269,16 +270,21 @@ class Log(...) {
 
 
 
-
+ProducerStateManager保存所有producer最近添加的消息batch。一个ProducerStateManager只负责管理一个分区的producer信息。
 
 ```scala
-class ProducerStateManager(val topicPartition: TopicPartition,
+class ProducerStateManager(val topicPartition: TopicPartition,   
                            @volatile var logDir: File,
                            val maxProducerIdExpirationMs: Int = 60 * 60 * 1000) extends Logging {
+  // Key为produce_id，Value为对应的信息，由ProducerStateEntry类表示
+  private val producers = mutable.Map.empty[Long, ProducerStateEntry]
+        
+  def lastEntry(producerId: Long): Option[ProducerStateEntry] = producers.get(producerId)
 
   def prepareUpdate(producerId: Long, isFromClient: Boolean): ProducerAppendInfo = {
     val validationToPerform =
       if (!isFromClient)
+        // 如果是Kafka节点之间的请求，那么这里不做任何校检
         ValidationType.None
       else if (topicPartition.topic == Topic.GROUP_METADATA_TOPIC_NAME)
         // 如果是向__consumer_offsets内部topic写数据，则只检验epoch
@@ -286,43 +292,82 @@ class ProducerStateManager(val topicPartition: TopicPartition,
       else
         // 检验 epoch 和 序列号
         ValidationType.Full
-
+    // 如果有该producer的信息，则直接返回。否则调用 empty 方法新建一个
     val currentEntry = lastEntry(producerId).getOrElse(ProducerStateEntry.empty(producerId))
-    // 生成ProducerAppendInfo实例，后面会执行校检
+    // 生成ProducerAppendInfo实例
     new ProducerAppendInfo(producerId, currentEntry, validationToPerform)
   }
 }    
     
 ```
 
-ProducerAppendInfo 类主要负责处理校检。它会生成一个新的ProducerStateEntry，然后将新的消息批次，都添加到这里。
 
-每次添加消息批次，ProducerStateEntry都会检查epoch 和 sequence。如果消息批次的epoch小，则会报错。如果消息批次的epoch大，ProducerStateEntry会将旧的消息批次清空，并且更新自己的epoch。
+
+ProducerStateEntry类表示了producer的所有信息，它主要包含了最近添加的消息batch。ProducerStateEntry最多只能包含5个消息batch，注意这里只是包含了batch的元数据。
+
+```scala
+private[log] object ProducerStateEntry {
+  // 最大保存batch的数目
+  private[log] val NumBatchesToRetain = 5
+  def empty(producerId: Long) = new ProducerStateEntry(producerId, mutable.Queue[BatchMetadata](), RecordBatch.NO_PRODUCER_EPOCH, -1, None)
+}  
+
+private[log] class ProducerStateEntry(val producerId: Long,
+                                      val batchMetadata: mutable.Queue[BatchMetadata],  // 消息batch的元数据列表
+                                      var producerEpoch: Short,
+                                      var coordinatorEpoch: Int,
+                                      var currentTxnFirstOffset: Option[Long]) {
+    
+  // 添加消息batch
+  def addBatch(producerEpoch: Short, lastSeq: Int, lastOffset: Long, offsetDelta: Int, timestamp: Long): Unit = {
+    // 如果该消息batch的epoch大，则更新producerEpoch
+    maybeUpdateEpoch(producerEpoch)
+    // 添加消息batch的元数据
+    addBatchMetadata(BatchMetadata(lastSeq, lastOffset, offsetDelta, timestamp))
+  }
+    
+  private def addBatchMetadata(batch: BatchMetadata): Unit = {
+    // 如果保存的batch数目，达到了5个，则将旧的剔除掉
+    if (batchMetadata.size == ProducerStateEntry.NumBatchesToRetain)
+      batchMetadata.dequeue()
+    // 添加到队列里
+    batchMetadata.enqueue(batch)
+  }     
+    
+}    
+    
+```
+
+
+
+注意到上面实例化ProducerAppendInfo对象后，最后调用了它的 append 方法，来校检消息batch的有效性。ProducerAppendInfo最后还会生成新的ProducerStateEntry对象，存储最新一次添加batch的信息，然后替换旧的信息。
+
+ProducerStateEntry都会检查epoch 和 sequence，校检步骤如下
+
+如果消息批次的epoch小，则会报错。如果消息批次的epoch大，ProducerStateEntry会将旧的消息批次清空，并且更新自己的epoch。
 
 
 
 如果消息批次的epoch比较大，它的序列号必须从0开始。否则就会出错。
 
-
-
-
-
 序列号的检查，通过检查上次消息批次的结束序列号，新添加的消息批次的开始序列号，两者的是否是连续的。
 
 
 
-
-
-添加成功后，ProducerAppendInfo会将新的ProducerStateEntry，替换掉旧的。
-
-
+ProducerAppendInfo会初始化一个新的ProducerStateEntry，当 添加成功后，会将旧的替换掉。
 
 ```scala
 private[log] class ProducerAppendInfo(val producerId: Long,
-                                      val currentEntry: ProducerStateEntry,
-                                      val validationType: ValidationType) {
-                                      
+                                      val currentEntry: ProducerStateEntry,  // 上次添加的消息batch的元数据
+                                      val validationType: ValidationType) {  // 校检策略
+  // 初始化新的ProducerStateEntry，保存到updatedEntry属性                                     
+  private val updatedEntry = ProducerStateEntry.empty(producerId)
+  updatedEntry.producerEpoch = currentEntry.producerEpoch
+  updatedEntry.coordinatorEpoch = currentEntry.coordinatorEpoch
+  updatedEntry.currentTxnFirstOffset = currentEntry.currentTxnFirstOffset    
+    
   private def maybeValidateAppend(producerEpoch: Short, firstSeq: Int) = {
+    // 对于不同的校检策略，做不同的检查
     validationType match {
       case ValidationType.None =>
 
@@ -336,6 +381,7 @@ private[log] class ProducerAppendInfo(val producerId: Long,
   }
   
   private def checkProducerEpoch(producerEpoch: Short): Unit = {
+    // 如果该消息batch的produce_epoch比之前的还要下，那么就抛出ProducerFencedException错误
     if (producerEpoch < updatedEntry.producerEpoch) {
       throw new ProducerFencedException(s"Producer's epoch is no longer valid. There is probably another producer " +
         s"with a newer epoch. $producerEpoch (request epoch), ${updatedEntry.producerEpoch} (server epoch)")
@@ -343,8 +389,12 @@ private[log] class ProducerAppendInfo(val producerId: Long,
   }    
     
   private def checkSequence(producerEpoch: Short, appendFirstSeq: Int): Unit = {
+    // 因为之前已经检查过了produce_epoch，如果出现了不相等的情况，只能是该消息batch的produce_epoch大
     if (producerEpoch != updatedEntry.producerEpoch) {
+      // 如果是新的produce_epoch，那么它发送过来的第一个消息batch的序列号只能从0开始
       if (appendFirstSeq != 0) {
+        // 如果是旧的produce，那么就抛出OutOfOrderSequenceException异常，表示此消息发送的序列号有问题
+        // 否则抛出UnknownProducerIdException异常
         if (updatedEntry.producerEpoch != RecordBatch.NO_PRODUCER_EPOCH) {
           throw new OutOfOrderSequenceException(s"Invalid sequence number for new epoch: $producerEpoch " +
             s"(request epoch), $appendFirstSeq (seq. number)")
@@ -354,13 +404,14 @@ private[log] class ProducerAppendInfo(val producerId: Long,
         }
       }
     } else {
+      // 获取最后一次添加的消息batch的结束序列号，如果这次添加的
       val currentLastSeq = if (!updatedEntry.isEmpty)
         updatedEntry.lastSeq
       else if (producerEpoch == currentEntry.producerEpoch)
         currentEntry.lastSeq
       else
         RecordBatch.NO_SEQUENCE
-
+ 
       if (currentLastSeq == RecordBatch.NO_SEQUENCE && appendFirstSeq != 0) {
         // the epoch was bumped by a control record, so we expect the sequence number to be reset
         throw new OutOfOrderSequenceException(s"Out of order sequence number for producerId $producerId: found $appendFirstSeq " +
