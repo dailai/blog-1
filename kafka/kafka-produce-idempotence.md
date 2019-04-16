@@ -10,9 +10,9 @@
 
 Kafka的幂等性只支持单个producer向单个分区发送。它会为每个Producer生成一个唯一id号，这样Kafka服务端就可以根据 produce_id来确定是哪个生产者发送的消息。然后Kafka还为每条消息生成了一个序列号，Kafka服务端会保留最近的消息，根据序列号就可以判断该消息，是否近期已经发送过，来达到去重的效果。
 
+
+
 ## Producer 发送消息 ##
-
-
 
 ### 幂等性配置 ###
 
@@ -303,7 +303,9 @@ class ProducerStateManager(val topicPartition: TopicPartition,
 
 
 
-ProducerStateEntry类表示了producer的所有信息，它主要包含了最近添加的消息batch。ProducerStateEntry最多只能包含5个消息batch，注意这里只是包含了batch的元数据。
+ProducerStateEntry类表示了producer的所有信息，它主要包含了最近添加的消息batch。ProducerStateEntry最多只能包含5个消息batch，当有新的消息batch添加进来，会将旧的消息batch删除，来保持队列的长度始终为5。
+
+注意这里只是包含了batch的元数据。消息batch的元数据包含，第一条消息和最后一条消息的序列号。
 
 ```scala
 private[log] object ProducerStateEntry {
@@ -342,19 +344,14 @@ private[log] class ProducerStateEntry(val producerId: Long,
 
 注意到上面实例化ProducerAppendInfo对象后，最后调用了它的 append 方法，来校检消息batch的有效性。ProducerAppendInfo最后还会生成新的ProducerStateEntry对象，存储最新一次添加batch的信息，然后替换旧的信息。
 
-ProducerStateEntry都会检查epoch 和 sequence，校检步骤如下
+ProducerStateEntry每次添加新的消息batch时，都会检查它的epoch 和 sequence，校检步骤如下：
 
-如果消息批次的epoch小，则会报错。如果消息批次的epoch大，ProducerStateEntry会将旧的消息批次清空，并且更新自己的epoch。
+1. 检查消息batch的produce epoch。如果该消息barch的epoch比上条消息小，则会报错。
+2. 检查消息batch的sequence，分为两种情况
+   1. 如果消息batch的epoch比上条消息大，它的序列号必须从0开始。否则就会出错。
+   2. 如果消息batch的epoch相等，它的起始序列号和上条消息batch的结束序列号，必须是连续递增的，否则就会出错。
 
-
-
-如果消息批次的epoch比较大，它的序列号必须从0开始。否则就会出错。
-
-序列号的检查，通过检查上次消息批次的结束序列号，新添加的消息批次的开始序列号，两者的是否是连续的。
-
-
-
-ProducerAppendInfo会初始化一个新的ProducerStateEntry，当 添加成功后，会将旧的替换掉。
+ProducerAppendInfo会初始化一个新的ProducerStateEntry，新添加的消息batch，都会存到这个新的里面。
 
 ```scala
 private[log] class ProducerAppendInfo(val producerId: Long,
@@ -365,21 +362,7 @@ private[log] class ProducerAppendInfo(val producerId: Long,
   updatedEntry.producerEpoch = currentEntry.producerEpoch
   updatedEntry.coordinatorEpoch = currentEntry.coordinatorEpoch
   updatedEntry.currentTxnFirstOffset = currentEntry.currentTxnFirstOffset    
-    
-  private def maybeValidateAppend(producerEpoch: Short, firstSeq: Int) = {
-    // 对于不同的校检策略，做不同的检查
-    validationType match {
-      case ValidationType.None =>
 
-      case ValidationType.EpochOnly =>
-        checkProducerEpoch(producerEpoch)
-
-      case ValidationType.Full =>
-        checkProducerEpoch(producerEpoch)
-        checkSequence(producerEpoch, firstSeq)
-    }
-  }
-  
   private def checkProducerEpoch(producerEpoch: Short): Unit = {
     // 如果该消息batch的produce_epoch比之前的还要下，那么就抛出ProducerFencedException错误
     if (producerEpoch < updatedEntry.producerEpoch) {
@@ -404,26 +387,32 @@ private[log] class ProducerAppendInfo(val producerId: Long,
         }
       }
     } else {
-      // 获取最后一次添加的消息batch的结束序列号，如果这次添加的
+      // 获取最后一次添加的消息batch的结束序列号
       val currentLastSeq = if (!updatedEntry.isEmpty)
+        // updatedEntry不为空，那么表示上个消息batch存在于updatedEntry
         updatedEntry.lastSeq
       else if (producerEpoch == currentEntry.producerEpoch)
+        // updatedEntry为空，那么表示上个消息batch存在于currentEntry
         currentEntry.lastSeq
       else
+        // 如果是新建的producer，那么它的序列号为NO_SEQUENCE
         RecordBatch.NO_SEQUENCE
- 
+      
       if (currentLastSeq == RecordBatch.NO_SEQUENCE && appendFirstSeq != 0) {
-        // the epoch was bumped by a control record, so we expect the sequence number to be reset
+        // 如果是新建的producer，那么它的第一条消息batch的序列号必须为0，否则抛出OutOfOrderSequenceException异常
         throw new OutOfOrderSequenceException(s"Out of order sequence number for producerId $producerId: found $appendFirstSeq " +
           s"(incoming seq. number), but expected 0")
       } else if (!inSequence(currentLastSeq, appendFirstSeq)) {
+        // 继续检查序列号是否连续，否则抛出OutOfOrderSequenceException异常
         throw new OutOfOrderSequenceException(s"Out of order sequence number for producerId $producerId: $appendFirstSeq " +
           s"(incoming seq. number), $currentLastSeq (current end sequence number)")
       }
     }
   }
 
+  // 检查序列号的连续性
   private def inSequence(lastSeq: Int, nextSeq: Int): Boolean = {
+    // 这里需要注意下，Int.MaxValue 的下个连续值等于 0
     nextSeq == lastSeq + 1L || (nextSeq == 0 && lastSeq == Int.MaxValue)
   }    
     
@@ -432,39 +421,44 @@ private[log] class ProducerAppendInfo(val producerId: Long,
 
 ​                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
 
+当消息成功存储到文件中后，Kafka会根据此次AppendInfo，生成新的ProducerStateEntry。
 
+```scala
+private[log] class ProducerAppendInfo(...) {
+  // 新添加的消息batch都会保存到 updatedEntry 
+  private val updatedEntry = ProducerStateEntry.empty(producerId)    
+    
+  // 这里生成新的ProducerStateEntry，是直接返回updatedEntry                                      
+  def toEntry: ProducerStateEntry = updatedEntry  
+}
 
+class ProducerStateManager(val topicPartition: TopicPartition,
+                           @volatile var logDir: File,
+                           val maxProducerIdExpirationMs: Int = 60 * 60 * 1000) extends Logging {
+  // Key为produce_id，Value为最近添加的信息
+  private val producers = mutable.Map.empty[Long, ProducerStateEntry]  
+    
+  // 负责替换掉旧的ProducerStateEntry
+  def update(appendInfo: ProducerAppendInfo): Unit = {
+    if (appendInfo.producerId == RecordBatch.NO_PRODUCER_ID)
+      throw new IllegalArgumentException(s"Invalid producer id ${appendInfo.producerId} passed to update " +
+        s"for partition $topicPartition")
 
+    trace(s"Updated producer ${appendInfo.producerId} state to $appendInfo")
+    // 根据此次添加的结果，生成新的ProducerStateEntry
+    val updatedEntry = appendInfo.toEntry
+    // 保存到producers表中
+    producers.get(appendInfo.producerId) match {
+      case Some(currentEntry) =>
+        currentEntry.update(updatedEntry)
 
-ProducerStateEntry 类包含了消息批次的元数据队列。当有新的消息批次添加进来，会将旧的消息批次删除，来保持队列的长度始终为5。
-
-ProducerStateEntry还包含了produce_id 和 producer_epoch。
-
-消息批次的元数据包含，开始和结束的offset，开始和结束的序列号。
-
-
-
-
-
-
-
-
-
-遇到重复的batch，怎么处理
-
-
-
-
-
-
-
-消息批次的produce_epoch只有在启动了事务，才会产生变化。当事务完成时，会更新producer_epoch。
-
-
-
-
-
-
+      case None =>
+        producers.put(appendInfo.producerId, updatedEntry)
+    }
+    ......
+  }
+}
+```
 
 
 
@@ -472,13 +466,170 @@ ProducerStateEntry还包含了produce_id 和 producer_epoch。
 
 ## 错误处理 ##
 
-错误都是可重试的，会将消息重新插入到RecordAccumulator里
+
+
+当Producer收到出错的响应时，首先会去检测该错误是否重试。如果支持重试，会将这条失败的请求重新添加到队列里，等待再次发送。否则就会修改序列号，或者重置 produce id。
+
+```java
+public class Sender implements Runnable {
+
+    private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response, long correlationId, long now, long throttleUntilTimeMs) {
+        // 检测错误
+        Errors error = response.error;
+        if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 &&
+                (batch.magic() >= RecordBatch.MAGIC_VALUE_V2 || batch.isCompressed())) {
+            // 这里处理MESSAGE_TOO_LARGE异常，如果该消息batch有多条数据，这里会将消息batch切分成小的batch，再次发送 
+            ......
+        } else if (error != Errors.NONE) {
+            // 检查发生这个错误，是否支持重试
+            if (canRetry(batch, response)) {
+                if (transactionManager == null) {
+                    // 重新添加到发送队列里
+                    reenqueueBatch(batch, now);
+                } else if (transactionManager.hasProducerIdAndEpoch(batch.producerId(), batch.producerEpoch())) {
+                    // 重新添加到发送队列里
+                    reenqueueBatch(batch, now);
+                } else {
+                    // 认为
+                    failBatch(batch, response, new OutOfOrderSequenceException("..."), false);
+                }
+            } else if (error == Errors.DUPLICATE_SEQUENCE_NUMBER) {
+                // 如果是重复，说明该消息batch是重复的，之前就添加到了Kafka。这里就直接认为添加成功了
+                completeBatch(batch, response);
+            } else {
+                final RuntimeException exception;
+                .... // 初始化错误
+                // 处理响应的错误
+                failBatch(batch, response, exception, batch.attempts() < this.retries);
+            }
+        }
+        
+     private void reenqueueBatch(ProducerBatch batch, long currentTimeMs) {
+        // 重新添加到RecordAccumulator
+        this.accumulator.reenqueue(batch, currentTimeMs);
+ }
+```
+
+ 
+
+### 重新添加到队列 ###
+
+错误都是可重试的，会将消息重新插入到队列里。注意插入消息，是需要保证队列的序列号的顺序。RecordAccumulator提供了reenqueue方法，支持重新插入。
+
+```java
+public final class RecordAccumulator {
+
+    public void reenqueue(ProducerBatch batch, long now) {
+        batch.reenqueued(now);
+        Deque<ProducerBatch> deque = getOrCreateDeque(batch.topicPartition);
+        synchronized (deque) {
+            if (transactionManager != null)
+                // 开启了幂等性，需要按照序列号大小，添加到队列里
+                insertInSequenceOrder(deque, batch);
+            else
+                deque.addFirst(batch);
+        }
+    }
+    
+    private void insertInSequenceOrder(Deque<ProducerBatch> deque, ProducerBatch batch) {
+        ProducerBatch firstBatchInQueue = deque.peekFirst();
+        if (firstBatchInQueue != null && firstBatchInQueue.hasSequence() && firstBatchInQueue.baseSequence() < batch.baseSequence()) {
+            // 注意这里会检查重新添加的消息batch的序列号，需要比最后一条消息batch要小
+            List<ProducerBatch> orderedBatches = new ArrayList<>();
+            // 将序列号小的消息batch，先提取出来，添加到新队列orderedBatches里
+            while (deque.peekFirst() != null && deque.peekFirst().hasSequence() && deque.peekFirst().baseSequence() < batch.baseSequence())
+                orderedBatches.add(deque.pollFirst());
+            // 添加该消息batch到队列中
+            deque.addFirst(batch);
+
+            // 就序列号小的消息batch再添加到队列中
+            for (int i = orderedBatches.size() - 1; i >= 0; --i) {
+                deque.addFirst(orderedBatches.get(i));
+            }
+
+            // 添加完后，原有的队列就是有序的
+        } else {
+            deque.addFirst(batch);
+        }    
+}
+```
 
 
 
-插入消息，需要按照消息的序列号插入
+### 重置  produce id ###
+
+如果尝试多次，仍然遇到OutOfOrderSequenceException异常，Kafka会认为无法找到缺失的那条记录，而无法修复。所以Producer为了不影响之后的消息发送，它会重置 produce id，然后申请新的 produce id，继续发送请求。
+
+```java
+public class Sender implements Runnable {
+
+    private void failBatch(ProducerBatch batch, long baseOffset, long logAppendTime, RuntimeException exception, boolean adjustSequenceNumbers) {
+        if (transactionManager != null) {
+            if (exception instanceof OutOfOrderSequenceException
+                    && !transactionManager.isTransactional()  // isTransactional方法返回false，表示这里仅仅开启了幂等性，并没有开启事务
+                    && transactionManager.hasProducerId(batch.producerId())) {  // 是否之前就已经申请了produce_id
+                // 重置produce_id为空，等待请求新的produce_id
+                transactionManager.resetProducerId();
+            } else if (exception instanceof ClusterAuthorizationException
+                    || exception instanceof TransactionalIdAuthorizationException
+                    || exception instanceof ProducerFencedException
+                    || exception instanceof UnsupportedVersionException) {
+                // 这些异常是不可恢复的，所以这里将transactionManager的状态设置为错误
+                transactionManager.transitionToFatalError(exception);
+            } else if (transactionManager.isTransactional()) {
+                transactionManager.transitionToAbortableError(exception);
+            }
+            transactionManager.removeInFlightBatch(batch);
+            if (adjustSequenceNumbers)
+                // 如果消息batch即使切分还是因为消息长度过大，那么会跳过这个消息batch，并且将更改之后的序列号
+                transactionManager.adjustSequencesDueToFailedBatch(batch);
+        }
+        // 执行batch的回调函数
+        if (batch.done(baseOffset, logAppendTime, exception))
+            // 释放batch
+            this.accumulator.deallocate(batch);
+    }
+}
+```
 
 
 
+### 修改序列号 ####
 
+当消息batch多次切分，还是因为消息长度过大，那么Kafka会认为这个batch失败，然后会跳过这个batch，更改之后的序列号。
+
+```java
+public class TransactionManager {
+    
+    // 存储着分区的下一个消息的序列号
+    private final Map<TopicPartition, Integer> nextSequence;   
+    
+    // 存储着正在发送的消息batch
+    private final Map<TopicPartition, PriorityQueue<ProducerBatch>> inflightBatchesBySequence;    
+
+    synchronized void adjustSequencesDueToFailedBatch(ProducerBatch batch) {
+        if (!this.nextSequence.containsKey(batch.topicPartition))
+            return;
+     
+        int currentSequence = sequenceNumber(batch.topicPartition);
+        currentSequence -= batch.recordCount;
+        if (currentSequence < 0)
+            throw new IllegalStateException("Sequence number for partition " + batch.topicPartition + " is going to become negative : " + currentSequence);
+        // 更新该分区的下个序列号，这样之后的消息就会从这个序列号开始，填补了这个序列号的缺失
+        setNextSequence(batch.topicPartition, currentSequence);
+
+        for (ProducerBatch inFlightBatch : inflightBatchesBySequence.get(batch.topicPartition)) {
+            if (inFlightBatch.baseSequence() < batch.baseSequence())
+                continue;
+            // 如果有在这条消息batch之后，发送的消息，需要更新它的序列号
+            // 序列号变为减去batch的消息数目
+            int newSequence = inFlightBatch.baseSequence() - batch.recordCount;
+            if (newSequence < 0)
+                throw new IllegalStateException("....");
+            // 更新新的序列号
+            inFlightBatch.resetProducerState(new ProducerIdAndEpoch(inFlightBatch.producerId(), inFlightBatch.producerEpoch()), newSequence, inFlightBatch.isTransactional());
+        }
+    }
+}
+```
 
