@@ -135,13 +135,14 @@ while (true) {
 
 
 
-
-
 发送EndTxnRequest请求前，必须保证所有请求都已经发送完毕。
 
 
 
 
 
+参考资料： <https://www.confluent.io/blog/transactions-apache-kafka/>
 
+<https://docs.google.com/document/d/11Jqy_GjUGtdXJK94XGsEIK7CP1SnQGdp2eF0wSw9ra8/edit#>
 
+<https://docs.google.com/document/d/1Rlqizmk7QCDe8qAnVW5e5X8rGvn6m2DCR3JR2yqwVjc/edit>
