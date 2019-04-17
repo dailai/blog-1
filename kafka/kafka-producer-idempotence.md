@@ -1,6 +1,6 @@
 # Kafka Producer 幂等性原理 #
 
-幂等性是指发送同样的请求，对系统资源的影响是一致的。结合 Kafka Producer，是指在多次发送同样的消息，Kafka做到消息的不丢失和不重复。实现幂等性服务，关键的一点是如何处理异常，因为一般请求发生异常，才会重复请求。比如Kafka Producer与服务端的网络异常：
+幂等性是指发送同样的请求，对系统资源的影响是一致的。结合 Kafka Producer，是指在多次发送同样的消息，Kafka做到发送消息的不丢失和不重复。实现幂等性服务，需要客户端和服务端的相互配合。客户端每次发送请求，需要得到服务端的确认，才认为此次请求成功。不然客户端只能不断的重试，来保证服务端不丢失请求。而这样服务端有可能收到重复的请求，所以需要对这些请求去重。比如Kafka Producer与服务端的网络异常：
 
 * Producer向服务端发送消息，但是此时连接就断开了，发送的消息经过网络传输时，被丢失了。服务端没有接收到消息。
 
@@ -14,9 +14,11 @@ Kafka的幂等性只支持单个producer向单个分区发送。它会为每个P
 
 ## Producer 发送消息 ##
 
-### 幂等性配置 ###
+### 配置幂等性 ###
 
-KafkaProducer 如果要使用幂等性，需要将 enable.idempotence 配置项设置为true。并且它对单个分区的发送，一次性最多发送5条。通过KafkaProducer的 configureInflightRequests 方法，可以看到对max.in.flight.requests.per.connection的限制
+KafkaProducer 如果要使用幂等性，需要将 enable.idempotence 配置项设置为true。并且它对单个分区的发送，一次性最多发送5条。通过KafkaProducer的 configureInflightRequests 方法，可以看到对max.in.flight.requests.per.connection的限制。
+
+因为客户端的每次请求，都需要服务端的确认，所以KafkaProducer在开启幂等性后，需要设置 ack。
 
 ```java
 public class KafkaProducer<K, V> implements Producer<K, V> {
@@ -29,15 +31,31 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         return config.getInt(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
     }
     
-}
     
+    private static short configureAcks(ProducerConfig config, boolean idempotenceEnabled, Logger log) {
+        boolean userConfiguredAcks = false;
+        short acks = (short) parseAcks(config.getString(ProducerConfig.ACKS_CONFIG));
+        if (config.originals().containsKey(ProducerConfig.ACKS_CONFIG)) {
+            userConfiguredAcks = true;
+        }
+        // 如果开启了幂等性，但是用户没有指定ack，则返回 -1。-1表示包括leader和follower分区都要确认
+        if (idempotenceEnabled && !userConfiguredAcks) {
+            return -1;
+        }
+        // 如果开启了幂等性，但是用户指定的ack不为 -1，则会抛出异常
+        if (idempotenceEnabled && acks != -1) {
+            throw new ConfigException(".....");
+        }
+        return acks;
+    }    
+}
 ```
 
 
 
-### 请求获取 producer_id ###
+### 请求获取 producer id ###
 
-Sender在发送消息之前，都会去检查是否已经获取到了 produce_id。如果没有，则向服务端发送请求。获取到的响应数据，保存在TransactionManager类里。
+如果Producer开启了幂等性，那么Sender在发送消息之前，都会去检查是否已经获取到了 produce_id。如果没有，会向服务端发送请求，然后保存在TransactionManager类里。
 
 ```java
 public class Sender implements Runnable {
@@ -99,9 +117,9 @@ public class Sender implements Runnable {
 
 
 
-### 发送消息 ###
+### 配置消息 ###
 
-当开启了幂等性，KafkaProducer发送消息时，会额外设置producer_id 和 序列号字段。producer_id是从Kafka服务端请求获取的，序列号是Producer自增生成的。这里需要说明下，Kafka发送消息都是以batch的格式发送，batch包含了多条消息。所以Producer发送消息batch的时候，只会设置该batch的第一个消息的序列号，后面的消息的序列号是依次递增的。
+当开启了幂等性，KafkaProducer发送消息时，会额外设置producer_id 和 序列号字段。producer_id是从Kafka服务端请求获取的，消息序列号是Producer端生成的，初始值为0，之后自增加一。这里需要说明下，Kafka发送消息都是以batch的格式发送，batch包含了多条消息。所以Producer发送消息batch的时候，只会设置该batch的第一个消息的序列号，后面消息的序列号可以根据第一个消息的序列号计算出来。
 
 当Sender从RecordAccumulator中拉取消息时，会设置produce_id 和 baseSequence两个字段。
 
@@ -421,7 +439,7 @@ private[log] class ProducerAppendInfo(val producerId: Long,
 
 ​                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
 
-当消息成功存储到文件中后，Kafka会根据此次AppendInfo，生成新的ProducerStateEntry。
+当消息成功存储到文件中后，Kafka会根据此次的AppendInfo，生成新的ProducerStateEntry。
 
 ```scala
 private[log] class ProducerAppendInfo(...) {
@@ -465,8 +483,6 @@ class ProducerStateManager(val topicPartition: TopicPartition,
 
 
 ## 错误处理 ##
-
-
 
 当Producer收到出错的响应时，首先会去检测该错误是否重试。如果支持重试，会将这条失败的请求重新添加到队列里，等待再次发送。否则就会修改序列号，或者重置 produce id。
 
