@@ -1,10 +1,16 @@
+# Kafka Consumer 读取事务消息
 
 
-## 事务索引
 
-事务索引保存了所有的Aborted 事务消息的位置。对于每个LogSegment文件，都对应着一个事务索引文件
+Kafka 在每次添加事务消息之后，还需要发送确认消息，才能表示此次事务完成。确认消息可以是事务确认成功的消息，也可以是事务终止的消息。如果该事务终止，那么此次事务需要回滚，所以涉及到的所有消息都应该认为是废弃的。Kafka Consumer在读取消息时，需要过滤掉这些废弃的消息。Kafka服务端返回消息时，也会附带事务信息，这样Kafka Consumer才能知道确定消息是否应该废弃。
 
-事务索引的原理图
+
+
+## 事务索引文件
+
+事务索引文件保存了所有的Aborted 事务消息的信息，这些信息包含该事务的起始和结束位置等。对于每个LogSegment文件，都对应着一个事务索引文件。
+
+事务索引文件的格式：
 
 
 
@@ -16,11 +22,26 @@
 
 查找事务的代码如下：
 
+```scala
+class TransactionIndex(val startOffset: Long, @volatile var file: File) extends Logging {
 
+  // 找到指定范围内的消息，和它有交集的事务，
+  // fetchOffset为起始位置，upperBoundOffset表示结束位置
+  def collectAbortedTxns(fetchOffset: Long, upperBoundOffset: Long): TxnIndexSearchResult = {
+    val abortedTransactions = ListBuffer.empty[AbortedTxn]
+    // 遍历事务的Aborted消息
+    for ((abortedTxn, _) <- iterator()) {
+      // 下面这个if条件，判断是否和这个事务有交集
+      if (abortedTxn.lastOffset >= fetchOffset && abortedTxn.firstOffset < upperBoundOffset)
+        abortedTransactions += abortedTxn
 
-
-
-
+      if (abortedTxn.lastStableOffset >= upperBoundOffset)
+        return TxnIndexSearchResult(abortedTransactions.toList, isComplete = true)
+    }
+    TxnIndexSearchResult(abortedTransactions.toList, isComplete = false)
+  }
+}
+```
 
 
 
@@ -34,7 +55,7 @@
 
 当Consumer遍历到batch 0时，发现它属于事务A的消息，并且这个batch的起始位置，通过比较事务A的起始和结束位置（Aborted消息的位置），可以判断出该batch是在终止事务中的，所以会跳过。
 
-同理当Consumer遍历到batch 1时，发现它属于事务B的消息，并且这个消息是在终止的事务中，所以会跳过。
+同理当Consumer遍历到batch 1时，发现它属于事务B的消息，并且这个消息是在终止的事务中，所以会 跳过。
 
 当Consumer遍历到 batch 2，它是事务A的终止消息batch。这个batch很特殊，它不包含任何数据，只是表示事务的终止。
 
