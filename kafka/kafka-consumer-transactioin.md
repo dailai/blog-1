@@ -34,7 +34,7 @@ class TransactionIndex(val startOffset: Long, @volatile var file: File) extends 
       // 下面这个if条件，判断是否和这个事务有交集
       if (abortedTxn.lastOffset >= fetchOffset && abortedTxn.firstOffset < upperBoundOffset)
         abortedTransactions += abortedTxn
-
+      // 这里涉及到的所有事务，它们的lastStableOffset必须小于结束位置
       if (abortedTxn.lastStableOffset >= upperBoundOffset)
         return TxnIndexSearchResult(abortedTransactions.toList, isComplete = true)
     }
