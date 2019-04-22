@@ -198,11 +198,139 @@ Registry 服务端将数据格式存储到 Kafka 中，对应的 topic 名称为
 
 ### 高可用
 
-如果要实现高可用，需要运行多个 Registry 服务，这些服务中必须选择出一个 leader，所有的请求都是由 leader 来负责。当 leader 挂掉之后，就会触发选举操作，来选举出新的 leader。选举的实现有两种方式，基于kafka 和 基于 zookeeper。 
+如果要实现高可用，需要运行多个 Registry 服务，这些服务中必须选择出一个 leader，所有的请求都是最终 由 leader 来负责。当 leader 挂掉之后，就会触发选举操作，来选举出新的 leader。选举的实现有两种方式，基于kafka 和 基于 zookeeper。 
 
 基于 kafka 的原理是利用消费组，因为消费组的每个成员都需要和 kafka coordinator 服务端保持心跳，如果有成员挂了，那么就会触发组的重分配操作。重分配操作会从存活的成员中，选出 leader 角色。
+
+KafkaGroupMasterElector 启动了一个心跳线程，定期发送心跳请求。它 实现了监听器的接口，当出发开始选举时会调用onRevoked方法，当选举完之后会调用onAssigned方法。
+
+```java
+public class KafkaGroupMasterElector implements MasterElector, SchemaRegistryRebalanceListener {
+
+
+  public void init() throws SchemaRegistryTimeoutException, SchemaRegistryStoreException {
+    // 心跳线程
+    executor = Executors.newSingleThreadExecutor();
+    executor.submit(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          while (!stopped.get()) {
+            // 循环调用poll方法，处理心跳
+            coordinator.poll(Integer.MAX_VALUE);
+          }
+        } catch (Throwable t) {
+          log.error("Unexpected exception in schema registry group processing thread", t);
+        }
+      }
+    });
+
+  public void onRevoked() {
+    log.info("Rebalance started");
+    try {
+      // 因为要重新选举，所以将之前的leader清空
+      schemaRegistry.setMaster(null);
+    } catch (SchemaRegistryException e) {
+      // This shouldn't be possible with this implementation. The exceptions from setMaster come
+      // from it calling nextRange in this class, but this implementation doesn't require doing
+      // any IO, so the errors that can occur in the ZK implementation should not be possible here.
+      log.error(
+          "Error when updating master, we will not be able to forward requests to the master",
+          e
+      );
+    }
+  }
+  
+  // assignment为选举结果
+  public void onAssigned(SchemaRegistryProtocol.Assignment assignment, int generation) {
+    log.info("Finished rebalance with master election result: {}", assignment);
+    try {
+      switch (assignment.error()) {
+        case SchemaRegistryProtocol.Assignment.NO_ERROR:
+          if (assignment.masterIdentity() == null) {
+            log.error(...);
+          }
+          // 记录分配结果
+          schemaRegistry.setMaster(assignment.masterIdentity());
+          joinedLatch.countDown();
+          break;
+        case SchemaRegistryProtocol.Assignment.DUPLICATE_URLS:
+          throw new IllegalStateException(...);
+        default:
+          throw new IllegalStateException(...);
+      }
+    } catch (SchemaRegistryException e) {
+      ......
+    }
+  }
+} 
+```
+
+
 
 
 
 基于 zookeeper 的方式，会更加简单，效率也更高。因为只有 leader 挂掉，zookeeper 才会触发重新选举。而基于 kafka 的方式，只要是有一个成员挂掉，不管它是不是 leader，都会触发重新选举。如果这个成员不是 leader，则会造成不必要的选举。
 
+使用zookeeper方式的原理是，所有 Registry 服务都会监听一个临时节点，而只有 leader 才会占有这个节点。当 leader 挂掉之后，临时节点会消失。其余的服务发现临时节点不存在，就会立即尝试重新创建，而只有一个服务能够创建成功，成为 leader。
+
+```java
+public class ZookeeperMasterElector implements MasterElector {
+  // 选举使用的临时节点    
+  private static final String MASTER_PATH = "/schema_registry_master";
+    
+  public void electMaster() throws
+      SchemaRegistryStoreException, SchemaRegistryTimeoutException,
+      SchemaRegistryInitializationException, IdGenerationException {
+    SchemaRegistryIdentity masterIdentity = null;
+    try {
+      // 尝试在zookeeper中，创建临时节点
+      zkUtils.createEphemeralPathExpectConflict(MASTER_PATH, myIdentityString,
+                                                zkUtils.defaultAcls(MASTER_PATH));
+      log.info("Successfully elected the new master: " + myIdentityString);
+      masterIdentity = myIdentity;
+      schemaRegistry.setMaster(masterIdentity);
+    } catch (ZkNodeExistsException znee) {
+      // 创建失败
+      readCurrentMaster();
+    }
+  }    
+    
+    
+  private class MasterChangeListener implements IZkDataListener {
+
+    public MasterChangeListener() {
+    }
+
+    // 当数据被更改后，触发
+    @Override
+    public void handleDataChange(String dataPath, Object data) {
+      
+      try {
+        if (isEligibleForMasterElection) {
+          // 选举
+          electMaster();
+        } else {
+          // 从节点中读取leader
+          readCurrentMaster();
+        }
+      } catch (SchemaRegistryException e) {
+        log.error("Error while reading the schema registry master", e);
+      }
+    }
+
+    // leader 挂掉
+    @Override
+    public void handleDataDeleted(String dataPath) throws Exception {
+      if (isEligibleForMasterElection) {
+        // 如果允许选举，那么立即执行
+        electMaster();
+      } else {
+        // 否则设置之前的leader为空
+        schemaRegistry.setMaster(null);
+      }
+    }
+  }
+
+}    
+```

@@ -2,17 +2,17 @@
 
 
 
-Kafka 在每次添加事务消息之后，还需要发送确认消息，才能表示此次事务完成。确认消息可以是事务确认成功的消息，也可以是事务终止的消息。如果该事务终止，那么此次事务需要回滚，所以涉及到的所有消息都应该认为是废弃的。Kafka Consumer在读取消息时，需要过滤掉这些废弃的消息。Kafka服务端返回消息时，也会附带事务信息，这样Kafka Consumer才能知道确定消息是否应该废弃。
+Kafka 在每次发送事务消息之后，还需要发送确认消息，才能表示此次事务完成。确认消息可以是事务确认成功的消息，也可以是事务终止的消息。如果是事务终止，那么此次事务需要回滚，所有涉及到该事务之前的消息都应该废弃。Kafka Consumer在读取这些消息时，需要结合事务状态，来滤掉这些废弃的消息。所以Kafka服务端返回消息时，也会附带祥光的事务信息。
 
 
 
 ## 事务索引文件
 
-事务索引文件保存了所有的Aborted 事务消息的信息，这些信息包含该事务的起始和结束位置等。对于每个LogSegment文件，都对应着一个事务索引文件。
+事务索引文件保存了所有的终止事务的信息，这些信息包含事务的起始和结束位置等。
 
-事务索引文件的格式：
-
-
+* 起始位置，该事务的第一条消息的位置
+* 结束位置，该事务的最后一条消息的位置
+* Last Stable Offset，表示在该位置前面，所有的数据都已经是确认好的，没有正在执行的事务
 
 当Consumer请求消息时，不仅会返回消息，还会返回对应范围内的所有Aborted 事务消息。举例如下：
 
@@ -34,7 +34,7 @@ class TransactionIndex(val startOffset: Long, @volatile var file: File) extends 
       // 下面这个if条件，判断是否和这个事务有交集
       if (abortedTxn.lastOffset >= fetchOffset && abortedTxn.firstOffset < upperBoundOffset)
         abortedTransactions += abortedTxn
-      // 这里涉及到的所有事务，它们的lastStableOffset必须小于结束位置
+      // 这个if条件，判断是否结束遍历事务。如果事务的lastStableOffset必须大于结束位置，表示该事务已经和这个范围的消息没有交集了
       if (abortedTxn.lastStableOffset >= upperBoundOffset)
         return TxnIndexSearchResult(abortedTransactions.toList, isComplete = true)
     }
@@ -49,15 +49,15 @@ class TransactionIndex(val startOffset: Long, @volatile var file: File) extends 
 
 ## Consumer 过滤事务消息
 
-当Consumer收到响应后，会结合Aborted 事务消息，过滤掉因为事务没有成功的消息。过滤原理如下图所示：
+当Consumer收到响应后，会结合Aborted 事务消息，过滤掉因为事务没有成功的消息。过滤原理如下图所示，下面表示服务端返回的响应，有多个消息batch，其中涉及到两个事务，A 和 B。 还有每个事务的起始位置：
 
-下面表示服务端返回的响应，有多个消息batch，其中涉及到两个事务，A 和 B。 还有每个事务的起始位置。
 
-当Consumer遍历到batch 0时，发现它属于事务A的消息，并且这个batch的起始位置，通过比较事务A的起始和结束位置（Aborted消息的位置），可以判断出该batch是在终止事务中的，所以会跳过。
 
-同理当Consumer遍历到batch 1时，发现它属于事务B的消息，并且这个消息是在终止的事务中，所以会 跳过。
+当Consumer遍历到batch 0时，发现它属于事务A的消息，通过比较事务A的起始和结束位置（Aborted消息的位置），可以判断出该batch是在终止事务A的，所以会跳过。
 
-当Consumer遍历到 batch 2，它是事务A的终止消息batch。这个batch很特殊，它不包含任何数据，只是表示事务的终止。
+同理当Consumer遍历到batch 1时，发现它属于事务B的消息，并且是在终止的事务中，所以也会跳过。
+
+当Consumer遍历到 batch 2，它是事务A的终止消息batch。这个batch很特殊，它不包含任何数据，只是表示事务的终止，所以它也会跳过。
 
 当Consumer遍历到 batch 3，发现它并不在任何终止事务中，所以认为这个batch是合法的，会返回。
 
@@ -65,15 +65,13 @@ class TransactionIndex(val startOffset: Long, @volatile var file: File) extends 
 
 
 
-
-
-
+### 源码解析 ###
 
 过滤的代码如下：
 
-首先创建一个优先队列，存储Aborted 事务消息，排序依照事务消息的起始offset。
+首先创建一个优先队列，存储Aborted 事务消息，排序依照事务的起始offset。
 
-然后遍历消息batch，根据消息batch的 last offset，找到所有可能与它相关的Aborted 事务消息，将这些涉及到的produce id 保存起来。根据这些produce id，就可以判断出此条消息是否为废弃的事务消息。
+然后遍历消息batch，根据消息batch的 末尾位置，找到所有可能与它相关的Aborted 事务消息，将这些涉及到的produce id 保存起来。根据这些produce id，就可以判断出此条消息是否为废弃的事务消息。
 
 如果此条消息是Aborted 事务消息，那么说明对应的produce id的事务已经确定了，就将 produce id 从集合中删除掉。
 
