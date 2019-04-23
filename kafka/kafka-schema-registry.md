@@ -1,6 +1,6 @@
 # Kafka Schema Registry 原理
 
-Confluent 公司为了Kafka 支持 Avro 序列化，创建了 Kafka Schema Registry 项目，项目地址为 <https://github.com/confluentinc/schema-registry> 。顾名思义 Registry作为一个注册中心，它负责管理 Kafka 所有 topic 的数据格式。
+Confluent 公司为了能让 Kafka 支持 Avro 序列化，创建了 Kafka Schema Registry 项目，项目地址为 <https://github.com/confluentinc/schema-registry> 。对于存储大量数据的 kafka 来说，使用 Avro 序列化，可以减少数据的存储空间提高了存储量，减少了序列化时间提高了性能。 Kafka 有多个topic，里面存储了不同种类的数据，每种数据都对应着一个 Avro schema 来描述这种格式。Registry 服务支持方便的管理这些 topic 的schema，它还对外提供了多个 restful 接口，用于存储和查找。
 
 
 
@@ -31,9 +31,9 @@ Avro 序列化相比常见的序列化（比如 json）会更快，序列化的�
 // 解析数据格式文件  
 Schema schema = new Schema.Parser().parse(new File("user.avsc"));
 // 创建一个实例
-GenericRecord user1 = new GenericData.Record(schema);
-user1.put("name", "Alyssa");
-user1.put("favorite_number", 256);
+GenericRecord user = new GenericData.Record(schema);
+user.put("name", "Alyssa");
+user.put("favorite_number", 256);
 
 // 构建输出流，保存结果
 ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -42,7 +42,7 @@ BinaryEncoder encoder =  EncoderFactory.get().directBinaryEncoder(out, null);
 // DatumWriter负责序列化
 DatumWriter<GenericRecord> datumWriter = new GenericDatumWriter<GenericRecord>(schema);
 // 调用DatumWriter序列化，并将结果写入到输出流
-datumWriter.write(value, encoder);
+datumWriter.write(user, encoder);
 // 刷新缓存
 encoder.flush();
 
@@ -58,11 +58,15 @@ byte[] result = out.toByteArray();
 
 ## Kafka 客户端使用原理
 
-Kafka 如果要使用 Avro 序列化， Kafka Schema Registry 提供了 KafkaAvroSerializer 和 KafkaAvroDeserializer 两个类，在实例化 KafkaProducer 和 KafkaConsumer 时， 指定序列化或反序列化的配置。
+Kafka Schema Registry 提供了 KafkaAvroSerializer 和 KafkaAvroDeserializer 两个类。Kafka 如果要使用 Avro 序列化， 在实例化 KafkaProducer 和 KafkaConsumer 时， 指定序列化或反序列化的配置。
+
+客户端发送数据的流程图如下所示：
 
 
 
-下面以实例 KafkaProducer 为例，运行这段代码之前，需要保证 Kafka Schema Registry 服务已经运行
+我们向 kafka 发送数据时，需要先向 Schema Registry 注册 schema，然后序列化发送到 kafka 里。当我们需要从 kafka 消费数据时，也需要先从 Schema Registry 获取 schema，然后才能解析数据。
+
+下面以实例 KafkaProducer 的使用为例
 
 ```java
 public class SchemaProducer {
@@ -80,6 +84,7 @@ public class SchemaProducer {
         // 指定Value的序列化类，KafkaAvroSerializer
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
         // 指定 registry 服务的地址
+        // 如果 Schema Registry 启动了高可用，那么这儿的配置值可以是多个服务地址，以逗号隔开
         props.put("schema.registry.url", registryHost);
         KafkaProducer<String, GenericRecord> producer = new KafkaProducer<>(props);
 
@@ -100,17 +105,15 @@ public class SchemaProducer {
 
 
 
-上面使用到了 KafkaAvroSerializer 序列化消息，接下来看看 KafkaAvroSerializer 的 原理。我们知道 Kafka 的消息由 Key 和 Value 组成，这两部分的值可以有不同的数据格式。而这些数据格式都会保存在 Registry 服务端，客户端需要指定数据格式的名称，才能获取到。如果我们要获取当前消息 Key 这部分的数据格式，它对于的名称为 <topic>-key，如果要获取 Value 这部分的数据格式，它对应的名称为 <topic>-value（topic 为该消息所在的 topic 名称）。
+上面使用到了 KafkaAvroSerializer 序列化消息，接下来看看 KafkaAvroSerializer 的 原理。我们知道 Kafka 的消息由 Key 和 Value 组成，这两部分的值可以有不同的数据格式。而这些数据格式都会保存在 Registry 服务端，客户端需要指定数据格式的名称（在 Registry 中叫做 subject），才能获取到。如果我们要获取当前消息 Key 这部分的数据格式，它对于的 subject 名称为 <topic>-key，如果要获取 Value 这部分的数据格式，它对应的 subject 名称为 <topic>-value（topic 为该消息所在的 topic 名称）。
 
  Kafka Schema Registry 还支持修改数据格式，这样对于同一个 topic ，它的消息有多个版本，前面的消息和最新的消息都可能会完全不一样，那么客户怎么区分呢。Registry 会为每种数据格式都会分配一个 id 号，然后发送的每条消息都会附带对应的数据格式 id。
-
-
 
 KafkaProducer 在第一次序列化的时候，会自动向 Registry 服务端注册。服务端保存数据格式后，会返回一个 id 号。KafkaProducer发送消息的时候，需要附带这个 id 号。这样 KafkaConsumer 在读取消息的时候，通过这个 id 号，就可以从 Registry 服务端 获取。
 
 
 
-Registry 客户端负责向服务端发送请求，每个请求后会将结果缓存起来，以提高性能。
+Registry 客户端负责向服务端发送 http 请求，然后会将结果缓存起来，以提高性能。
 
 ```java
 public class CachedSchemaRegistryClient implements SchemaRegistryClient {
@@ -161,38 +164,100 @@ public class CachedSchemaRegistryClient implements SchemaRegistryClient {
 
 
 
-### 处理请求
-
-
-
-
-
-自增 id 生成器
-
-自增生成器目前有两种实现方式。一种是基于内存的，自己维护。另外一种是基于zookeeper的，每次获取一个 id 段，然后一个 id， 一个 id 的分配出去。
-
-
-
-
-
-
-
-
-
 ### 存储数据
 
-Registry 服务端将数据格式存储到 Kafka 中，对应的 topic 名称为 _schemas。存储在该 topic 的消息，格式如下：
+Registry 服务端将数据格式存储到 Kafka 中，对应的 topic 名称为 _schemas。存储消息的格式如下：
 
-* Key 部分的值，包含数据格式名称，版本号，由 SchemaRegistryKey 类表示。 
-
-* Value部分的值，包含数据格式名称，版本号， 数据格式 id 号，数据格式的内容，是否被删除， 由 SchemaRegistryValue 类表示。
+- Key 部分，包含数据格式名称，版本号，由 SchemaRegistryKey 类表示。 
+- Value部分，包含数据格式名称，版本号， 数据格式 id 号，数据格式的内容，是否被删除， 由 SchemaRegistryValue 类表示。
 
  Registry 服务端在存储Kafka之前，还会将上述的 Key 和 Value 序列化，目前序列化由两种方式：
 
-*  json 序列化，由 ZkStringSerializer 类负责
-* 将 SchemaRegistryKey 或 SchemaRegistryValue 强制转换为 String 类型保存起来
+- json 序列化，由 ZkStringSerializer 类负责
+- 将 SchemaRegistryKey 或 SchemaRegistryValue 强制转换为 String 类型保存起来
 
 
+
+### 处理请求
+
+Registry 服务端主要负责两种请求，注册数据格式 schema 请求和 获取数据格式 schema 请求。
+
+如果 Registry 服务端启动了高可用，说明有多个服务端在运行。如果注册 schema 请求发送给了 follower，那么 follower 会将请求转发给 leader。至于获取 schema 请求，follower 和 leader 都能处理，因为 schema 最后都存在了 kafka 中，它们直接从 kafka 里读取。
+
+处理注册 schema 请求
+
+```java
+public class KafkaSchemaRegistry implements SchemaRegistry, MasterAwareSchemaRegistry {
+
+  public int registerOrForward(String subject,
+                               Schema schema,
+                               Map<String, String> headerProperties)
+      throws SchemaRegistryException {
+    // 检测这个schema是否之前注册过
+    Schema existingSchema = lookUpSchemaUnderSubject(subject, schema, false);
+    if (existingSchema != null) {
+      if (schema.getId() != null && schema.getId() >= 0 && !schema.getId().equals(existingSchema.getId())
+      ) {
+        throw new IdDoesNotMatchException(existingSchema.getId(), schema.getId());
+      }
+      return existingSchema.getId();
+    }
+
+    synchronized (masterLock) {
+      if (isMaster()) {
+        // 如果是leader，那么执行register方法，写schema到kafka
+        return register(subject, schema);
+      } else {
+        // 如果是follower，那么转发请求到 leader
+        if (masterIdentity != null) {
+          return forwardRegisterRequestToMaster(subject, schema, headerProperties);
+        } else {
+          throw new UnknownMasterException("Register schema request failed since master is "
+                                           + "unknown");
+        }
+      }
+    }
+  }
+}
+```
+
+上面调用了 register 方法保存 schema，同时它也为这个 schema 分配了一个 id。这里简单说下自增 id 生成器的算法，目前有两种实现方式。一种是基于内存的方式，自己维护一个计数器。另外一种是基于zookeeper的方式，每次从 zookeeper 获取一个 id 段，然后一个 id，一个 id 的分配出去。
+
+
+
+处理获取 schema 请求
+
+```java
+public class KafkaSchemaRegistry implements SchemaRegistry, MasterAwareSchemaRegistry {
+  // 负责读取kafka
+  final KafkaStore<SchemaRegistryKey, SchemaRegistryValue> kafkaStore;
+  // 缓存
+  private final LookupCache<SchemaRegistryKey, SchemaRegistryValue> lookupCache;
+    
+  @Override
+  public SchemaString get(int id) throws SchemaRegistryException {
+    SchemaValue schema = null;
+    try {
+      // 从缓存中查找，根据 id 获取消息的key
+      SchemaKey subjectVersionKey = lookupCache.schemaKeyById(id);
+      if (subjectVersionKey == null) {
+        return null;
+      }
+      // 从kafka中读取消息的value
+      schema = (SchemaValue) kafkaStore.get(subjectVersionKey);
+      if (schema == null) {
+        return null;
+      }
+    } catch (StoreException e) {
+      throw new SchemaRegistryStoreException(...);
+    }
+    // 返回结果
+    SchemaString schemaString = new SchemaString();
+    schemaString.setSchemaString(schema.getSchema());
+    return schemaString;
+  }
+}   
+```
 
 
 
@@ -268,8 +333,6 @@ public class KafkaGroupMasterElector implements MasterElector, SchemaRegistryReb
 
 
 
-
-
 基于 zookeeper 的方式，会更加简单，效率也更高。因为只有 leader 挂掉，zookeeper 才会触发重新选举。而基于 kafka 的方式，只要是有一个成员挂掉，不管它是不是 leader，都会触发重新选举。如果这个成员不是 leader，则会造成不必要的选举。
 
 使用zookeeper方式的原理是，所有 Registry 服务都会监听一个临时节点，而只有 leader 才会占有这个节点。当 leader 挂掉之后，临时节点会消失。其余的服务发现临时节点不存在，就会立即尝试重新创建，而只有一个服务能够创建成功，成为 leader。
@@ -334,3 +397,13 @@ public class ZookeeperMasterElector implements MasterElector {
 
 }    
 ```
+
+
+
+## 参考资料
+
+<https://docs.confluent.io/current/schema-registry/index.html>
+
+<https://github.com/confluentinc/schema-registry>
+
+http://avro.apache.org/docs/current/gettingstartedjava.html
