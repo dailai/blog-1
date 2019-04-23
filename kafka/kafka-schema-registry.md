@@ -171,7 +171,9 @@ Registry 服务端将数据格式存储到 Kafka 中，对应的 topic 名称为
 - Key 部分，包含数据格式名称，版本号，由 SchemaRegistryKey 类表示。 
 - Value部分，包含数据格式名称，版本号， 数据格式 id 号，数据格式的内容，是否被删除， 由 SchemaRegistryValue 类表示。
 
- Registry 服务端在存储Kafka之前，还会将上述的 Key 和 Value 序列化，目前序列化由两种方式：
+
+
+Registry 服务端在存储Kafka之前，还会将上述的 Key 和 Value 序列化，目前序列化由两种方式：
 
 - json 序列化，由 ZkStringSerializer 类负责
 - 将 SchemaRegistryKey 或 SchemaRegistryValue 强制转换为 String 类型保存起来
