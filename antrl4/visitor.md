@@ -1,4 +1,4 @@
-# antrl4 遍历原理
+# ntrl4 遍历原理
 
 
 
@@ -24,10 +24,10 @@ class RuleContextWithAltNum
 Tree <|-- SyntaxTree
 SyntaxTree <|-- ParseTree
 ParseTree <|-- TerminalNode
-TerminalNode <|-- TerminalNodeImpl
+TerminalNode <|.. TerminalNodeImpl
 TerminalNodeImpl <|-- ErrorNodeImpl
 ParseTree <|-- RuleNode
-RuleNode <|-- RuleContext
+RuleNode <|.. RuleContext
 RuleContext <|-- ParserRuleContext
 ParserRuleContext <|-- InterpreterRuleContext
 ParserRuleContext <|-- RuleContextWithAltNum
@@ -384,3 +384,8 @@ public class Main {
 ```
 结果输出为：36
 
+
+
+## 参考资料
+
+<https://www.jianshu.com/p/dc1b68dfe2d7>
