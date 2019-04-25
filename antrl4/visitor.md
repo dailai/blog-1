@@ -171,7 +171,7 @@ public abstract class AbstractParseTreeVisitor<T> implements ParseTreeVisitor<T>
 
 ### 语法定义文件
 
-定义的Calculator.g4文件
+首先我们创建一个Calculator.g4名称的文件，里面定义了计算器的语法格式
 
 ```
 grammar Calculator;
@@ -210,9 +210,13 @@ stat就是一行语句的格式。
 
 ### 节点代码
 
-通过anltr4生成java的代码，关于Visitor相关的有两个文件 CalculatorBaseVisitor 和 CalculatorParser。
+antrl4 会根据上述的语法定义文件，为每个规则，都生成一个 ParserRuleContext  的子类。这些子类根据自身的规则，都有访问子节点的方法。这些所有的子类，都会被组织在 CalculatorParser 类里。
 
-antrl4 会为每个规则，生成一个 ParserRuleContext （非叶子节点 ）。
+上面语法定义了三条语法规则 prog，stat，expr，分别对应着  三个类。
+
+
+
+
 
 CalculatorParser包含了各个节点，都为每个节点封装了accept方法，接收visitor的遍历。以prog为例，
 
