@@ -2,7 +2,7 @@
 
 Antlr4 是一款开源的框架，用来分析语法。使用者可以自己创建语法规则文件，然后使用 antrl4 生成类文件。这些类实现了将语句按照关键字分词，然后将分词构造成一棵树。使用者在这些类之上封装代码，就可以实现自己的功能。比如下面，我们使用 antrl4 实现一个计算器：
 
-## 计算器语法
+## 四则运算语法
 
 ### 定义语法文件
 
@@ -176,7 +176,7 @@ public class Main {
 
 ## antrl4 基础类
 
-上面介绍了 antrl4 的 基本用法，实现了一个计算器的功能。但是其中的原理，还没有详细讲解。我们知道 antlr4 会将语句解析成一棵树，但这棵树的数据结构是什么样的，还不清楚。我们首先介绍下树的节点。
+上面介绍了 antrl4 的 基本用法，实现了一个四则运算的功能。但是其中的原理，还没有详细讲解。我们知道 antlr4 会将语句解析成一棵树，但这棵树的数据结构是什么样的，还不清楚。我们首先介绍下树的节点。
 
 树的节点可以主要分为叶子节点和非叶子节点两类。 但是涉及到节点的类比较多，如下图所示
 
@@ -495,7 +495,7 @@ public static class PrintContext extends StatContext {
 
 
 
-CalculatorBaseVisitor 提供了访问不同节点的方法，默认实现都是调用 visitChildren 方法。它的泛型 T 表示返回的结果类型。使用者一般继承 CalculatorBaseVisitor 类，复写一些方法，来实现自定义的功能（比如上面的计算器例子）。
+CalculatorBaseVisitor 提供了访问不同节点的方法，默认实现都是调用 visitChildren 方法。它的泛型 T 表示返回的结果类型。使用者一般继承 CalculatorBaseVisitor 类，复写一些方法，来实现自定义的功能（比如上面的四则运算例子）。
 
 ```java
 public class CalculatorBaseVisitor<T> extends AbstractParseTreeVisitor<T> implements CalculatorVisitor<T> {
