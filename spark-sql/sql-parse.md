@@ -165,3 +165,8 @@ class SparkSqlAstBuilder(conf: SQLConf) extends AstBuilder(conf) {
 vistiCreateDatabase直接返回了CreateDatabaseCommand实例。
 
 整个sql解析的原理，是使用了antrl4这个库，定义了sql的匹配标准。然后使用Visitor模式。自定义遍历sql语句的节点，生成相应的RunnableCommand。
+
+
+
+
+
