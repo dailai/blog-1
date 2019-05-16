@@ -1,131 +1,3 @@
-
-
-
-
-
-
-## 客户端
-
-
-
-### 请求类型
-
-```
-FindCoordinatorHandler
-
-
-InitProducerIdHandler
-
-
-AddPartitionsToTxnHandler
-AddOffsetsToTxnHandler
-
-
-TxnOffsetCommitHandler
-
-
-EndTxnHandler
-```
-
-
-
-
-
-
-
-### 事务状态
-
-TransactionStateManager 管理着 分区的事务信息，当事务的信息发生变化时，会先保存到 名称为 __transaction_state 的 topic 里，然后更新缓存。
-
-
-
-
-
-
-
-TransactionCoordinator  负责定期检查超时事务。
-
-
-
-TransactionMetadata 是每个事务对应着一个元数据
-
-```scala
-class TransactionMetadata(val transactionalId: String,
-                                               var producerId: Long,
-                                               var producerEpoch: Short,
-                                               var txnTimeoutMs: Int,
-                                               var state: TransactionState,
-                                               val topicPartitions: mutable.Set[TopicPartition],
-                                               @volatile var txnStartTimestamp: Long = -1,
-                                               @volatile var txnLastUpdateTimestamp: Long) 
-```
-
-
-
-TransactionState分为下面几种 Empty， Ongoing， PrepareCommit， PrepareAbort， CompleteCommit， CompleteAbort， Dead。
-
-
-
-
-
-
-
-TransactionCoordinator 的 handleEndTransaction 处理 commit 或者 abort 请求，
-
-
-
-
-
-
-
-
-
-ProducerIdManager类负责生成 自增号 producer_id，它每次会从zookeeper批量的拉取 id 号，提高了效率。数据保存在zookeeper的 节点 /latest_producer_id_block，以json的格式保存。
-
-transactional.id ，是transaction客户端的唯一 id 号，有客户端自己指定。当这个客户端重启后，仍然可以根据 transactional.id 来继续处理失败的事务。
-
-loadTransactionsForTxnTopicPartition 方法负责从 __transaction_state里，加载事务数据。
-
-
-
-每个 producer_id 都有一个 producerEpoch。producerEpoch是有范围的，当producerEpoch逐渐递增，超过Short.Max的时候，那么就会生成新的producer_id。
-
-
-
-
-
-
-
-
-
-处理申请 producer id 请求，如果该 transaction id 之前不存在，那么会新建元数据，并且保存到 topic 里。并将producer epoch 增大。
-
-
-
-处理 add partition 请求，会更新元数据的状态，并且保存在 topic 里。
-
-保存到 topic 的请求，ack设为 -1， 表示必须保存到所有备份中。
-
-
-
-处理 end transaction 请求后，会先持久化到 topic 里。然后将请求发送给该事物涉及到的那些partition 的 leader角色。
-
-
-
-发送参与者的请求，会以节点分组，保存在各自的队列里。
-
-
-
-后台线程会将队列的请求发送出去
-
-
-
-请求正常完成后，会将此事务的元数据中删除对应的分区。并将 TxnLogAppend 写入 topic。
-
-
-
-
-
 ## 事务流程
 
 Kafka的整个事务处理流程如下图：
@@ -140,6 +12,12 @@ Producer 向 TC 服务发送的 commit 消息，下面简称事务提交消息�
 
 TC 服务向分区发送的消息，下面简称事务结果消息。
 
+
+
+### 寻找 TC 服务地址
+
+
+
 ### 事务初始化
 
 Producer 在使用事务功能，必须先自定义一个唯一的 transaction id。通过这个 transaction id，即使客户端挂掉了，也能保证重启后，继续处理未完成的事务。
@@ -150,13 +28,15 @@ Kafka 实现事务需要依靠幂等性，而幂等性需要指定 producer id �
 
 Producer 在收到 producer id 后，就可以发送消息到对应的 topic。不过发送消息之前，需要先将这些消息发送的分区地址，上传到 TC 服务。TC 服务将这些分区地址持久化到事务 topic。然后 Producer 才会真正的发送消息，这些消息与普通消息不同，它们会有一个字段，表示自身是事务消息。
 
+这里需要注意下一种特殊的请求，提交消费位置请求，用于原子性的从某个 topic 读取消息，并且发送消息到另外一个 topic。我们知道一般是消费者使用消费组订阅 topic，才会发送提交消费位置的请求，而这里是由 Producer 发送的。Producer 首先会发送一条请求，通知 TC 服务此次事务需要使用到消费位置请求，然后TC 服务会将这个消费组对应的分区添加进来（每个消费组的消费位置都保存在 __consumer_offset topic 的一个分区里）。Producer收到响应后，就可以直接发送消费位置请求给 GroupCoordinator。
+
 ### 发送提交请求
 
-Producer 发送完消息后，认为该事务可以提交了，就会发送提交请求到 TC 服务。Producer 的工作就完成了，接下来它只需要等待响应。
+Producer 发送完消息后，认为该事务可以提交了，就会发送提交请求到 TC 服务。Producer 的工作就完成了，接下来它只需要等待响应。这里需要强调下，Producer会在发送事务提交请求之前，会等待之前所有的请求都已经发送并且响应成功。
 
 ### 提交请求持久化
 
-TC 服务收到提交请求后，会先将提交信息先持久化到 事务 topic 。持久化成功后，服务端就立即发送成功响应给 Producer。然后找到该事务涉及到的所有分区，为每个分区生成提交请求，存到队列里，等待发送。
+TC 服务收到提交请求后，会先将提交信息先持久化到 事务 topic 。持久化成功后，服务端就立即发送成功响应给 Producer。然后找到该事务涉及到的所有分区，为每 个分区生成提交请求，存到队列里，等待发送。
 
 读者可能有所疑问，在一般的二阶段提交中，协调者需要收到所有参与者的响应后，才能判断此事务是否成功，最后才将结果返回给客户。那如果 TC 服务在发送响应给 Producer 后，还没来及向分区发送请求就挂掉了，那么 Kafka 是如何保证事务完成。因为每次事务的信息都会持久化，所以 TC 服务挂掉重新启动后，会先从 事务 topic 加载事务信息，如果发现只有事务提交信息，却没有后来的事务完成信息，说明存在事务结果信息没有提交到分区。
 
@@ -166,11 +46,7 @@ TC 服务收到提交请求后，会先将提交信息先持久化到 事务 top
 
 
 
-
-
 ## 客户端原理
-
-
 
 ### 使用示例
 
@@ -202,7 +78,7 @@ while (true) {
     producer.send(producerRecord(“outputTopic_2”, record));
   }
   // 提交 offset
-  producer.sendOffsetsToTransaction(currentOffsets(consumer), group);  
+  producer.sendOffsetsToTransaction(currentOffsets(consumer), "my-group-id");  
   // 提交事务
   producer.commitTransaction();
 }
@@ -212,9 +88,28 @@ while (true) {
 
 ### 运行原理
 
- TransactionManager 类负责 Producer 与 TC 服务通信，并且它在请求之后，会变化自身的状态。
+上面的例子使用了 Producer的接口实现了事务，但负责与 TC 服务通信的是 TransactionManager 类。TransactionManager 类会发送申请分配 producer id 请求，上传消息分区请求和事务提交请求，在完成每一步请求，TransactionManager 都会更新自身的状态。
 
-### Kafka 客户端的 TransactionManager的状态
+```mermaid
+graph TD
+    UNINITIALIZED((UNINITIALIZED))
+    INITIALIZING((INITIALIZING))
+    READY((READY))
+    IN_TRANSACTION((IN_TRANSACTION))
+    COMMITTING_TRANSACTION((COMMITTING_TRANSACTION))
+    ABORTING_TRANSACTION((ABORTING_TRANSACTION))
+    
+    UNINITIALIZED -->|发送事务初始化请求后| INITIALIZING
+    INITIALIZING -->|成功获取到producer id| READY
+    READY -->| producer调用beginTransaction方法| IN_TRANSACTION
+    IN_TRANSACTION -->|发送事务提交请求| COMMITTING_TRANSACTION
+    COMMITTING_TRANSACTION -->|事务提成功| READY
+    IN_TRANSACTION -->|发送事务回滚请求| ABORTING_TRANSACTION
+    ABORTING_TRANSACTION -->|事务回滚成功| READY
+    
+```
+
+状态
 
 ```java
 private enum State {
@@ -231,35 +126,9 @@ private enum State {
 
 
 
-### 发送请求流程
-
-TransactionManager 实例化的时候，状态为UNINITIALIZED。
-
-当发送请求获取produce_id 时，状态变为INITIALIZING。
-
-当成功获取到producer_id的响应时，状态变为READY。
-
-当producer调用了beginTransaction方法时，状态变为IN_TRANSACTION。
-
-之后producer进行一系列的操作，涉及到发送AddPartitionsToTxnRequest请求，和AddOffsetsToTxnRequest请求。
-
-发送完AddPartitionsToTxnRequest之后，  producer才发送消息到分区里
-
-producer最后会发送EndTxnRequest请求，提交本次事务。状态变为COMMITTING_TRANSACTION。
-
-当收到提交事务的响应，状态变为READY。
-
-有可能producer最后需要事务回滚，当它发送EndTxnRequest时，状态变为ABORTING_TRANSACTION。接收到响应后，状态变为READY。
-
-
-
 当请求过程出错时，状态变为ABORTABLE_ERROR或FATAL_ERROR。
 
-
-
-发送EndTxnRequest请求前，必须保证所有请求都已经发送完毕。
-
-
+发送事务提交或者回滚请求前，必须保证之前的请求都已经成功发送。
 
 
 
@@ -267,12 +136,460 @@ producer最后会发送EndTxnRequest请求，提交本次事务。状态变为CO
 
 ## 服务端原理
 
+TC 服务会为每个 transaction id 都维护了元数据，元数据的字段如下：
+
+```scala
+class TransactionMetadata(
+    val transactionalId: String,      // 事务 id
+    var producerId: Long,             // pruducer id
+    var producerEpoch: Short,         // producer epoch
+    var txnTimeoutMs: Int,            // 事务超时时间
+    var state: TransactionState,      // 事务当前状态
+    val topicPartitions: mutable.Set[TopicPartition],    // 该事务涉及到的分区列表
+    @volatile var txnStartTimestamp: Long = -1,          // 事务开始的时间
+    @volatile var txnLastUpdateTimestamp: Long)          // 事务的更新时间
+```
+
+对于服务端，每个事务也有对应的状态图
+
+```mermaid
+graph TD
+    Empty((Empty))
+    Ongoing((Ongoing))
+    PrepareCommit((PrepareCommit))
+    PrepareAbort((PrepareAbort))
+    CompleteCommit((CompleteCommit))
+    CompleteAbort((CompleteAbort))
+    
+    Empty -->|接收到分区请求| Ongoing
+    Ongoing -->|接收到事务提交请求| PrepareCommit
+    Ongoing -->|接收到事务回滚请求| PrepareAbort
+    PrepareCommit -->|发送消息给分区| CompleteCommit
+    PrepareAbort -->|发送消息给分区| CompleteAbort
+    CompleteAbort -->|接收到分区请求| Ongoing
+    CompleteCommit -->|接收到分区请求| Ongoing
+```
+
+
+
+当 TC 服务接收到了来自客户端的分区上传请求，此时它才会认为此次事务开始了，然后它会更新分区列表和开始时间，并且会将更新后的元数据，持久化到事务 topic。最后将自身状态改为 Ongoing。
+
+当TC 服务收到事务提交请求或者事务回滚请求，更新元数据，持久化到事务 topic，然后自身状态改为CompleteCommit 或CompleteAbort 。然后向涉及到该事务的分区发送事务结果消息，等待所有的分区都成功返回响应后，就会持久化一条事务成功的消息到消息 topic。
+
+
+
+## 高可用分析
+
+### TC 服务
+
+通过上述对 Kafka 事务的简述，可以看到 TC 服务起着很重要的作用。事实上 Kafka 集群中运行着多个 TC 服务，每个TC 服务负责事务 topic 的一个分区读写，也就是这个分区的 leader。Producer 根据 transaction id 的哈希值，来决定该事务属于事务 topic 的哪个分区，最后找到这个分区的 leader 位置。
+
+既然 TC 服务负责事务 topic 的一个分区 leader，我们知道当一个分区的 leader挂掉之后，Kafka 会保证这个的分区的 follower 会转换为 leader 角色，会继续对外提供服务。这么 TC 服务的高可用就达到了。
+
+### 消息持久化
+
+TC 服务为了支持重启后，也能恢复到之前的状态，所以它将每次重要的消息都会持久化起来，并且保存到事务 topic 的时候，指定 leader 分区和 follower 分区必须都存储成功。这样每次 TC 服务启动的时候，都会从事务 topic 读取之前的状态，加载到缓存里。比如当TC 服务在响应客户端的事务提交请求后，还没来得及向各分区发送事务结果请求，就已经挂掉了。之后 TC 服务重启，会去事务 topic 加载数据，它发现事务的最后状态为 PrepareCommit，并且事务数据还包括了分区列表，这样 TC 服务会继续未完成的事务，会向列表中的各个分区发送事务结果请求。
+
+### 超时处理
+
+如果 Producer 发起了一个事务，但是由于网络问题，TC 服务迟迟没有接下来的请求，那么该事务就会被认为超时。TC 服务会有个线程，会定期检查处理 Ongoing 状态的事务，如果该事务的开始时间和当前时间的差，超过了指定的超时时间（在发送申请producer id请求时可以指定），那么 TC 服务就会回滚该事务，更新和持久化事务的状态，并且发送事务回滚结果给分区。
+
+
+
+## 源码分析
+
+如果对源码还有兴趣的读者，可以继续阅读这部分。这里会大概的讲解下代码结构，读者如果想进一步的理解，可以参看源码。整个事务的源码分为两部分，客户端和服务端。
+
+### 客户端
+
+事务的客户端，只能是 Producer。下面首先介绍下 Producer 与事务相关的接口。
+
+```java
+public interface Producer<K, V> extends Closeable {
+    // 初始化事务，包括申请 producer id
+    void initTransactions();
+    // 开始事务，这里会更改事务的本地状态
+    void beginTransaction() throws ProducerFencedException;
+    // 提交消费位置， offsets表示每个分区的消费位置， consumerGroupId表示消费组的名称
+    void sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offsets,
+                                  String consumerGroupId) throws ProducerFencedException;
+    // 发送事务提交请求
+    void commitTransaction() throws ProducerFencedException;
+    // 发送事务回滚请求
+    void abortTransaction() throws ProducerFencedException;
+}                                  
+```
+
+KafkaProducer 类实现了 Producer 接口，比较简单，只是调用了 TransactionCoordinator 类的方法。客户端事务处理的核心代码，都是在 TransactionCoordinator 类里。
+
+
+
+| 请求类型         | 请求类                    | 响应处理类                |
+| ---------------- | ------------------------- | ------------------------- |
+| 寻找 TC 服务地址 | FindCoordinatorRequest    | FindCoordinatorHandler    |
+| 事务初始化请求   | InitProducerIdRequest     | InitProducerIdHandler     |
+| 消费位置提交请求 | TxnOffsetCommitRequest    | TxnOffsetCommitHandler    |
+| 事务分区上传请求 | AddPartitionsToTxnRequest | AddPartitionsToTxnHandler |
+| 事务提交或者回滚 | EndTxnRequest             | EndTxnHandler             |
+
+
+
+TransactionCoordinator 发送的请求类，都有一个对应的类来处理响应。这些处理类都是继承 TxnRequestHandler 类，它封装了共同的错误处理，比如连接断开，api 版本不兼容等。子类需要实现 handleResponse 方法，负责处理具体的响应内容。
+
+initializeTransactions 方法负责事务初始化，它会发送 InitProducerIdRequest 请求。
+
+```java
+public synchronized TransactionalRequestResult initializeTransactions() {
+    // 检查transaction id是否已经设置
+    ensureTransactional();
+    // 更改自身状态为INITIALIZING
+    transitionTo(State.INITIALIZING);
+    // 将producer id和epoch都设为空
+    setProducerIdAndEpoch(ProducerIdAndEpoch.NONE);
+    // nextSequence在消息发送中会用到，因为发送事务消息要求幂等性，而发送幂等性的消息是需要设置sequence的
+    this.nextSequence.clear();
+    // 构建申请produce id请求
+    InitProducerIdRequest.Builder builder = new InitProducerIdRequest.Builder(transactionalId, transactionTimeoutMs);
+    // InitProducerIdHandler 负责处理响应
+    InitProducerIdHandler handler = new InitProducerIdHandler(builder);
+    // 将消息保存到队列中，等待Sender线程（Producer会有个后台线程发送消息）发送
+    enqueueRequest(handler);
+    // 返回异步结果
+    return handler.result;
+}
+```
+
+InitProducerIdHandler 类的定义如下：
+
+```java
+private class InitProducerIdHandler extends TxnRequestHandler {
+
+    @Override
+    public void handleResponse(AbstractResponse response) {
+        InitProducerIdResponse initProducerIdResponse = (InitProducerIdResponse) response;
+        // 检查错误
+        Errors error = initProducerIdResponse.error();
+        if (error == Errors.NONE) {
+            ProducerIdAndEpoch producerIdAndEpoch = new ProducerIdAndEpoch(initProducerIdResponse.producerId(), initProducerIdResponse.epoch());
+            // 保存结果 producer id和epoch
+            setProducerIdAndEpoch(producerIdAndEpoch);
+            // 更改状态为READY
+            transitionTo(State.READY);
+            lastError = null;
+            // 通知异步结果已完成
+            result.done();
+        } else if (error == Errors.NOT_COORDINATOR || error == Errors.COORDINATOR_NOT_AVAILABLE) {
+            // 如果TC服务没有找到或者刚好挂掉，那么生成FindCoordinatorRequest请求，等待发送
+            lookupCoordinator(FindCoordinatorRequest.CoordinatorType.TRANSACTION, transactionalId);
+            // 并且将自身请求也放入队列，等待发送
+            reenqueue();
+        } else if (error == Errors.COORDINATOR_LOAD_IN_PROGRESS || error == Errors.CONCURRENT_TRANSACTIONS) {
+            // 如果TC服务正在启动中，那么加入队列，等待发送
+            reenqueue();
+        } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED) {
+            // 如果发生权限问题，那么认为进入错误状态
+            fatalError(error.exception());
+        } else {
+            fatalError(new KafkaException("Unexpected error in InitProducerIdResponse; " + error.message()));
+        }
+    }
+}
+```
+
+
+
+beginTransaction 方法负责开始新事务，它只是更改自身状态为 IN_TRANSACTION，并不会发送任何请求
+
+```java
+public synchronized void beginTransaction() {
+    // 检查 transaction id
+    ensureTransactional();
+    // 检查之前响应是否出错
+    maybeFailWithError();
+    // 更改状态
+    transitionTo(State.IN_TRANSACTION);
+}
+```
+
+
+
+我们知道Producer发送消息，都是先将消息发送到缓存队列里，最后是由Sender线程发送出去 。Producer 如果开启了事务， 它在发送消息到缓存之前，会将消息所在的分区保存在 TransactionCoordinator 里。然后Sender线程在发送消息之前，会去从 TransactionCoordinator 检查是否需要上次分区到 TC 服务，如果有就先上次分区，随后才发送消息。
+
+```java
+public class KafkaProducer<K, V> implements Producer<K, V> {
+    private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback callback) {
+        .......
+        int partition = partition(record, serializedKey, serializedValue, cluster);
+        tp = new TopicPartition(record.topic(), partition);
+        ......
+        if (transactionManager != null && transactionManager.isTransactional())
+            // 如果开启了事务，那么就先将分区保存在 transactionManager
+            transactionManager.maybeAddPartitionToTransaction(tp);
+        ......
+    }
+}
+```
+
+TransactionManager 提供了 maybeAddPartitionToTransaction 方法添加分区。
+
+```java
+public class TransactionManager {
+    // 新增的上传分区集合
+    private final Set<TopicPartition> newPartitionsInTransaction;
+    // 本次事务已经上传的分区集合
+    private final Set<TopicPartition> partitionsInTransaction;
+    // 本次事务涉及到的所有分区集合
+    private final Set<TopicPartition> pendingPartitionsInTransaction;
+    
+    public synchronized void maybeAddPartitionToTransaction(TopicPartition topicPartition) {
+        // 检查事务状态必须为IN_TRANSACTION
+        failIfNotReadyForSend();
+        // 如果已经上传过这个分区，或者正在上传这个分区，那么直接返回
+        if (isPartitionAdded(topicPartition) || isPartitionPendingAdd(topicPartition))
+            return;
+
+        log.debug("Begin adding new partition {} to transaction", topicPartition);
+        // 添加到需要上次的集合
+        newPartitionsInTransaction.add(topicPartition);
+    }
+    
+    // 检查是否这个分区已经上传过了
+    synchronized boolean isPartitionAdded(TopicPartition partition) {
+        return partitionsInTransaction.contains(partition);
+    }
+    
+    // 检查是否这个分区正在上传中
+    synchronized boolean isPartitionPendingAdd(TopicPartition partition) {
+        return newPartitionsInTransaction.contains(partition) || pendingPartitionsInTransaction.contains(partition);
+    }    
+}
+```
+
+TransactionManager 的 addPartitionsToTransactionHandler 方法，会生成分区上传请求，然后由Sender发送。
+
+```java
+public class TransactionManager {
+
+    private synchronized TxnRequestHandler addPartitionsToTransactionHandler() {
+        // 将新增的分区，添加到 pendingPartitionsInTransaction 集合
+        pendingPartitionsInTransaction.addAll(newPartitionsInTransaction);
+        // 清空新增的分区集合
+        newPartitionsInTransaction.clear();
+        // 构建 AddPartitionsToTxnRequest 请求
+        AddPartitionsToTxnRequest.Builder builder = new AddPartitionsToTxnRequest.Builder(transactionalId,
+                producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, new ArrayList<>(pendingPartitionsInTransaction));
+        return new AddPartitionsToTxnHandler(builder);
+    }
+}
+```
+
+AddPartitionsToTxnHandler 负责处理响应
+
+```java
+private class AddPartitionsToTxnHandler extends TxnRequestHandler {
+
+    @Override
+    public void handleResponse(AbstractResponse response) {
+        AddPartitionsToTxnResponse addPartitionsToTxnResponse = (AddPartitionsToTxnResponse) response;
+        Map<TopicPartition, Errors> errors = addPartitionsToTxnResponse.errors();
+        boolean hasPartitionErrors = false;
+        Set<String> unauthorizedTopics = new HashSet<>();
+        retryBackoffMs = TransactionManager.this.retryBackoffMs;
+
+        for (Map.Entry<TopicPartition, Errors> topicPartitionErrorEntry : errors.entrySet()) {
+            // 检查每个分区的响应错误
+            .....
+        }
+
+        Set<TopicPartition> partitions = errors.keySet();
+        // 因为这些分区已经有响应了，即使错误也需要从集合中删除
+        pendingPartitionsInTransaction.removeAll(partitions);
+
+        if (!unauthorizedTopics.isEmpty()) {
+            abortableError(new TopicAuthorizationException(unauthorizedTopics));
+        } else if (hasPartitionErrors) {
+            abortableError(new KafkaException("Could not add partitions to transaction due to errors: " + errors));
+        } else {
+            log.debug("Successfully added partitions {} to transaction", partitions);
+            // 将这些成功响应的分区，添加到 partitionsInTransaction集合
+            partitionsInTransaction.addAll(partitions);
+            transactionStarted = true;
+            // 通知结果成功
+            result.done();
+        }
+    }
+}
+```
+
+
+
+sendOffsetsToTransaction 方法负责发送消费位置提交请求
+
+```java
+public class TransactionManager {
+    public synchronized TransactionalRequestResult sendOffsetsToTransaction(Map<TopicPartition, OffsetAndMetadata> offsets, String consumerGroupId) {
+        // 保证transaction id
+        ensureTransactional();
+        // 检查之前的响应错误
+        maybeFailWithError();
+        // 只有 IN_TRANSACTION 状态才可以发送这种类型请求
+        if (currentState != State.IN_TRANSACTION)
+            throw new KafkaException("...");
+        // 构建请求
+        AddOffsetsToTxnRequest.Builder builder = new AddOffsetsToTxnRequest.Builder(transactionalId, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, consumerGroupId);
+        // 构建处理器
+        AddOffsetsToTxnHandler handler = new AddOffsetsToTxnHandler(builder, offsets);
+        // 添加到队列
+        enqueueRequest(handler);
+        return handler.result;
+    }
+}
+```
+
+AddOffsetsToTxnHandler 类负责处理响应，它的处理逻辑很简单，它收到响应后，会发送 TxnOffsetCommitRequest 请求给 TC 服务。
+
+最后还剩下事务提交或回滚请求，还没讲述。Producer 在调用 commitTransaction 或 abortTransaction 方法，本质都是调用了 TransactionManager 的 beginCompletingTransaction 方法发送请求。
+
+```java
+public synchronized TransactionalRequestResult beginCommit() {
+    ensureTransactional();
+    maybeFailWithError();
+    // 更改状态为 COMMITTING_TRANSACTION
+    transitionTo(State.COMMITTING_TRANSACTION);
+    // 调用 beginCompletingTransaction 方法发送请求
+    return beginCompletingTransaction(TransactionResult.COMMIT);
+}
+
+public synchronized TransactionalRequestResult beginAbort() {
+    ensureTransactional();
+    // 更改状态为 ABORTABLE_ERROR
+    if (currentState != State.ABORTABLE_ERROR)
+        maybeFailWithError();
+    transitionTo(State.ABORTING_TRANSACTION);
+
+    // 清空分区集合
+    newPartitionsInTransaction.clear();
+    // 发送请求
+    return beginCompletingTransaction(TransactionResult.ABORT);
+}
+
+private TransactionalRequestResult beginCompletingTransaction(TransactionResult transactionResult) {
+    // 如果还有分区没有上传，那么生成请求放进队列
+    if (!newPartitionsInTransaction.isEmpty())
+        enqueueRequest(addPartitionsToTransactionHandler());
+    // 构建请求
+    EndTxnRequest.Builder builder = new EndTxnRequest.Builder(transactionalId, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, transactionResult);
+    // 构建处理器
+    EndTxnHandler handler = new EndTxnHandler(builder);
+    enqueueRequest(handler);
+    return handler.result;
+}
+```
+
+EndTxnHandler 负责处理事务提交或回滚响应，EndTxnHandler的处理逻辑比较简单，它只是调用了 completeTransaction 方法。
+
+```java
+private synchronized void completeTransaction() {
+    // 更改状态为READY
+    transitionTo(State.READY);
+    lastError = null;
+    transactionStarted = false;
+    // 清空分区集合
+    newPartitionsInTransaction.clear();
+    pendingPartitionsInTransaction.clear();
+    partitionsInTransaction.clear();
+}
+```
+
+
+
+### 服务端
+
+服务端的结构会相对复杂一些，这里尽量简单的讲讲大概逻辑。首先介绍下 TransactionStateManager 类，它负责管理事务的元数据，它也提供持久化事务的元数据，和从事务 topic 加载数据的功能。
+
+```scala
+class TransactionStateManager(...) {
+  // key值为 partition id，value为 TxnMetadataCacheEntry对象
+  private val transactionMetadataCache: mutable.Map[Int, TxnMetadataCacheEntry] = mutable.Map()
+}
+
+// metadataPerTransactionalId 参数是Pool类型，可以看成是Map
+// key值为transaction id， value为元数据
+private[transaction] case class TxnMetadataCacheEntry(coordinatorEpoch: Int,
+                                                      metadataPerTransactionalId: Pool[String, TransactionMetadata]) 
+```
+
+
+
+TransactionStateManager 提供了 appendTransactionToLog 方法用于持久化。
+
+```scala
+class TransactionStateManager {
+  def appendTransactionToLog(transactionalId: String,
+                             coordinatorEpoch: Int,
+                             newMetadata: TxnTransitMetadata,
+                             responseCallback: Errors => Unit,
+                             retryOnError: Errors => Boolean = _ => false): Unit = {
+    // 生成record的key
+    val keyBytes = TransactionLog.keyToBytes(transactionalId)
+    // 生成record的calue
+    val valueBytes = TransactionLog.valueToBytes(newMetadata)
+    // 生成record
+    val records = MemoryRecords.withRecords(TransactionLog.EnforcedCompressionType, new SimpleRecord(timestamp, keyBytes, valueBytes))
+    val topicPartition = new TopicPartition(Topic.TRANSACTION_STATE_TOPIC_NAME, partitionFor(transactionalId))
+    val recordsPerPartition = Map(topicPartition -> records)      
+    
+    // 当持久化完成后，会调用这个函数，更新transactionMetadataCache集合的元数据
+    def updateCacheCallback(responseStatus: collection.Map[TopicPartition, PartitionResponse]): Unit = {
+        // 检查持久化是否出错
+        .....
+        // 更改元数据
+        metadata.completeTransitionTo(newMetadata)
+    }
+      
+    ......
+      
+    // 持久化recod到topic里
+    replicaManager.appendRecords(
+                newMetadata.txnTimeoutMs.toLong,
+                TransactionLog.EnforcedRequiredAcks,
+                internalTopicsAllowed = true,
+                isFromClient = false,
+                recordsPerPartition,
+                updateCacheCallback,   // 持久化完成后，会调用这个函数
+                delayedProduceLock = Some(stateLock.readLock))
+}
+```
+
+
+
+TransactionStateManager 提供了 loadTransactionsForTxnTopicPartition 方法用于从消息 topic 恢复数据，这里不再详细介绍。
+
+
+
+接下来来讲讲 TransactionCoordinator 类，它负责处理重要的事务请求。
+
+| 请求类型                  | 响应方法                         |
+| ------------------------- | -------------------------------- |
+| InitProducerIdRequest     | handleInitProducerId             |
+| AddPartitionsToTxnRequest | handleAddPartitionsToTransaction |
+| EndTxnRequest             | handleEndTransaction             |
+
+
+
+handleInitProducerId 方法会返回 producer id，如果这个事务的 transaction id 第一次请求，那么会为它分配新的 producer id 。如果之前请求过，就会返回之前分配的 producer id。
+
+handleAddPartitionsToTransaction 方法会将
+
+
+
 
 
 这里要额外说明下，Kafka 的事务消息还包括提交consumer的消费位置。
 
 发送consumer 消费位置的提交消息，本质也是发送消息到 __consumer_offset topic。
 
+ProducerIdManager类负责生成 自增号 producer_id，它每次会从zookeeper批量的拉取 id 号，提高了效率。数据保存在zookeeper的 节点 /latest_producer_id_block，以json的格式保存。
 
+每个 producer_id 都有一个 producerEpoch。producerEpoch是有范围的，当producerEpoch逐渐递增，超过Short.Max的时候，那么就会生成新的producer_id。
 
- 后，会去更新缓存的分区列表，从中把自己删除掉。当这个分区列表为空时，则表示所有的分区都已经成功响应了，那么就会持久化一条事务完成的消息到__consumer_offset topic。
