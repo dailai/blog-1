@@ -16,7 +16,7 @@ TC 服务向分区发送的消息，下面简称事务结果消息。
 
 ### 寻找 TC 服务地址
 
-
+Producer 会首先从 Kafka 集群的任意一台机器发送请求，获取到 TC 服务的地址。Kafka 有个事务 topic，它负责持久化所有的事物消息。这个 topic 有多个分区，每个分区负责一些事务。Kafka 首先会根据 transaction id 计算出 该事务属于哪个分区，然后负责这个事务的TC 服务地址，就是该事务分区的 leader 所在的机器。
 
 ### 事务初始化
 
@@ -164,10 +164,10 @@ graph TD
     Empty -->|接收到分区请求| Ongoing
     Ongoing -->|接收到事务提交请求| PrepareCommit
     Ongoing -->|接收到事务回滚请求| PrepareAbort
-    PrepareCommit -->|发送消息给分区| CompleteCommit
-    PrepareAbort -->|发送消息给分区| CompleteAbort
-    CompleteAbort -->|接收到分区请求| Ongoing
-    CompleteCommit -->|接收到分区请求| Ongoing
+    PrepareCommit -->|持久化成功| CompleteCommit
+    PrepareAbort -->|持久化成功| CompleteAbort
+    CompleteAbort -->|发送消息给分区并且接收到响应| Ongoing
+    CompleteCommit -->|发送消息给分区并且接收到响应| Ongoing
 ```
 
 
@@ -525,10 +525,11 @@ TransactionStateManager 提供了 appendTransactionToLog 方法用于持久化�
 
 ```scala
 class TransactionStateManager {
+    
   def appendTransactionToLog(transactionalId: String,
                              coordinatorEpoch: Int,
-                             newMetadata: TxnTransitMetadata,
-                             responseCallback: Errors => Unit,
+                             newMetadata: TxnTransitMetadata,  // 新的元数据
+                             responseCallback: Errors => Unit, // 回调函数
                              retryOnError: Errors => Boolean = _ => false): Unit = {
     // 生成record的key
     val keyBytes = TransactionLog.keyToBytes(transactionalId)
@@ -545,6 +546,8 @@ class TransactionStateManager {
         .....
         // 更改元数据
         metadata.completeTransitionTo(newMetadata)
+        // 执行回调函数
+        responseCallback(responseError)
     }
       
     ......
@@ -565,8 +568,6 @@ class TransactionStateManager {
 
 TransactionStateManager 提供了 loadTransactionsForTxnTopicPartition 方法用于从消息 topic 恢复数据，这里不再详细介绍。
 
-
-
 接下来来讲讲 TransactionCoordinator 类，它负责处理重要的事务请求。
 
 | 请求类型                  | 响应方法                         |
@@ -579,17 +580,136 @@ TransactionStateManager 提供了 loadTransactionsForTxnTopicPartition 方法用
 
 handleInitProducerId 方法会返回 producer id，如果这个事务的 transaction id 第一次请求，那么会为它分配新的 producer id 。如果之前请求过，就会返回之前分配的 producer id。
 
-handleAddPartitionsToTransaction 方法会将
+handleAddPartitionsToTransaction 方法会将上传的分区列表，添加到元数据并且持久化。
+
+handleEndTransaction 方法会稍微复杂一些，因为它需要将这个消息转发给各个分区。
+
+```scala
+  def handleEndTransaction(transactionalId: String,
+                           producerId: Long,
+                           producerEpoch: Short,
+                           txnMarkerResult: TransactionResult,
+                           responseCallback: EndTxnCallback): Unit = {
+      // 获取元数据，更改状态
+      val preAppendResult: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
+        case None =>
+          // 如果元数据不存在，说明存在问题
+          Left(Errors.INVALID_PRODUCER_ID_MAPPING)
+        case Some(epochAndTxnMetadata) =>
+          val txnMetadata = epochAndTxnMetadata.transactionMetadata
+          val coordinatorEpoch = epochAndTxnMetadata.coordinatorEpoch
+          ......
+          txnMetadata.state match {
+              // 必须是Ongoing状态，如果是别的状态，就会报错
+              case Ongoing =>
+                // 根据发送的消息类型，查看是事务提交还是回滚，来决定接下来的状态
+                val nextState = if (txnMarkerResult == TransactionResult.COMMIT)
+                  PrepareCommit
+                else
+                  PrepareAbort
+                // 调用 prepareAbortOrCommit 来更新状态
+                Right(coordinatorEpoch, txnMetadata.prepareAbortOrCommit(nextState, time.milliseconds()))
+          }
+      }
+      
+      // 检查上一步的结果
+      preAppendResult match {
+        case Left(err) =>
+          responseCallback(err)
+        case Right((coordinatorEpoch, newMetadata)) =>
+          
+          // 定义回调函数，用于发送请求到分区
+          def sendTxnMarkersCallback(error: Errors): Unit = {
+            if (error == Errors.NONE) {
+                ...... // 检查状态，只有是PrepareCommit或PrepareAbort，才能继续执行
+              txnMetadata.state match {
+                case PrepareCommit =>
+                  // 更改状态为 CompleteCommit
+                  txnMetadata.prepareComplete(time.milliseconds())
+                case PrepareAbort =>
+                  // 更改状态为 CompleteAbort
+                  txnMetadata.prepareComplete(time.milliseconds())
+              }
+            }
+            // 检查更改状态的结果
+            preSendResult match {
+              case Left(err) =>
+                responseCallback(err)
+              case Right((txnMetadata, newPreSendMetadata)) =>
+                // 向客户端发送成功响应
+                responseCallback(Errors.NONE)
+                // 通过txnMarkerChannelManager发送请求到分区
+                txnMarkerChannelManager.addTxnMarkersToSend(transactionalId, coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
+            }
+          }
+          
+          // 持久化元数据，然后调用sendTxnMarkersCallback函数，发送客户端的响应和发送请求到分区
+          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendTxnMarkersCallback)
+```
 
 
 
+上面发送请求到分区，调用了 TransactionMarkerChannelManager 的方法。它会生成每个分区的请求，然后放到一个队列里，后台线程会负责将这些请求发送出去。当收到所有分区的响应后，它还负责更改事务的状态，并且负责持久化一条事务成功的消息。
+
+这里需要提下延迟任务 DelayedTxnMarker，它负责检查是否收到所有分区的响应。它设置的延迟时间达到365天，所以可以认为次任务几乎不会过期。
+
+```scala
+private[transaction] class DelayedTxnMarker(txnMetadata: TransactionMetadata,
+                                           completionCallback: Errors => Unit,
+                                           lock: Lock)
+  extends DelayedOperation(TimeUnit.DAYS.toMillis(100 * 365), Some(lock)) {
+
+  override def tryComplete(): Boolean = {
+    txnMetadata.inLock {
+      // 当每收到一个分区的响应后，就会从元数据中删除掉。
+      // 直到分区列表为空，就说明所有分区都已经成功响应
+      if (txnMetadata.topicPartitions.isEmpty)
+        forceComplete()
+      else false
+    }
+  }
+
+  override def onExpiration(): Unit = {
+    // this should never happen
+    throw new IllegalStateException(s"Delayed write txn marker operation for metadata $txnMetadata has timed out, this should never happen.")
+  }
+
+  // TODO: if we will always return NONE upon completion, we can remove the error code in the param
+  override def onComplete(): Unit = completionCallback(Errors.NONE)
+}
+```
 
 
-这里要额外说明下，Kafka 的事务消息还包括提交consumer的消费位置。
 
-发送consumer 消费位置的提交消息，本质也是发送消息到 __consumer_offset topic。
+DelayedTxnMarker 是在 TransactionMarkerChannelManager 的 addTxnMarkersToSend 方法中实例化的，它的 completionCallback 参数，就是定义在 addTxnMarkersToSend 方法里面。
 
-ProducerIdManager类负责生成 自增号 producer_id，它每次会从zookeeper批量的拉取 id 号，提高了效率。数据保存在zookeeper的 节点 /latest_producer_id_block，以json的格式保存。
-
-每个 producer_id 都有一个 producerEpoch。producerEpoch是有范围的，当producerEpoch逐渐递增，超过Short.Max的时候，那么就会生成新的producer_id。
-
+```scala
+def addTxnMarkersToSend(transactionalId: String,
+                        coordinatorEpoch: Int,
+                        txnResult: TransactionResult,
+                        txnMetadata: TransactionMetadata,
+                        newMetadata: TxnTransitMetadata): Unit = {
+  // 定义延迟任务的回调函数
+  def appendToLogCallback(error: Errors): Unit = {
+    // 检查错误
+    error match {
+      case Errors.NONE =>
+        // 检查状态
+        txnStateManager.getTransactionState(transactionalId) match {
+          case Right(Some(epochAndMetadata)) =>
+            if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {
+               // 持久化事务成功消息TxnLogAppend，写入到事务 topic
+              tryAppendToLog(TxnLogAppend(transactionalId, coordinatorEpoch, txnMetadata, newMetadata))
+            }
+        }
+    }
+  }
+      
+  // 实例化延迟任务
+  val delayedTxnMarker = new DelayedTxnMarker(txnMetadata, appendToLogCallback, txnStateManager.stateReadLock)
+  // 等待执行
+  txnMarkerPurgatory.tryCompleteElseWatch(delayedTxnMarker, Seq(transactionalId))
+  // 将请求放进队列里
+  addTxnMarkersToBrokerQueue(transactionalId, txnMetadata.producerId, txnMetadata.producerEpoch, txnResult, coordinatorEpoch, txnMetadata.topicPartitions.toSet)
+}
+```
