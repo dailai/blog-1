@@ -1,0 +1,2 @@
+HBase 当region 切分时， 会造成写入出现错误， 异常为 不存在的 Column Family
+

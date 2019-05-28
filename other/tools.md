@@ -12,3 +12,7 @@ pdf阅读器 ：sumatra
 
 uml 画图语言：plantuml
 
+代码质量管理平台：SonarQube
+
+质量检查插件：PMD，Findbugs，CheckStyle，p3c
+
