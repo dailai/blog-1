@@ -418,3 +418,27 @@ class RecordWriter<ImmutableBytesWritable, V>() {
 ```
 
 RecordWriter在写入数据时，如果遇到一条 row key 和 value 都为 null 的数据时，这条数据有着特殊的含义，表示writer应该立即 flush。在每次创建RecordWriter时，它会根据此时row key 的值，找到所属 Region 的服务器地址，然后尽量在这台服务器上，创建新的HFile文件。
+
+
+
+## 加载 HFile
+
+上面生成完 HFile 之后，我们还需要调用第二条命令完成加载 HFile 过程。首先它会遍历目录下的每个 HFile ，
+
+1. 首先检查 HFile 里面数据的 family 在 Hbase 表里是否存在。
+2. 获取HFile 数据的起始 row key，找到 Hbase 里对应的 Region，然后比较两者之间的 row key 范围
+3. 如果 HFile 的 row key 范围比 Region 大，也就是 HFile 的结束 row key 比这个 Region 的 结束 row Key 大，那么需要将这个 HFile 切割成两份，切割值为 Region 的结束 row key。
+4. 继续从上一部切割生成的两份HFile中，选择第二份 HFile（它的row key 大于 Regioin 的结束 row key），将它继续按照第二步切割，直到所有HFile的 row key范围都能在一个Region里。
+
+在割切HFile的过程中，还会检查 column family 对应的 HFile数目。 如果一个 column family 对应的 HFile 数目过多，默认数目为32，程序就会报错。但是这个值通过指定 hbase.mapreduce.bulkload.max.hfiles.perRegion.perFamily，来设置更大的值。
+
+当完成了HFile的切割后，最后的导入动作是发送 BulkLoadHFileRequest 请求给 Hbase 服务端。Hbase 服务端会处理该请求，完成HFile加载。
+
+
+
+## 其他
+
+至于我为什么要研究 Hbase Bulkload 的原理，是因为在使用过程中发生了错误。虽然经过排查，后来发现和Hbase Bulkload 的原理没什么关系，不过在此也提一下，希望能帮到遇到类似情况的人。首先说下我使用的Hadoop 版本是 CDH 5.12.2，我在使用Hbase Bulkload 的时候，程序总是报 Out Of Memory 的错误。原因是 Hbase Bulkload 底层用的MapReduce的模式为本地模式，而不是集群 Yarn 的方式跑。虽然在 CDH 的 Yarn 配置页面里，设置了mapreduce.framework.name 为 yarn，但是仍然没用。后来发现 Yarn 组件下有个 Gateway 的角色实例，没有在这台主机下安装，所以在使用 Hbase Bulkload 时，没有读取到 Yarn 的配置。解决方法是在 CDH 界面添加  Gateway 实例就好了。
+
+
+  
