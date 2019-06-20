@@ -96,13 +96,55 @@ override def visitSingleStatement(ctx: SingleStatementContext): LogicalPlan = wi
 
 ### query 节点
 
-query 节点也在 AstBuilder 定义了访问自身的方法。注意到 query 的定义，它有
+query 节点也定义了访问自身的方法。注意到 query 语法的定义，它有 ctes 语法和 queryNoWith 语法两部分组成。 ctes  语法是来匹配 WITH 语句的。
+
+```scala
+override def visitQuery(ctx: QueryContext): LogicalPlan = withOrigin(ctx) {
+  // 首先遍历 queryNoWith 子节点 
+  val query = plan(ctx.queryNoWith)
+
+  // 如果由 ctes 子节点，则遍历它并且生成 With 节点，将queryNoWIth的结果当作With的子节点
+  query.optional(ctx.ctes) {
+    // 
+    val ctes = ctx.ctes.namedQuery.asScala.map { nCtx =>
+      val namedQuery = visitNamedQuery(nCtx)
+      (namedQuery.alias, namedQuery)
+    }
+    // Check for duplicate names.
+    checkDuplicateKeys(ctes, ctx)
+    With(query, ctes)
+  }
+}
+```
+
+这儿可以看到有个LogicalPlan 的子类 With，它的子节点是 queryNoWith 的结果，并且还包含了 WITH 语句的表达式。因为 WITH 语句用得不多，这里不再详细介绍。
 
 
 
+ ### queryNoWith 节点
+
+我们使用的 sql 匹配了 queryNoWith 语法的 singleInsertQuery 规则，在 AstBuilder 类也定义了访问此节点的方法。
+
+```scala
+override def visitSingleInsertQuery(
+    ctx: SingleInsertQueryContext): LogicalPlan = withOrigin(ctx) {
+  plan(ctx.queryTerm).
+    // Add organization statements.
+    optionalMap(ctx.queryOrganization)(withQueryResultClauses).
+    // Add insert.
+    optionalMap(ctx.insertInto())(withInsertInto)
+}
+```
 
 
 
+singleInsertQuery 规则有三部分组成
+
+* insertInto 规则，匹配 INSERT INTO 语句
+* queryTerm 规则，匹配 SELECT 语句
+* queryOrganization 规则，匹配 ORDER BY，DISTRIBUTE BY，CLUSTER BY，SORT BY 或 LIMIT 语句
+
+当访问此节点时，按照 queryTerm ，queryOrganization，insertInto 顺序遍历。
 
 
 
