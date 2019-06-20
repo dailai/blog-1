@@ -1,5 +1,139 @@
 # spark sql 解析 #
 
+
+
+## 解析操作
+
+Spark Sql 使用 antrl 工具来解析 sql，
+
+
+
+### 查看 sql 语法树
+
+sql 的语法定义文件的位置是 sql/catalyst/src/main/antlr4/org/apache/spark/sql/catalyst/parser/SqlBase.g4。我们可以首先在 idea 编辑器安装 antrl 插件，然后打开 spark 项目并找到 sql 的语法文件。
+
+打开文件后，我们看到 sql 语法的入口是 singleStatement 规则。然后右键点击 singleStatement 规则，选择 Test Rule singleStatement 这个选项。然后在底部的左边编辑框里，输入要解析的 sql 语句。注意到 sql 语句中，除了字符串，都必须要大小。运行结果如下：
+
+
+
+
+
+### 查看 LogicalPlan 树
+
+使用下面的 scala 代码
+
+```scala
+import org.apache.spark.sql.SparkSession
+
+object SparkSqlTutorial {
+
+  def main(args: Array[String]):Unit = {
+    val spark = SparkSession.builder().master("local").appName("SparkSqlParser").getOrCreate()
+    val sql = "SELECT name, price FROM fruit WHERE name = 'apple'"
+    val logical = spark.sessionState.sqlParser.parsePlan(sql)
+    println(logical)
+  }
+}
+```
+
+logical 变量就是整个 LogicalPlan 树的根节点，我们在 println 那一行加上断点调试，就可以很清楚的看到解析后的结果。
+
+
+
+
+
+## 生成 LogicalPlan 原理
+
+因为 spark sql 是使用 antrl 工具来解析 sql 的，所以读者需要先了解 antrl 的基本用法，可以参考此篇博客。
+
+经过 antrl 生成了语法树之后，我们来看看 spark sql 是如何来遍历这颗树的，遍历语法树的逻辑定义在 AstBuilder 类。接下来我们通过几个简单的例子，来阐述解析的原理，也附带讲讲常见的 LogicalPlan 和 Expression 种类。
+
+## AstBuilder 
+
+AstBuilder 使用了 visitor 模式来遍历语法树，它还复写了遍历的默认方法。
+
+```scala
+class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging {
+  override def visitChildren(node: RuleNode): AnyRef = {
+    // 如果该节点只有一个子节点，那么继续遍历子节点
+    // 否则返回null
+    if (node.getChildCount == 1) {
+      node.getChild(0).accept(this)
+    } else {
+      null
+    }
+  }
+}
+```
+
+
+
+## 示例一
+
+```sql
+SELECT NAME, PRICE FROM FRUIT WHERE NAME = 'apple'
+```
+
+生成的语法树
+
+
+
+我们从上面依次向下，来看看每个节点是如何被解析的。
+
+### singleStatement 节点
+
+首先是 singleStatement 节点，它在 AstBuilder 定义了访问自身的方法。
+
+```scala
+override def visitSingleStatement(ctx: SingleStatementContext): LogicalPlan = withOrigin(ctx) {
+  visit(ctx.statement).asInstanceOf[LogicalPlan]
+}
+```
+
+可以看到它只是继续遍历了statement 子节点，注意到 statement 语法有四种规则。而这条语句匹配了 statement 语法的 statementDefault 格式，所以这里的子节点实际是 statementDefault 节点。statementDefault节点有一个 query 子节点。
+
+
+
+### query 节点
+
+query 节点也在 AstBuilder 定义了访问自身的方法。注意到 query 的定义，它有
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## parser相关类 ##
 
 接口 ParserInterface
@@ -167,6 +301,24 @@ vistiCreateDatabase直接返回了CreateDatabaseCommand实例。
 整个sql解析的原理，是使用了antrl4这个库，定义了sql的匹配标准。然后使用Visitor模式。自定义遍历sql语句的节点，生成相应的RunnableCommand。
 
 
+
+visitQuerySpecification 方法很重要，它用来解析最常见的 SELECT 语句。
+
+
+
+
+
+
+
+
+
+
+
+## Expression 解析
+
+```sql
+SELECT name, price-1, 'favorite' FROM test.fuit WHERE price > 2 AND name = 'apple';
+```
 
 
 
