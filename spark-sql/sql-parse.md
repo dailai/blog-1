@@ -1,20 +1,28 @@
-# spark sql 解析 #
+# Spark Sql 解析原理 #
 
 
 
-## 解析操作
+## 前言
 
-Spark Sql 使用 antrl 工具来解析 sql，
+Spark Sql 支持用户编写 sql 语句来完成复杂的操作，并且还会对 sql 语句自动优化。Spark Sql 接收到用户的 sql 语句，会先按照 sql 的语法规则，来将 sql 语句拆分成语法词，然后用树的方式来组织这些词。然后用特定的访问规则，来将这课语法树，编译成Spark Sql 的数据结构，最后才会生成 Spark 代码运行。
 
-
-
-### 查看 sql 语法树
-
-sql 的语法定义文件的位置是 sql/catalyst/src/main/antlr4/org/apache/spark/sql/catalyst/parser/SqlBase.g4。我们可以首先在 idea 编辑器安装 antrl 插件，然后打开 spark 项目并找到 sql 的语法文件。
-
-打开文件后，我们看到 sql 语法的入口是 singleStatement 规则。然后右键点击 singleStatement 规则，选择 Test Rule singleStatement 这个选项。然后在底部的左边编辑框里，输入要解析的 sql 语句。注意到 sql 语句中，除了字符串，都必须要大小。运行结果如下：
+这篇博客讲述Spark Sql 时如何将 sql 语句来编译成 Spark Sql 的内部结构。因为这部分的内容涉及到 antrl4 的使用，需要先了解 antrl 的基本用法，如果不清楚，建议参考此篇博客。
 
 
+
+## 查看解析过程
+
+### 查看  sql  语法树
+
+Spark Sql 利用 anrl4 来完成语法分词和生成语法树的。sql 语法的 antrl4 定义文件的位置是 sql/catalyst/src/main/antlr4/org/apache/spark/sql/catalyst/parser/SqlBase.g4。我们可以首先在 idea 编辑器安装 antrl 插件，然后打开 spark 项目并找到 sql 的语法文件。
+
+打开文件后，我们看到 sql 语法的入口是 singleStatement 规则。然后右键点击 singleStatement 规则，选择 Test Rule singleStatement 这个选项。然后在底部的左边编辑框里，输入要解析的 sql 语句。注意 sql 语句，除了字符串，都必须要大写。这里使用一个简单的 sql 语句为例，
+
+```sql
+SELECT NAME, PRICE FROM FRUIT WHERE NAME = 'apple'
+```
+
+生成的语法树如下：
 
 
 
@@ -40,17 +48,19 @@ logical 变量就是整个 LogicalPlan 树的根节点，我们在 println 那�
 
 
 
+## 编译结果
+
+Spark Sql 在遍历语法树后，生成的内部数据结构也是一棵树只不过这颗树的节点类型是 LogicalPlan 的子类。语法树中不同的节点对应于 LogicalPlan 的不同子类。这些 LogicalPlan 表示 sql 的一些重要操作，它可能会会包含多个 Expression。Expression表示一些数值对象或数值表达式， 也是根据根据语法树中的节点生成的。
+
+比如 where 过滤语句 由 Filter 类表示， where 过滤语句的表达式 BooleanExpression。LogicalPlan 会包含多个 Expression  ，比如 Filter 会包含多个BooleanExpression 。
 
 
-## 生成 LogicalPlan 原理
 
-因为 spark sql 是使用 antrl 工具来解析 sql 的，所以读者需要先了解 antrl 的基本用法，可以参考此篇博客。
 
-经过 antrl 生成了语法树之后，我们来看看 spark sql 是如何来遍历这颗树的，遍历语法树的逻辑定义在 AstBuilder 类。接下来我们通过几个简单的例子，来阐述解析的原理，也附带讲讲常见的 LogicalPlan 和 Expression 种类。
 
 ## AstBuilder 
 
-AstBuilder 使用了 visitor 模式来遍历语法树，它还复写了遍历的默认方法。首先来看看两个很重要的方法，typedVisit 提供了遍历节点，并且结果强制转换。visitChildren 复写了父类的方法，当遍历非叶子节点时，如果该节点只有一个子节点，那么继续遍历，否则就停止遍历。
+antrl4 会自动生成语法树，剩下的工作就需要自行编写遍历的程序。Spark Sql 遍历语法树的逻辑定义在 AstBuilder 类。AstBuilder 使用了 visitor 模式来遍历语法树，它还复写了遍历的默认方法。首先来看看两个很重要的方法，typedVisit 提供了遍历节点，并且结果强制转换。visitChildren 复写了父类的方法，当遍历非叶子节点时，如果该节点只有一个子节点，那么继续遍历，否则就停止遍历。
 
 ```scala
 class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging {
@@ -68,26 +78,28 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       null
     }
   }
+
+  // 访问该语法树节点，并且将结果类型转换为LogicalPlan
+  protected def plan(tree: ParserRuleContext): LogicalPlan = typedVisit(tree)
+    
+  // 访问该语法树节点，并且将结果类型转换为Expression
+  protected def expression(ctx: ParserRuleContext): Expression = typedVisit(ctx)    
 }
 ```
 
 
 
-## 示例一
+接下来我们以 antrl4 文件为主，按照从上到下的顺序来查看语法树，是如何生成 LogicalPlan 树。读者可以自行编写 sql 语句生成语法树，然后结合下面的程序一起看。这里使用上述示例的 sql 为例
 
 ```sql
 SELECT NAME, PRICE FROM FRUIT WHERE NAME = 'apple'
 ```
 
-生成的语法树
 
 
+### singleStatement 语法规则
 
-我们从上面依次向下，来看看每个节点是如何被解析的。
-
-### singleStatement 节点
-
-首先是 singleStatement 节点，它在 AstBuilder 定义了访问自身的方法。
+首先是 singleStatement 规则，它在 AstBuilder 定义了访问自身的方法。
 
 ```scala
 override def visitSingleStatement(ctx: SingleStatementContext): LogicalPlan = withOrigin(ctx) {
@@ -95,13 +107,13 @@ override def visitSingleStatement(ctx: SingleStatementContext): LogicalPlan = wi
 }
 ```
 
-可以看到它只是继续遍历了statement 子节点，注意到 statement 语法有四种规则。而这条语句匹配了 statement 语法的 statementDefault 格式，所以这里的子节点实际是 statementDefault 节点。statementDefault节点有一个 query 子节点。
+它只是继续遍历了statement 子规则，注意到 statement 规则有多种格式，支持 USE，CREATE 等语句。而我们使用的 sql 示例语句，匹配了 statement 规则的 statementDefault 格式。statementDefault 语法规则只有一个 query 子规则，它没有定义访问方法，所以它使用了 AstBuilder 的默认访问方法，即访问 query 子节点。
 
 
 
-### query 节点
+### query 语法规则
 
-query 节点也定义了访问自身的方法。注意到 query 语法的定义，它有 ctes 语法和 queryNoWith 语法两部分组成。 ctes  语法是来匹配 WITH 语句的。
+query 节点定义了访问自身的方法。注意到 query 语法规则，它有 ctes 和 queryNoWith 两个语法规则组成。 ctes  语法是来匹配 WITH 语句的。
 
 ```scala
 override def visitQuery(ctx: QueryContext): LogicalPlan = withOrigin(ctx) {
@@ -127,7 +139,7 @@ override def visitQuery(ctx: QueryContext): LogicalPlan = withOrigin(ctx) {
 
 
 
- ### queryNoWith 节点
+ ### queryNoWith 语法规则
 
 我们使用的 sql 匹配了 queryNoWith 语法的 singleInsertQuery 规则，在 AstBuilder 类也定义了访问此节点的方法。
 
@@ -150,7 +162,7 @@ singleInsertQuery 规则有三部分组成
 * queryTerm 规则，匹配 SELECT 语句
 * queryOrganization 规则，匹配 ORDER BY，DISTRIBUTE BY，CLUSTER BY，SORT BY 或 LIMIT 语句
 
-当访问此节点时，按照 queryTerm ，queryOrganization，insertInto 顺序遍历。
+当访问此节点时，依次按照 queryTerm ，queryOrganization，insertInto 顺序遍历。
 
 
 
@@ -158,62 +170,21 @@ singleInsertQuery 规则有三部分组成
 
 queryTerm 匹配了 UNION， INTERSECT，EXCEPT，MINUS语句， 这些 语句是用来将两个查询结果合并成一个，这些查询结果的列数目和类型都必须相同。queryTerm 有两种规则，一种是需要合并查询结果的，另一种是不需要合并。
 
-需要合并查询结果
+需要合并两个查询结果 left 和 right
 
-```scala
-override def visitSetOperation(ctx: SetOperationContext): LogicalPlan = withOrigin(ctx) {
-  // 遍历第一个查询结果
-  val left = plan(ctx.left)
-  // 遍历第一个查询结果
-  val right = plan(ctx.right)
-  // 查询UNION 类型是 ALL 还是 DISTINCT 类型
-  val all = Option(ctx.setQuantifier()).exists(_.ALL != null)
- // 根据 UNION 类型来实例化不同的节点
-  ctx.operator.getType match {
-      
-    // UNION ALL
-    case SqlBaseParser.UNION if all =>
-      Union(left, right)
-    // UNION DISTINCT 或 UNION（UNION默认是DISTINCT类型）
-    case SqlBaseParser.UNION =>
-      Distinct(Union(left, right))
-      
-    // INTERSECT ALL
-    case SqlBaseParser.INTERSECT if all =>
-      throw new ParseException("INTERSECT ALL is not supported.", ctx)
-    // INTERSECT DISTINCT或 INTERSECT
-    case SqlBaseParser.INTERSECT =>
-      Intersect(left, right)
-      
-    // EXCEPT ALL
-    case SqlBaseParser.EXCEPT if all =>
-      throw new ParseException("EXCEPT ALL is not supported.", ctx)
-    // EXCEPT DISTINCT或 EXCEPT
-    case SqlBaseParser.EXCEPT =>
-      Except(left, right)
-      
-    // MINUS ALL
-    case SqlBaseParser.SETMINUS if all =>
-      throw new ParseException("MINUS ALL is not supported.", ctx)
-    // MINUS DISTINCT或 MINUS
-    case SqlBaseParser.SETMINUS =>
-      Except(left, right)
-  }
-}
-```
-
-这儿可以看到 LogicalPlan 的子类
-
-* UNION，两个查询结果相加，支持去重操作
-* INTERSECT，取两个查询结果相交的集合
-* EXCEPT，两个查询结果相加，但是去掉相交的集合
-* MINUS，查找第一个查询结果中，不在第二个查询结果的数据
+| sql 语句                       | 返回类型                    | 含义                                 |
+| ------------------------------ | --------------------------- | ------------------------------------ |
+| UNION ALL                      | Union(left, right)          | 两个查询结果相加                     |
+| UNION DISTINCT 或 UNION 语句   | Distinct(Union(lef, right)) | 两个查询结果相加并且去重             |
+| INTERSECT DISTINCT或 INTERSECT | Intersect(left, right)      | 两个查询结果的相交集合               |
+| EXCEPT DISTINCT或 EXCEPT       | Except(left, right)         | 两个查询结果相加，但是去掉相交的部分 |
+| MINUS DISTINCT或 MINUS         | Except(left, right)         | 两个查询结果相加，但是去掉相交的部分 |
 
 
 
 不需要合并查询结果
 
-因为这种情况只有一个子节点 queryPrimary，而且也并没有定义这种情况的访问方法。所以它会使用AstBuilder的默认访问方式，直接方法子节点queryPrimary。
+因为这种情况只有一个子规则 queryPrimary，而且也并没有定义这种情况的访问方法。所以它会使用AstBuilder的默认访问方式，直接方法子节点queryPrimary。
 
 
 
