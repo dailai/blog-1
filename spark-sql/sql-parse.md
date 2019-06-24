@@ -89,6 +89,8 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
 
 
 
+## 遍历语法规则
+
 接下来我们以 antrl4 文件为主，按照从上到下的顺序来查看语法树，是如何生成 LogicalPlan 树。读者可以自行编写 sql 语句生成语法树，然后结合下面的程序一起看。这里使用上述示例的 sql 为例
 
 ```sql
@@ -135,17 +137,18 @@ override def visitQuery(ctx: QueryContext): LogicalPlan = withOrigin(ctx) {
 }
 ```
 
-这儿可以看到有个LogicalPlan 的子类 With，它的子节点是 queryNoWith 的结果，并且还包含了 WITH 语句的表达式。因为 WITH 语句用得不多，这里不再详细介绍。
+这里的 With 类是 LogicalPlan 的子类，它对应 WITH 语句。因为 WITH 语句用得不多，这里不再详细介绍。
 
 
 
  ### queryNoWith 语法规则
 
-我们使用的 sql 匹配了 queryNoWith 语法的 singleInsertQuery 规则，在 AstBuilder 类也定义了访问此节点的方法。
+我们使用的 示例 sql 匹配了 queryNoWith 语法的 singleInsertQuery 格式，在 AstBuilder 类也定义了访问此格式的方法。
 
 ```scala
 override def visitSingleInsertQuery(
     ctx: SingleInsertQueryContext): LogicalPlan = withOrigin(ctx) {
+  // 解析子节点 queryTerm，生成LogicalPlan子类
   plan(ctx.queryTerm).
     // Add organization statements.
     optionalMap(ctx.queryOrganization)(withQueryResultClauses).
@@ -166,11 +169,13 @@ singleInsertQuery 规则有三部分组成
 
 
 
-### queryTerm 节点
+### queryTerm 语法规则
 
-queryTerm 匹配了 UNION， INTERSECT，EXCEPT，MINUS语句， 这些 语句是用来将两个查询结果合并成一个，这些查询结果的列数目和类型都必须相同。queryTerm 有两种规则，一种是需要合并查询结果的，另一种是不需要合并。
+queryTerm 规则有两种格式，一种是需要合并查询结果的，另一种是不需要合并。
 
-需要合并两个查询结果 left 和 right
+需要合并查询结果的语句，匹配了 UNION， INTERSECT，EXCEPT 或 MINUS语句， 这些被合并的查询结果的列数目和类型都必须相同。
+
+假设需要合并两个查询结果分别是 left 和 right
 
 | sql 语句                       | 返回类型                    | 含义                                 |
 | ------------------------------ | --------------------------- | ------------------------------------ |
@@ -182,24 +187,22 @@ queryTerm 匹配了 UNION， INTERSECT，EXCEPT，MINUS语句， 这些 语句�
 
 
 
-不需要合并查询结果
-
-因为这种情况只有一个子规则 queryPrimary，而且也并没有定义这种情况的访问方法。所以它会使用AstBuilder的默认访问方式，直接方法子节点queryPrimary。
+不需要合并查询结果的语句，是一个单表查询语句。这种情况只有一个子规则 queryPrimary，而且也并没有定义这种情况的访问方法。所以它会使用AstBuilder的默认访问方式，直接访问子规则 queryPrimary。
 
 
 
-### queryPrimary 节点
+### queryPrimary 语法规则
 
-queryPrimary 规则也有多种情况，分别对应了支持表名，子查询等
+queryPrimary 规则也有多种格式，分别对应了以下情况
 
-* queryPrimaryDefault 规则，普通的 SELECT 语句
-* table 规则，表名
-* inlineTableDefault1 规则，支持使用VALUES 语句创建表
-* subquery 规则，子查询
+* queryPrimaryDefault 格式，普通的 SELECT 语句
+* table 格式，表名
+* inlineTableDefault1 格式，支持使用VALUES 语句创建表
+* subquery 格式，子查询
 
 
 
-解析 table 规则
+解析 table 格式，会生成 UnresolvedRelation 类，它表示表名
 
 ```scala
 override def visitTable(ctx: TableContext): LogicalPlan = withOrigin(ctx) {
@@ -207,11 +210,9 @@ override def visitTable(ctx: TableContext): LogicalPlan = withOrigin(ctx) {
 }
 ```
 
-可以看到一个新的LogicalPlan子类 UnresolvedRelation，它表示表名
 
 
-
-解析 subquery 规则，也只是继续遍历子节点 queryNoWith。
+解析 subquery 格式，也只是继续遍历子规则 queryNoWith。
 
 ```scala
 override def visitSubquery(ctx: SubqueryContext): LogicalPlan = withOrigin(ctx) {
@@ -221,7 +222,7 @@ override def visitSubquery(ctx: SubqueryContext): LogicalPlan = withOrigin(ctx) 
 
 
 
-解析 inlineTableDefault1 规则，这个用法不是很常见。举个简单的例子，
+解析 inlineTableDefault1 格式，这个用法不是很常见。举个简单的例子，
 
 ```sql
 SELECT * FROM (VALUES(1, 'apple'), (2, 'orange')) AS FRUIT(ID, NAME)
@@ -249,7 +250,7 @@ override def visitInlineTable(ctx: InlineTableContext): LogicalPlan = withOrigin
   }
   // 生成 UnresolvedInlineTable 实例
   val table = UnresolvedInlineTable(aliases, rows)
-  // 这里没弄明白，为什么有identifier属性，需要再去查看下antrl4文档
+  // 这里没弄明白，为什么有identifier属性，需要再去查看下antrl4文档，因为antrl4文件的内容被改了
   // 如果指定了表名，那么就生成 SubqueryAlias 实例
   table.optionalMap(ctx.identifier)(aliasPlan)
 }
@@ -267,16 +268,14 @@ private def aliasPlan(alias: ParserRuleContext, plan: LogicalPlan): LogicalPlan 
 
 
 
-### querySpecification 节点
+### querySpecification 语法规则
 
-querySpecification 规则匹配了SELECT 语句，它几乎是 sql 的核心了。querySpecification 规则有两种，一种是普通的SELECT 操作，另一种是TRANSFORM 类型，它支持执行外部脚本来处理数据。
-
-TRANSFORM 原理和使用待续研究，参考类ScriptTransformationExec。针对于这种语句，会生成 ScriptTransformation 实例。
+querySpecification 规则匹配了基础的 SELECT 语句，它几乎是 sql 的核心了。querySpecification 规则有两种格式，一种是普通的SELECT 操作，另一种是TRANSFORM 类型，它支持执行外部脚本来处理数据。
 
 ```scala
 override def visitQuerySpecification(
     ctx: QuerySpecificationContext): LogicalPlan = withOrigin(ctx) {
-  // 如果有FROM语句,那么调用visitFromClause方法解析
+  // 如果有FROM语句,那么先调用visitFromClause方法解析
   // 否则返回OneRowRelation实例，表示没有FROM语句的情况
   val from = OneRowRelation.optional(ctx.fromClause) {
     visitFromClause(ctx.fromClause)
@@ -286,7 +285,7 @@ override def visitQuerySpecification(
 }
 
 override def visitFromClause(ctx: FromClauseContext): LogicalPlan = withOrigin(ctx) {
-  // 如果 FROM 后面接了多张表，那么认为这些表都是 INNER JOIN
+  // 如果 FROM 后面接了多张表，那么默认认为这些表都是 INNER JOIN
   val from = ctx.relation.asScala.foldLeft(null: LogicalPlan) { (left, relation) =>
     // 遍历relation的子节点relationPrimary
     val right = plan(relation.relationPrimary)
@@ -303,8 +302,6 @@ override def visitTable(ctx: TableContext): LogicalPlan = withOrigin(ctx) {
   UnresolvedRelation(visitTableIdentifier(ctx.tableIdentifier))
 }
 ```
-
-从遍历 From 语句的逻辑，可以看到 UnresolvedRelation 节点表示 sql 语句中的表名。
 
 
 
@@ -331,7 +328,7 @@ private def withQuerySpecification(
   val specType = Option(kind).map(_.getType).getOrElse(SqlBaseParser.SELECT)
   specType match {
     case SqlBaseParser.MAP | SqlBaseParser.REDUCE | SqlBaseParser.TRANSFORM =>
-      // Transform 类型
+      // Transform 类型，会生成 ScriptTransformation 实例。
       .......
     case SqlBaseParser.SELECT =>
       // 普通 select 类型
@@ -387,7 +384,7 @@ private def withQuerySpecification(
 }
 ```
 
-从上面可以看到多个LogicalPlan的种类：
+从上面可以看到生成了多个LogicalPlan的种类：
 
 * Filter，表示Where语句或者Having语句
 * GroupingSets，表示GROUPING SETS 语句
@@ -398,31 +395,17 @@ private def withQuerySpecification(
 
 
 
-我们现在回顾下之前的 sql 语句，
-
-```sql
-SELECT NAME, PRICE FROM FRUIT WHERE NAME = 'apple'
-```
-
-按照上述的原理，它被解析成了
-
-```shell
-'Project ['NAME, 'PRICE]
-+- 'Filter ('NAME = apple)
-   +- 'UnresolvedRelation `FRUIT`
-```
-
-Project 是根节点，它有一个子节点Filter。Filter也有一个子节点 UnresolvedRelation。
 
 
+## 示例
 
-## 实例二
+### 示例一
+
+执行 sql 语句：
 
 ```sql
 SELECT NAME, PRICE-1 AS DISCOUNT, 'favorite' FROM fruit WHERE PRICE > 2 AND NAME = 'apple'
 ```
-
-
 
 解析结果如下：
 
@@ -432,7 +415,9 @@ SELECT NAME, PRICE-1 AS DISCOUNT, 'favorite' FROM fruit WHERE PRICE > 2 AND NAME
    +- 'UnresolvedRelation `fruit`
 ```
 
-## 实例三
+### 示例二
+
+执行 sql 语句：
 
 ```sql
 SELECT FRUIT_ID, COUNT(*) FROM ORDERS WHERE CONSUMER = 'John' GROUP BY FRUIT_ID
@@ -446,7 +431,9 @@ SELECT FRUIT_ID, COUNT(*) FROM ORDERS WHERE CONSUMER = 'John' GROUP BY FRUIT_ID
    +- 'UnresolvedRelation `ORDERS`
 ```
 
-## 实例四
+### 示例三
+
+执行 sql 语句：
 
 ```sql
 SELECT FRUIT.NAME, ORDERS.CONSUMER, ORDERS.CREATE_TIME FROM FRUIT INNER JOIN ORDERS ON ORDERS.FUIRT_ID = FRUIT.ID WHERE CONSUMER = 'John'
@@ -466,7 +453,7 @@ SELECT FRUIT.NAME, ORDERS.CONSUMER, ORDERS.CREATE_TIME FROM FRUIT INNER JOIN ORD
 
 ## Expression 解析
 
-上面介绍了 LogicalPlan 的生成，这些 LogicalPlan可能包含了多个表达式，而这些表达式在Spark Sql中由 Expression 类表示，不同种类的表达式对应着不同的 Expression 子类。
+上面介绍了 LogicalPlan 的生成，这些 LogicalPlan 可能包含了多个表达式。这些表达式由 Expression 的子类表示，也是遍历语法树生成的。
 
 我们以下面的 sql 语句为例，
 
@@ -478,25 +465,9 @@ SELECT NAME, PRICE-1 AS DISCOUNT, 'favorite' FROM fruit WHERE PRICE > 2 AND NAME
 
 
 
-当解析到 SELECT 选择的列，这些表达式会认为是 namedExpression。
+当解析到 namedExpression 语法规则时，会生成表达式，保存到 Project 实例里。
 
-```shell
-namedExpression
-    : expression (AS? (identifier | identifierList))?
-    ;
-
-namedExpressionSeq
-    : namedExpression (',' namedExpression)*
-    ;
-    
-namedExpression
-    : expression (AS? (identifier | identifierList))?
-    ;
-```
-
-
-
-
+visitNamedExpression 方法定义了访问原理，会返回 Alias，MultiAlias 等子类。
 
 ```scala
 override def visitNamedExpression(ctx: NamedExpressionContext): Expression = withOrigin(ctx) {
@@ -516,11 +487,9 @@ override def visitNamedExpression(ctx: NamedExpressionContext): Expression = wit
 
 
 
-WHERE后面的过滤表达式，会匹配为 booleanExpression 规则。而 booleanExpression 规则也分为多种
+当解析到 WHERE 后面的过滤表达式，会匹配为 booleanExpression 规则。而 booleanExpression 规则主要有两类格式，一种是包含逻辑运算符的，另一种是基础的表达式。
 
-
-
-一类是组合表达式，包含 AND 或 OR 关键字。这类语句的解析稍微复杂，因为spark sql 会做一部分的优化。我们知道antrl4 是匹配语法规则时，它是用左递归的方式匹配。下面以 booleanExpression 规则为例，
+如果是第一种格式，比如包含 AND 或 OR 关键字。这类语句的解析稍微复杂，因为spark sql 会做一部分的优化。我们知道antrl4 是匹配语法规则时，它是用左递归的方式匹配。下面以 booleanExpression 规则为例，
 
 ```shell
 booleanExpression
@@ -542,15 +511,34 @@ NAME = 'pear' AND NAME = 'apple' AND NAME = 'orange' AND NAME = 'banana' AND NAM
 
 
 
-很明显这颗树左右不对称，而且左右子树的深度相差很大。这样遍历数的时候，容易造成栈溢出。spark sql 会尽可能的平衡这棵树，比如上面连续的 AND 表达式，会被优化成
+很明显这颗树左右不对称，而且左子树的深度很大。这样递归遍历树的时候，容易造成栈溢出。spark sql 针对这种情况，会尽可能的平衡这棵树，比如上面连续的 AND 表达式，会被优化成如下图所示。不过 spark sql 只能优化，从跟节点开始，连续为AND 或者连续为OR的这一段路径。具体程序就不介绍了，定义在 visitLogicalBinary 方法中。
 
 
 
-不过它只能优化，从跟节点连续为AND 或者连续为OR的这一段路径。具体程序就不介绍了，定义在 visitLogicalBinary 方法中。
 
 
 
-继续看遍历子节点 primaryExpression 的原理，primaryExpression 有多种规则，能够匹配四则运算，大小等于的比较操作，还有异或预算。对于这些运算的规则，访问的原理很简单，只是生成了对应运算符的实例。比如等于操作符生成了 EqualTo 实例，加法运算符生成了 Add 实例。
+
+
+
+如果是基础表达式，则对应于 predicated 格式。predicated格式的 predicate 规则，用来匹配 IN，BETWEEN AND 等语句。
+
+```scala
+override def visitPredicated(ctx: PredicatedContext): Expression = withOrigin(ctx) {
+  // 遍历子规则 valueExpression
+  val e = expression(ctx.valueExpression)
+  if (ctx.predicate != null) {
+    // 如果满足 predicate 格式的语句，则调用 withPredicate 方法生成Expression实例
+    withPredicate(e, ctx.predicate)
+  } else {
+    e
+  }
+}
+```
+
+
+
+继续看子规则 valueExpression 的原理，valueExpression 有多种规则，能够匹配四则运算，大小等于的比较操作，还有异或预算。对于这些运算的规则，访问的原理很简单，只是生成了对应运算符的实例。比如等于操作符生成了 EqualTo 实例，加法运算符生成了 Add 实例。
 
 
 
@@ -563,4 +551,28 @@ functionCall 规则负责匹配函数，会返回 UnresolvedFunction 类
 star 规则负责匹配 * 号，用来表示选择所有列，会返回 UnresolvedStar 类
 
 constantDefault 规则负责匹配常量，返回 Literal 类
+
+
+
+
+
+
+
+
+
+我们再来现在回顾下之前的 sql 语句，
+
+```sql
+SELECT NAME, PRICE FROM FRUIT WHERE NAME = 'apple'
+```
+
+按照上述的原理，它被解析成了
+
+```shell
+'Project ['NAME, 'PRICE]
++- 'Filter ('NAME = apple)
+   +- 'UnresolvedRelation `FRUIT`
+```
+
+Project 是根节点，它有一个子节点Filter。Filter也有一个子节点 UnresolvedRelation。
 
