@@ -243,7 +243,8 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
       afterRule.mapChildren(_.transformDown(rule))
     }
   }
-    
+  
+  // 遍历子节点 
   def mapChildren(f: BaseType => BaseType): BaseType = {
     // 如果是叶子节点，则返回自身节点
     // 如果是非叶子节点，那么会遍历构造函数的参数。如果参数是子节点，那么递归遍历

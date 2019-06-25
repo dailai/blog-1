@@ -1,18 +1,20 @@
 # Spark Sql 数据统计
 
+## 前言
 
+计算出当前 plan 的数据统计，用于指导后续的优化。
+
+## 数据统计结果
 
 Statistics 类表示数据统计，包含数据源的大小，条数和各列的统计数
 
 ```scala
 case class Statistics(
-    sizeInBytes: BigInt,
-    rowCount: Option[BigInt] = None,
-    attributeStats: AttributeMap[ColumnStat] = AttributeMap(Nil),
-    hints: HintInfo = HintInfo()) 
+    sizeInBytes: BigInt,    // 数据的字节大小
+    rowCount: Option[BigInt] = None,    // 数据的总行数
+    attributeStats: AttributeMap[ColumnStat] = AttributeMap(Nil),   // 各列的数据统计
+    hints: HintInfo = HintInfo())   // 仅仅使用在join时，表示用户是否指定使用 broadcast join
 ```
-
-hints 用于需要 join 的时候，表示是否要采用广播表的方式。
 
 ColumnStat 类表示各列的数据统计
 
@@ -28,15 +30,19 @@ case class ColumnStat(
 
 
 
-computeStats 会计算出当前 plan 的数据统计，用于指导后续的优化。
+## 统计原理
+
+LogicalPlan 基类定义了默认的统计方法 computeStats，不过它只支持非叶子节点。它仅仅是将子节点的统计结果相乘，而且只能计算数据的字节大小。
 
 ```scala
 abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
 
   protected def computeStats(conf: SQLConf): Statistics = {
+    // 叶子节点必须自己实现统计方法
     if (children.isEmpty) {
       throw new UnsupportedOperationException(s"LeafNode $nodeName must implement statistics.")
     }
+    // 这里将子节点的数据大小值相乘
     Statistics(sizeInBytes = children.map(_.stats(conf).sizeInBytes).product)
   }
 }
@@ -44,9 +50,7 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
 
 
 
-LogicalPlan 的默认实现是计算子节点的数据统计，然后将他们的数据大小值相乘。所以叶子节点必须要实现computeStats 方法。
-
-子类 UnaryNode 表示它只有一个子节点。它复写了 computeStats方法
+LogicalPlan 的子类 UnaryNode 表示它只有一个子节点，复写了 computeStats方法。它会根据输入的列类型，计算每行输入的字节长度。同时根据输出的列类型，计算出每行输出的字节长度，这样就可以根据输入源的大小粗略的计算出输出的大小。
 
 ```scala
 abstract class UnaryNode extends LogicalPlan {
@@ -56,7 +60,7 @@ abstract class UnaryNode extends LogicalPlan {
     val childRowSize = child.output.map(_.dataType.defaultSize).sum + 8
     // 计算当前节点的输出行数据大小
     val outputRowSize = output.map(_.dataType.defaultSize).sum + 8
-    // 按照比例，计算统计数据
+    // 按照每行输出和输入的大小比例，计算统计数据
     var sizeInBytes = (child.stats(conf).sizeInBytes * outputRowSize) / childRowSize
     if (sizeInBytes == 0) {
       // sizeInBytes can't be zero, or sizeInBytes of BinaryNode will also be zero
@@ -70,11 +74,21 @@ abstract class UnaryNode extends LogicalPlan {
 }
 ```
 
+这种根据列类型来估算每行的数据长度，很明显不准确。比如列类型是 String，那么这个列的每行的数据长度很明显不是相同的，所以这种估算方式是很粗略的。下面列举常见类型的默认长度，
+
+| 列类型    | 默认长度（字节）              |
+| --------- | ----------------------------- |
+| Byte      | 1                             |
+| Integer   | 4                             |
+| String    | 20                            |
+| Date      | 4                             |
+| Timestamp | 8                             |
+| Array     | 列表元素的类型大小            |
+| Map       | Key类型大小  +  Value类型大小 |
 
 
 
-
-首先来看看各种叶子节点的数据统计原理
+接下来来看看各个叶子节点的数据统计原理，基本上这些统计方式分为两种，一种是简单的统计，另一种是允许cbo优化，比较复杂但相比准确。
 
 
 
@@ -87,25 +101,28 @@ case class Project(projectList: Seq[NamedExpression], child: LogicalPlan) extend
       // 如果允许cbo优化，那么就调用ProjectEstimation的统计方法
       ProjectEstimation.estimate(conf, this).getOrElse(super.computeStats(conf))
     } else {
-      // 调用了UnaryNode父类的统计方法
+      // 调用了UnaryNode父类的默认统计方法
       super.computeStats(conf)
     }
   }
 }
 ```
 
-ProjectEstimation 的统计原理，它必须知道子节点的数据行数，才能进完成统计。
+
+
+ProjectEstimation 统计数据时，必须知道子节点的数据行数，才能进完成统计。它
 
 ```scala
 object ProjectEstimation {
   import EstimationUtils._
 
   def estimate(conf: SQLConf, project: Project): Option[Statistics] = {
+    // 判断是否知道子节点的行数
     if (rowCountsExist(conf, project.child)) {
-      // 如果子节点有条数的统计值
+      // 获取子节点的统计结果
       val childStats = project.child.stats(conf)
       val inputAttrStats = childStats.attributeStats
-      // 从子节点的列中，生成 Alias 实例
+      // 遍历Alias 表达式，为列的别名也生成统计信息
       val aliasStats = project.expressions.collect {
         case alias @ Alias(attr: Attribute, _) if inputAttrStats.contains(attr) =>
           alias.toAttribute -> inputAttrStats(attr)
@@ -119,6 +136,31 @@ object ProjectEstimation {
     } else {
       None
     }
+  }
+}
+
+object EstimationUtils {
+  // 计算输出的数据大小
+  // 参数 attributes：输出的列
+  // 参数 outputRowCount：输出行数
+  // 参数 attrStats：输出列的统计信息
+  def getOutputSize(attributes: Seq[Attribute], outputRowCount: BigInt, 
+                    attrStats: AttributeMap[ColumnStat] = AttributeMap(Nil)): BigInt = {
+    val sizePerRow = 8 + attributes.map { attr =>
+      if (attrStats.contains(attr)) {
+        attr.dataType match {
+          case StringType =>
+            // UTF8String: base + offset + numBytes
+            attrStats(attr).avgLen + 8 + 4
+          case _ =>
+            attrStats(attr).avgLen
+        }
+      } else {
+        attr.dataType.defaultSize
+      }
+    }.sum
+
+    if (outputRowCount > 0) outputRowCount * sizePerRow else 1
   }
 }
 ```
