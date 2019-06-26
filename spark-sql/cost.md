@@ -127,10 +127,11 @@ object ProjectEstimation {
         case alias @ Alias(attr: Attribute, _) if inputAttrStats.contains(attr) =>
           alias.toAttribute -> inputAttrStats(attr)
       }
-      // 通过输出列的大小，计算出每行的数据大小。然后乘以行数，即可计算出总的大小
+      // 根据输出列，构建出每列的统计信息
       val outputAttrStats =
         getOutputMap(AttributeMap(inputAttrStats.toSeq ++ aliasStats), project.output)
       Some(childStats.copy(
+        // 调用getOutputSize方法，计算数据字节大小
         sizeInBytes = getOutputSize(project.output, childStats.rowCount.get, outputAttrStats),
         attributeStats = outputAttrStats))
     } else {
@@ -146,20 +147,24 @@ object EstimationUtils {
   // 参数 attrStats：输出列的统计信息
   def getOutputSize(attributes: Seq[Attribute], outputRowCount: BigInt, 
                     attrStats: AttributeMap[ColumnStat] = AttributeMap(Nil)): BigInt = {
+    // 遍历每个列的数据大小，计算它们的平均大小
     val sizePerRow = 8 + attributes.map { attr =>
+      
       if (attrStats.contains(attr)) {
         attr.dataType match {
           case StringType =>
             // UTF8String: base + offset + numBytes
             attrStats(attr).avgLen + 8 + 4
           case _ =>
+            // 该列的平均大小
             attrStats(attr).avgLen
         }
       } else {
+        // 如果没有此列的统计信息，则计算该列类型的默认大小
         attr.dataType.defaultSize
       }
     }.sum
-
+    // 每行数据的平均大小，乘以数据行数
     if (outputRowCount > 0) outputRowCount * sizePerRow else 1
   }
 }
@@ -169,18 +174,94 @@ object EstimationUtils {
 
 ## Filter 节点
 
-它的计算也分为两种
+Filter 节点主要是起过滤作用，所以它只会更新行数相关的统计。它的计算也分为两种
 
 * 允许 cbo 优化，调用 FilterEstimation 的统计方法
 * 不允许 cbo 优化，调用 UnaryNode 的统计方法
 
-FilterEstimation 的统计方法有点复杂，
+FilterEstimation 的统计方法有点复杂，因为 Filter 里的表达式会很复杂，有And，Or，Not等语句。
+
+首先我们来从简单的表达式开始分析，目前 spark sql 支持可以统计的格式很简单。比较操作符只能是大于号，小于号，等于号的一种或两种结合，比较的两个变量必须是常量或列名。
+
+下面了为了阐述方便，列名使用 attribute 表示，常量使用 literal 表示。并且该列的统计结果，min 代表最小值，max代表最大值，distinctCount代表不重复的行数。
+
+假设该列的数据类型为数值型，Date，Timestamp 或 Boolean，并且比较符号是  =, <, <=, >, >=，
+
+
+
+### attribute = literal
+
+outputRowCount = 1.0 / distinctCount  * inputRowCount
+
+
+
+### attribute < literal
+
+1. literal <= min，那么 outputRowCount = 0
+2. literal > max，那么 outputRowCount = inputRowCount
+3. literal == max，那么 outputRowCount = (1.0 - 1.0 / distinctCount)  * inputRowCount
+4. 其他情况，outputRowCount = (literal - min) / (max - min) * inputRowCount
+
+
+
+### attribute <= literal
+
+1. literal < min，那么 outputRowCount = 0
+2. literal >= max，那么 outputRowCount = inputRowCount
+3. literal == min，那么 outputRowCount = 1.0 / distinctCount  * inputRowCount
+4. 其他情况，outputRowCount = (literal - min) / (max - min) * inputRowCount
+
+
+
+### attribute > literal
+
+1. literal >= max，那么 outputRowCount = 0
+2. literal < min，那么 outputRowCount = inputRowCount
+3. literal == min，那么 outputRowCount = (1.0 - 1.0 / distinctCount)  * inputRowCount
+4. 其他情况，outputRowCount = (literal - min) / (max - min) * inputRowCount
+
+
+
+### attribute >= literal
+
+1. literal > max，那么 outputRowCount = 0
+2. literal <= min，那么 outputRowCount = inputRowCount
+3. literal == max，那么 outputRowCount = 1.0 / distinctCount  * inputRowCount
+4. 其他情况，outputRowCount = (literal - min) / (max - min) * inputRowCount
+
+
+
+### attribute 之间的比较
+
+可以根据两个列的最大值和最小值，想象成两个区间取交集。然后结合比较符号，返回的结果可以分为三种，
+
+1. outputRowCount = 0，两个集合没有交集，条件不可能成立
+2. outputRowCount = inputRowCount，两个集合没有交集，条件肯定成立
+3. outputRowCount = 1.0 / 3.0 * inputRowCount，两个集合有交集，这里取一个经验值 1.0 / 3.0
+
+
+
+### attribute In [literal，.....]
+
+首先根据该列的最大值和最小值，过滤掉集合中，不在此范围的值。然后计算集合中符合条件的值数目 num，返回行数为 outputRowCount = (num * 1.0 / distinctCount)* inputRowCount
+
+
+
+### 复杂语句
+
+上面介绍完基础的表达式，然后来看看如果包含And，Or 或 Not 的语句，怎么计算统计结果的。
+
+如果是 And 语句，那么将两个子条件的比例，这个比例就是输出数据的行数 / 输入数据的行数。然后将两个比例相乘，就得到了 And 语句的比例。
+
+如果是 Or 语句，那么将两个子条件的比例，percent1 和 percent2。Or 语句的比例为 percent1 + percent2 - (percent1 * percent2)
+
+如果是Not 语句，那么计算出子条件的比例 percent，然后 Not 语句的比例为 1.0 - percent
 
 
 
 ## Union 节点
 
-计算子节点统计数据的和
+Union 节点的统计计算很简答，只是将各个子节点的统计数据取和
 
 
 
@@ -200,6 +281,7 @@ case class Join(
     def simpleEstimation: Statistics = joinType match {
       case LeftAnti | LeftSemi =>
         // 因为LeftAnti或LeftSemi类型的join，生成的数据是子节点left的子集
+        // 所以直接返回left的统计结果
         left.stats(conf)
       case _ =>
         // 调用UnaryNode的统计方法
@@ -219,7 +301,79 @@ case class Join(
 
 
 
-JoinEstimation 的统计方法比较复杂
+JoinEstimation 的统计方法比较复杂，它根据 join 的类型分成两种统计方法：
+
+1. Inner ， Cross ， LeftOuter ， RightOuter ， FullOuter
+2. LeftSemi， LeftAnti
+
+下面依次介绍两种统计原理，我们定义需要 join 的两张表 left 和 right。
+
+joinSelectivity 方法计算出比例，即 输出数据的行数 / 输入数据的行数
+
+```scala
+// 参数 joinKeyPairs，表示 join 字段
+// 返回比例，
+def joinSelectivity(joinKeyPairs: Seq[(AttributeReference, AttributeReference)]): BigDecimal = {
+  var ndvDenom: BigInt = -1
+  var i = 0
+  // 遍历 join 字段
+  while(i < joinKeyPairs.length && ndvDenom != 0) {
+    val (leftKey, rightKey) = joinKeyPairs(i)
+    // 获取字段对应的统计信息
+    val leftKeyStats = leftStats.attributeStats(leftKey)
+    val rightKeyStats = rightStats.attributeStats(rightKey)
+    // 根据字段的最大值和最小值，生成区间
+    val lRange = Range(leftKeyStats.min, leftKeyStats.max, leftKey.dataType)
+    val rRange = Range(rightKeyStats.min, rightKeyStats.max, rightKey.dataType)
+    // 如果两个区间没有交集，那么说明join后的结果是空
+    if (Range.isIntersected(lRange, rRange)) {
+      // 如果有交集，那么distinctCount的最大值
+      val maxNdv = leftKeyStats.distinctCount.max(rightKeyStats.distinctCount)
+      if (maxNdv > ndvDenom) ndvDenom = maxNdv
+    } else {
+      // 如果没有交集，则设置 ndvDenom 为0
+      ndvDenom = 0
+    }
+    i += 1
+  }
+
+  if (ndvDenom < 0) {
+    // We can't find any join key pairs with column stats, estimate it as cartesian join.
+    1
+  } else if (ndvDenom == 0) {
+    // One of the join key pairs is disjoint, thus the two sides of join is disjoint.
+    0
+  } else {
+    1 / BigDecimal(ndvDenom)
+  }
+}
+```
+
+
+
+计算出比例后，还会根据 join 类型计算出。
+
+```scala
+val joinKeyPairs = extractJoinKeysWithColStats(leftKeys, rightKeys)  // 提取join字段
+val selectivity = joinSelectivity(joinKeyPairs)  // 计算比例
+val leftRows = leftStats.rowCount.get  
+val rightRows = rightStats.rowCount.get
+val innerJoinedRows = ceil(BigDecimal(leftRows * rightRows) * selectivity)  // 计算join行数
+val outputRows = joinType match {
+  case LeftOuter =>
+    // All rows from left side should be in the result.
+    leftRows.max(innerJoinedRows)
+  case RightOuter =>
+    // All rows from right side should be in the result.
+    rightRows.max(innerJoinedRows)
+  case FullOuter =>
+    // T(A FOJ B) = T(A LOJ B) + T(A ROJ B) - T(A IJ B)
+    leftRows.max(innerJoinedRows) + rightRows.max(innerJoinedRows) - innerJoinedRows
+  case _ =>
+    // Don't change for inner or cross join
+    innerJoinedRows
+}
+```
 
 
 
