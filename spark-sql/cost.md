@@ -92,7 +92,29 @@ abstract class UnaryNode extends LogicalPlan {
 
 
 
-### Project 节点
+## HiveTableRelation 节点
+
+HiveTableRelation 代表着底层的 Hive 表，它的统计信息。。。原理待定
+
+```scala
+case class HiveTableRelation(
+    tableMeta: CatalogTable,
+    dataCols: Seq[AttributeReference],
+    partitionCols: Seq[AttributeReference]) extends LeafNode with MultiInstanceRelation {
+
+  override def computeStats(): Statistics = {
+    tableMeta.stats.map(_.toPlanStats(output, conf.cboEnabled)).getOrElse {
+      throw new IllegalStateException("table stats must be specified.")
+    }
+  }
+
+
+}
+```
+
+
+
+## Project 节点
 
 ```scala
 case class Project(projectList: Seq[NamedExpression], child: LogicalPlan) extends UnaryNode {
@@ -413,50 +435,9 @@ case class Aggregate(
 
 
 
- AggregateEstimation 的统计方法
+ AggregateEstimation 的统计方法，必须要求 GROUP BY 的字段都是列名，并且都有统计信息。统计原理是将这些列名的不重复行数相乘即可。以 GROUP BY col1, col2, col3 语句为例，分别将这三个列的不重复行数相乘，即可得到输出行数
 
-```scala
-object AggregateEstimation {
-  import EstimationUtils._
 
-  /**
-   * Estimate the number of output rows based on column stats of group-by columns, and propagate
-   * column stats for aggregate expressions.
-   */
-  def estimate(conf: SQLConf, agg: Aggregate): Option[Statistics] = {
-    val childStats = agg.child.stats(conf)
-    // Check if we have column stats for all group-by columns.
-    val colStatsExist = agg.groupingExpressions.forall { e =>
-      e.isInstanceOf[Attribute] && childStats.attributeStats.contains(e.asInstanceOf[Attribute])
-    }
-    if (rowCountsExist(conf, agg.child) && colStatsExist) {
-      // Multiply distinct counts of group-by columns. This is an upper bound, which assumes
-      // the data contains all combinations of distinct values of group-by columns.
-      var outputRows: BigInt = agg.groupingExpressions.foldLeft(BigInt(1))(
-        (res, expr) => res * childStats.attributeStats(expr.asInstanceOf[Attribute]).distinctCount)
-
-      outputRows = if (agg.groupingExpressions.isEmpty) {
-        // If there's no group-by columns, the output is a single row containing values of aggregate
-        // functions: aggregated results for non-empty input or initial values for empty input.
-        1
-      } else {
-        // Here we set another upper bound for the number of output rows: it must not be larger than
-        // child's number of rows.
-        outputRows.min(childStats.rowCount.get)
-      }
-
-      val outputAttrStats = getOutputMap(childStats.attributeStats, agg.output)
-      Some(Statistics(
-        sizeInBytes = getOutputSize(agg.output, outputRows, outputAttrStats),
-        rowCount = Some(outputRows),
-        attributeStats = outputAttrStats,
-        hints = childStats.hints))
-    } else {
-      None
-    }
-  }
-}
-```
 
 
 
