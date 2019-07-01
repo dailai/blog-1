@@ -4,7 +4,7 @@
 
 ## 前言
 
-LogicalPlan 表示逻辑计划，它表示 spark sql 初步解析的成果。之后的验证和优化，都是基于逻辑计划的。spark sql 使用 antrl 解析 sql 语句生成语法树，然后遍历这棵树生成 LogicalPlan 二叉树。这篇文章介绍常见的 LogicalPlan 子类和是如何生成 LogicalPlan 树的。
+LogicalPlan 表示逻辑计划，它表示 spark sql 初步解析的成果。之后的验证和优化，都是基于逻辑计划的。spark sql 使用 antrl4 解析 sql 语句生成语法树，然后遍历这棵树生成 LogicalPlan 二叉树。这篇文章介绍常见的 LogicalPlan 子类和是如何生成 LogicalPlan 树的。读者在了解 LogicalPlan 树的生成原理之前，必须先了解 antrl4 的基本用法。如果不熟悉可以参此篇文章。
 
 
 
@@ -20,32 +20,22 @@ LogicalPlan 继承QueryPlan，它的子类根据子节点的数量，分为三�
 
 ## LogicalPlan 子类
 
-
+常用的 LogicalPlan 子类并不多，大概有以下这些
 
 ### Project 节点
 
 ```scala
-case class Project(projectList: Seq[NamedExpression], child: LogicalPlan) extends UnaryNode
+case class Project(projectList: Seq[NamedExpression], child: LogicalPlan)
 ```
 
-Project 节点表示 SELECT 语句中选中列的那部分。它包含了选中列的表达式，这些表达式 由 NamedExpression的子类表示。NamedExpression 的子类如下所示：
-
-
-
-Star 类表示星号，意味着选中了所有列。它有两个子类UnresolvedStar 和 ResolvedStar，分别表示analyse 之前和之后。
-
-
-
-
-
-
+Project 节点表示 SELECT 语句中选中列的那部分。它包含了选中列的表达式，这些表达式叫做命名表达式，原理参考下篇博客。
 
 
 
 ### 表节点
 
 ```scala
-case class UnresolvedRelation(tableIdentifier: TableIdentifier) extends LeafNode
+case class UnresolvedRelation(tableIdentifier: TableIdentifier)
 ```
 
 表表名由 UnresolvedRelation 类表示，在上个 sql 例子中，在 analyse 之后会转换成一个子查询 SubqueryAlias，而这个子查询包含了 Hive 表节点 HiveTableRelation。
@@ -81,7 +71,7 @@ Join 表示sql 的 join 操作，包含两个需要 join 的子节点，join 类
 case class Filter(condition: Expression, child: LogicalPlan)
 ```
 
-Filter 节点包含了表达式，对应了 sql 语句中的 WHERE 条件。
+Filter 节点包含了布尔表达式，对应了 sql 语句中的 WHERE 条件。
 
  
 
@@ -98,6 +88,8 @@ case class Sort(
 
 如果使用了 SORT BY 语句，那么就是局部排序，也就是只保证同个分区是有序的，但是不能保证分区合并后的结果是有序的。
 
+
+
 ### Distinct 节点
 
 ```scala
@@ -108,9 +100,59 @@ case class Distinct(child: LogicalPlan)
 
 
 
+### Aggregate 节点
+
+```scala
+case class Aggregate(
+    groupingExpressions: Seq[Expression],     // GROUP BY 的字段
+    aggregateExpressions: Seq[NamedExpression],   // SELECT 的字段
+    child: LogicalPlan)
+```
+
+Aggregate 节点对应 GROUP BY 语句。
 
 
-## 遍历语法规则
+
+## 解析类
+
+Spark Sql 遍历语法树的逻辑定义在 AstBuilder 类。AstBuilder 使用了 visitor 模式来遍历语法树，它复写了默认的遍历方法。下面来看看两个很重要的方法：
+
+typedVisit 提供了遍历节点，并且结果强制转换。
+
+visitChildren 复写了父类的方法，当遍历非叶子节点时，如果该节点只有一个子节点，那么继续遍历，否则就停止遍历。
+
+```scala
+class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging {
+    
+  // 复写默认的遍历方法
+  override def visitChildren(node: RuleNode): AnyRef = {
+    // 如果该节点只有一个子节点，那么返回子节点的遍历结果
+    // 否则返回null
+    if (node.getChildCount == 1) {
+      node.getChild(0).accept(this)
+    } else {
+      null
+    }
+  }
+  
+  // 指定返回结果类型
+  protected def typedVisit[T](ctx: ParseTree): T = {
+    ctx.accept(this).asInstanceOf[T]
+  }  
+      
+  // 访问该语法树节点，并且将结果类型转换为LogicalPlan
+  protected def plan(tree: ParserRuleContext): LogicalPlan = typedVisit(tree)
+    
+  // 访问该语法树节点，并且将结果类型转换为Expression
+  protected def expression(ctx: ParserRuleContext): Expression = typedVisit(ctx)    
+}
+```
+
+
+
+
+
+## 遍历语法树
 
 接下来我们以 antrl4 文件为主，按照从上到下的顺序来查看语法树，是如何生成 LogicalPlan 树。读者可以自行编写 sql 语句生成语法树，然后结合下面的程序一起看。
 
@@ -126,7 +168,7 @@ override def visitSingleStatement(ctx: SingleStatementContext): LogicalPlan = wi
 }
 ```
 
-它只是继续遍历了statement 子规则，注意到 statement 规则有多种格式，支持 USE，CREATE 等语句。而我们使用的 sql 示例语句，匹配了 statement 规则的 statementDefault 格式。statementDefault 语法规则只有一个 query 子规则，它没有定义访问方法，所以它使用了 AstBuilder 的默认访问方法，即访问 query 子节点。
+它只是继续遍历了statement 子规则，注意到 statement 规则有多种格式，支持 USE，CREATE 等语句。而我们使用的 一般 sql 语句，匹配了 statementDefault 格式。statementDefault 格式只有一个 query 子规则，它没有定义访问方法，所以它使用了 AstBuilder 的默认访问方法，即访问 query 子规则。
 
 
 
@@ -160,7 +202,12 @@ override def visitQuery(ctx: QueryContext): LogicalPlan = withOrigin(ctx) {
 
 ### queryNoWith 语法规则
 
-我们使用的 示例 sql 匹配了 queryNoWith 语法的 singleInsertQuery 格式，在 AstBuilder 类也定义了访问此格式的方法。
+queryNoWith 语法规则由两种格式：
+
+1. 第一种格式匹配多条语句，比如`FROM fruit SELECT *  `
+2. 第二中匹配单条数据，比如`SELECT * FROM fruit`
+
+我们一般使用第二种，它匹配了 queryNoWith 语法的 singleInsertQuery 格式，在 AstBuilder 类定义了访问此格式的方法。
 
 ```scala
 override def visitSingleInsertQuery(
@@ -176,13 +223,26 @@ override def visitSingleInsertQuery(
 
 
 
-singleInsertQuery 规则有三部分组成
+singleInsertQuery 格式有三部分组成
 
 - insertInto 规则，匹配 INSERT INTO 语句
 - queryTerm 规则，匹配 SELECT 语句
 - queryOrganization 规则，匹配 ORDER BY，DISTRIBUTE BY，CLUSTER BY，SORT BY 或 LIMIT 语句
 
 当访问此节点时，依次按照 queryTerm ，queryOrganization，insertInto 顺序遍历。
+
+
+
+### queryOrganization 语法规则
+
+queryOrganization 规则匹配了排序语句，比如：
+
+* ORDER BY，指定全局排序
+* SORT BY，指定分区排序
+* DISTRIBUTE BY，指定 shuffle 按照哪个字段分区
+* CLUSTER BY，等同于 SORT BY 和 DISTRIBUTE  BY 的结合
+
+ 它会生成 Sort 节点。
 
 
 
@@ -355,7 +415,8 @@ private def withQuerySpecification(
       // 如果有 where 语句，那么生成Filter实例
       val withFilter = withLateralView.optionalMap(where)(filter)
 
-      // 生成NamedExpression或UnresolvedAlias实例，表示选中的列
+      // 注意到这里，会对Expression子类进行处理，将其转换为NamedExpression的子类。
+      // 如果表达式不是NamedExpression的子类，那么生成UnresolvedAlias实例
       val namedExpressions = expressions.map {
         case e: NamedExpression => e
         case e: Expression => UnresolvedAlias(e)
@@ -400,14 +461,7 @@ private def withQuerySpecification(
 }
 ```
 
-从上面可以看到生成了多个LogicalPlan的种类：
-
-- Filter，表示Where语句或者Having语句
-- GroupingSets，表示GROUPING SETS 语句
-- Aggregate，表示普通的GROUP BY 语句
-- Project，表示SELECT选择的列
-- Distinct，表示对列需要去重
-- WithWindowDefinition，表示WINDOW语句
+从上面可以看到如何生成了多个LogicalPlan的种类。
 
 
 
@@ -510,10 +564,6 @@ Project [name#41, create_time#38, consumer_name#39]
       :  +- HiveTableRelation `default`.`orders`, org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe, [id#36, fruit_id#37, create_time#38, consumer_name#39]
       +- SubqueryAlias `default`.`fruit`...
 ```
-
-.
-
-这里主要看看初步结果：
 
 WHERE 语句被解析成了 Filter 节点，它包含了过滤的表达式
 
