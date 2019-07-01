@@ -1,12 +1,18 @@
-# Spark Sql 基础类 TreeNode
+# Spark Sql 树结构
 
 
 
 ## 前言
 
+Spark Sql 最重要的数据结构就是树结构，它贯穿了所有的处理过程。无论是解析 sql 产生的语法树，还是生成的 LogicalPlan 树，或是生成的 SparkPlan 树，都是基于树的操作。Spark Sql 为树结构封装了一个基类和各种子类，下面会依次介绍这些类的原理。
+
+
+
+## sql 运行过程
+
+### 流程图
+
 Spark Sql 不仅支持 sql 语句，而且还会对 sql 进行自动优化。整体流程如下图所示：
-
-
 
 1. 接收 sql 语句，初步解析成 logical plan
 2. 分析上步生成的 logical plan，生成验证后的 logical plan
@@ -14,9 +20,7 @@ Spark Sql 不仅支持 sql 语句，而且还会对 sql 进行自动优化。整
 4. 对优化过后的 logical plan，生成 physical plan
 5. 根据 physical plan，生成 rdd 的程序，并且提交运行
 
-这里的 logical plan 代表着 sql 语句的一部分，比如子类 Project 代表着选中的列，UnresolvedRelation 表示未验证的表名或者试图。
-
-## 查看spark sql 的解析和优化过程
+### 运行示例
 
 假设我们有两张表，fruit 表记录了各种水果的信息，orders 表记录了购买记录
 
@@ -102,7 +106,36 @@ Project [name#9, num#6L]
 
 从上面的输出可以看到，这条语句经过了三个阶段，一次生成了 Parsed Logical Plan， Analyzed Logical Plan， Optimized Logical Plan， Physical Plan。
 
-上面每一步的生成结果，无论是 LogicalPlan 还是 PhysicalPlan，都是通过树的形式表示。每一步都是对树进行操作，生成新的树。如果想要深入了解，就必须要了解这些数据结构的原理。spark sql 使用基础类TreeNode 来实现树，在介绍 TreeNode 之前，需要先了解一些基本的语法。
+上面每一步的生成结果，无论是 LogicalPlan 还是 PhysicalPlan，都是通过树的形式表示。每一步都是对树进行操作，生成新的树。如果想要深入了解，就必须要了解这些数据结构的原理。
+
+
+
+## UML 类
+
+{% plantuml %}
+
+@startuml
+TreeNode <|-- QueryPlan
+QueryPlan <|-- LogicalPlan
+QueryPlan <|-- SparkPlan
+TreeNode <|-- Expression
+@enduml
+
+{% endplantuml %}
+
+TreeNode： 表示树结构，负责实现树的基本操作
+
+Expression：sql 表达式
+
+QueryPlan：拥有零个或多个 Expression
+
+LogicalPlan ： 逻辑计划，提供了解析表达式操作 
+
+SparkPlan：物理计划，负责生成实际的运行程序
+
+本篇先讲讲 TreeNode 和 QueryPlan 基类的原理，后续的文章会具体讲其他类的原理。
+
+
 
 ## 自限定泛型
 
@@ -114,12 +147,10 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
 }
 ```
 
-首先它是一个抽象类，其子类分为两种，逻辑计划 LogicalPlan，物理计划 SparkPlan。
-
 然后看看它的泛型声明，读者对于这种写法有可能比较陌生，我们可以分为两部分理解
 
 1. 它是一个泛型类，泛型类型由 BaseType 表示
-2. 它的泛型类型，必须是TreeNode类的子类
+2. 它的泛型类型，必须是 TreeNode 类的子类
 
 自限定泛型类，主要用于封装公共的方法。比如我们有两个类 Apple 和 Banana，它们有个共同的方法，用来创建出新的对象，那么可以把这个方法抽象，作为泛型类的一个方法。
 
@@ -148,6 +179,8 @@ class Banana extends Fruit<Banana> {
 
 可以看到 Fruit 泛型类，定义了 make 抽象方法，子类必须实现这个抽象方法。在子类中 make 方法，它的返回类型都随着子类改变。这就是自限定泛型最常用的场景。
 
+
+
 ## Case Class 使用
 
 我们继续观察 TreeNode 的声明，发现它还继承了 Product 接口，但是 TreeNode 类并没有实现 Product 的方法，这就需要子类实现。TreeNode 的子类都是 Case Class 类型，这种类是 scala 独有的语法。使用它有下面几个好处：
@@ -156,25 +189,6 @@ class Banana extends Fruit<Banana> {
 2. 子类构造方法的参数，都是 public 权限，意味着可以直接访问
 3. 子类自动实现 equals 方法，这个方法用来判断两个对象是否相等
 4. 子类自动实现 Product 接口，支持遍历构造方法的参数
-
-##  判断相等
-
-scala 判断相等的使用，涉及到三种 ==，eq，equals。
-
-其中 eq 的原理只是比较两者的引用是否相等， equals 是调用了对象的 equals 方法。== 等价于 equals 方法，只是加上了对 null 的判断。
-
-TreeNode 实现了 fastEquals 方法，来判断两个节点是否相等
-
-```scala
-abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
-  def fastEquals(other: TreeNode[_]): Boolean = {
-    // 首先比较引用，然后调用Case Class实现的equals方法
-    this.eq(other) || this == other
-  }
-}
-```
-
-## 遍历构造方法的参数
 
 TreeNode 的子类实现了 Product 接口，所以支持访问构造方法的参数。TreeNode 类提供了 mapProductIterator 方法，接收一个函数用来遍历这些参数
 
@@ -191,6 +205,25 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
       i += 1
     }
     arr
+  }
+}
+```
+
+
+
+##  TreeNode 判断相等
+
+scala 判断相等的使用，涉及到三种 ==，eq，equals。
+
+其中 eq 的原理只是比较两者的引用是否相等， equals 是调用了对象的 equals 方法。== 等价于 equals 方法，只是加上了对 null 的判断。
+
+TreeNode 实现了 fastEquals 方法，来判断两个节点是否相等
+
+```scala
+abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
+  def fastEquals(other: TreeNode[_]): Boolean = {
+    // 首先比较引用，然后调用Case Class实现的equals方法
+    this.eq(other) || this == other
   }
 }
 ```
@@ -217,33 +250,27 @@ partital.applyOrElse(2, { num:Int => "world" }) // "world"
 
 
 
-## Transform 操作
+## TreeNode 遍历操作
 
-介绍完基础知识后，现在可以来看看 TreeNode 的核心操作 Transform。当我们生成了逻辑计划 LogicalPlan 后，需要对它进行验证和优化，这些重要的操作都会使用到 Transform。它会遍历所有的子节点，并且生成一颗新的树。
+介绍完基础知识后，现在可以来看看树的遍历操作。当我们生成了逻辑计划 LogicalPlan 后，需要对它进行验证和优化，这些重要的操作都会使用到树的遍历。
+
+
+
+### mapChildren 方法
+
+mapChildren 方法接收一个函数参数，负责处理节点，它会返回一个新的节点。
+
+mapChildren 会依次调用函数对子节点操作，根据返回的结果生成一个新的节点。因为要实例一个新节点，需要知道这个节点的构建参数类型，但是每个类的构建参数类型不一样，Spark Sql 利用了 Case Class 的特性，通过 mapProductIterator 方法遍历参数。如果在遍历构造参数时，发现了它的子子节点，就调用函数进行处理，然后保存处理后的新节点，这样就可以按照顺序保存新的构造参数，就很容易的实例化新的节点。
 
 ```scala
 abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
-  // 对该节点的所有子节点调用 rule 方法，如果中间节点发生了改变，那么就 copy 节点
-  def transform(rule: PartialFunction[BaseType, BaseType]): BaseType = {
-    transformDown(rule)
-  }
     
-  def transformDown(rule: PartialFunction[BaseType, BaseType]): BaseType = {
-    val afterRule = CurrentOrigin.withOrigin(origin) {
-      // 对当前节点，调用rule函数。
-      // 这里rule函数有可能会生成新的节点，新节点的子节点可能不一样
-      rule.applyOrElse(this, identity[BaseType])
-    }
-
-    if (this fastEquals afterRule) {
-      // 如果当前节点没有变化，则继续遍历它的子节点
-      mapChildren(_.transformDown(rule))
-    } else {
-      // 如果当前节点发生改变，需要对改变后的节点进行遍历
-      afterRule.mapChildren(_.transformDown(rule))
-    }
-  }
-  
+  // 返回子节点
+  def children: Seq[BaseType]
+ 
+  // 返回子节点的set集合
+  lazy val containsChild: Set[TreeNode[_]] = children.toSet    
+    
   // 遍历子节点 
   def mapChildren(f: BaseType => BaseType): BaseType = {
     // 如果是叶子节点，则返回自身节点
@@ -251,6 +278,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
     if (children.nonEmpty) {
       var changed = false
       // 调用了mapProductIterator方法，遍历构造函数的参数，返回新的构造参数
+      // 这里只会遍历LogicalPlan的实例，并且还必须是子节点
       val newArgs = mapProductIterator {
         // 如果参数是TreeNode子类，并且是该节点的子节点
         case arg: TreeNode[_] if containsChild(arg) =>
@@ -267,7 +295,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
         case Some(arg: TreeNode[_]) if containsChild(arg) =>
           ...... // 遍历子节点
           
-        // 如果参数是Map类型，则遍历它的values
+        // 如果参数是Map类型，则从它的values找到
         case m: Map[_, _] => m.mapValues {
           case arg: TreeNode[_] if containsChild(arg) =>
            ...... // 遍历子节点
@@ -290,18 +318,66 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
       // 如果子节点发生变化，则利用新的构造参数，实例化新的节点
       if (changed) makeCopy(newArgs) else this
     } else {
+      // 递归结束条件
       this
     }
   }
+}
+```
+
+
+
+### TransformDown 操作
+
+我们定义 transformDown 函数，它接收一个函数参数，这里称为规则，负责对节点进行操作。它返回执行过规则后的新节点。
+
+transformDown 是一个递归函数，递归逻辑如下：
+
+* 递归结束条件：如果是叶子节点，那么使用规则对该节点操作，并且返回操作后的节点。
+* 递归继续条件：如果不是叶子节点，那么先使用该规则对该节点操作。对操作后的该节点，继续遍历其子节点，用子节点的返回结果，来构建成新的节点。
+
+
+
+```scala
+abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
+    
+  // 对该节点的所有子节点调用 rule 方法，如果中间节点发生了改变，那么就 copy 节点
+  def transform(rule: PartialFunction[BaseType, BaseType]): BaseType = {
+    transformDown(rule)
+  }
+    
+  def transformDown(rule: PartialFunction[BaseType, BaseType]): BaseType = {
+    val afterRule = CurrentOrigin.withOrigin(origin) {
+      // 对当前节点，调用rule函数。
+      // 这里rule函数有可能会生成新的节点，新节点的子节点可能不一样
+      rule.applyOrElse(this, identity[BaseType])
+    }
+
+    if (this fastEquals afterRule) {
+      // 如果当前节点没有变化，则继续遍历它的子节点
+      mapChildren(_.transformDown(rule))
+    } else {
+      // 如果当前节点发生改变，需要对改变后的节点进行遍历
+      afterRule.mapChildren(_.transformDown(rule))
+    }
+  }
+}
 ```
 
 上面的 mapChildren 就是递归的遍历子节点，执行函数。如果某个节点的子节点发生改变，那么就返回改变后的新节点。
 
 
 
-## TransformUp 操作
+### TransformUp 操作
 
 transformUp 操作与上面的 transformDown 操作有一点区别。transformDown 是采用前序遍历的，而 transformUp 是后序遍历的。
+
+递归逻辑：
+
+- 递归结束条件：如果是子节点，那么使用该规则执行该节点，并且返回执行规则后的节点
+- 递归继续条件：如果有子节点，那么先根据遍历子节点的结果，生成新节点。最后在使用该规则执行新节点
+
+
 
 ```scala
 abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
@@ -319,6 +395,86 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
         rule.applyOrElse(afterRuleOnChildren, identity[BaseType])
       }
     }
+  }
+}
+```
+
+
+
+## QueryPlan 遍历表达式
+
+QueryPlan 在 TreeNode 的基础上，添加了对 Expression 的处理。每个 QueryPlan 包含了零个或多个表达式，这些表达式都是通过树结构组织在一起的。QueryPlan 支持递归遍历这些表达式。
+
+### mapExpressions 方法
+
+mapExpressions 方法接收一个函数参数，这个函数负责处理一个 Expression 参数，然后返回一个新的 Expression 实例。
+
+```scala
+abstract class QueryPlan[PlanType <: QueryPlan[PlanType]] extends TreeNode[PlanType] {
+    
+  def mapExpressions(f: Expression => Expression): this.type = {
+    var changed = false
+
+    // 对expression 执行函数
+    @inline def transformExpression(e: Expression): Expression = {
+      val newE = f(e)
+      if (newE.fastEquals(e)) {
+        e
+      } else {
+        changed = true
+        newE
+      }
+    }
+   
+    // 定义递归函数，用来遍历子表达式
+    def recursiveTransform(arg: Any): AnyRef = arg match {
+      case e: Expression => transformExpression(e)      // 如果参数是Expression子类，那么继续遍历
+      case Some(value) => Some(recursiveTransform(value))
+      case m: Map[_, _] => m
+      case d: DataType => d // Avoid unpacking Structs
+      case seq: Traversable[_] => seq.map(recursiveTransform)  // 如果参数是列表，继续遍历
+      case other: AnyRef => other
+      case null => null
+    }
+      
+    // 遍历构造参数，执行recursiveTransform函数
+    val newArgs = mapProductIterator(recursiveTransform)
+
+    if (changed) makeCopy(newArgs).asInstanceOf[this.type] else this
+  }
+    
+```
+
+
+
+### 先序遍历
+
+遍历原理同 transformDown
+
+```scala
+abstract class QueryPlan[PlanType <: QueryPlan[PlanType]] extends TreeNode[PlanType] {
+    
+  def transformExpressions(rule: PartialFunction[Expression, Expression]): this.type = {
+    transformExpressionsDown(rule)
+  }
+
+  def transformExpressionsDown(rule: PartialFunction[Expression, Expression]): this.type = {
+    // 调用mapExpressions 遍历expression子节点
+    mapExpressions(_.transformDown(rule))
+  }
+    
+```
+
+
+
+### 后续遍历
+
+遍历原理同 transformUp
+
+```scala
+abstract class QueryPlan[PlanType <: QueryPlan[PlanType]] extends TreeNode[PlanType] {
+  def transformExpressionsUp(rule: PartialFunction[Expression, Expression]): this.type = {
+    mapExpressions(_.transformUp(rule))
   }
 }
 ```

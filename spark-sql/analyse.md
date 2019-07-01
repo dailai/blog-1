@@ -1,5 +1,101 @@
 
 
+## LogicalPlan 子类的输出列
+
+每个LogicalPlan 必须定义输出列，这样后面的 LogicalPlan才能计算。这个方法定义在QueryPlan中
+
+```scala
+abstract class QueryPlan[PlanType <: QueryPlan[PlanType]] extends TreeNode[PlanType] {
+  self: PlanType =>
+
+  def output: Seq[Attribute]
+}
+```
+
+### Filter 类
+
+```scala
+case class Filter(condition: Expression, child: LogicalPlan)
+  extends UnaryNode with PredicateHelper {
+  override def output: Seq[Attribute] = child.output
+}
+```
+
+
+
+### Join 类
+
+```scala
+case class Join(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    joinType: JoinType,
+    condition: Option[Expression])
+  extends BinaryNode with PredicateHelper {
+
+  override def output: Seq[Attribute] = {
+    joinType match {
+      case j: ExistenceJoin =>
+        left.output :+ j.exists
+      case LeftExistence(_) =>
+        left.output
+      case LeftOuter =>
+        left.output ++ right.output.map(_.withNullability(true))
+      case RightOuter =>
+        left.output.map(_.withNullability(true)) ++ right.output
+      case FullOuter =>
+        left.output.map(_.withNullability(true)) ++ right.output.map(_.withNullability(true))
+      case _ =>
+        left.output ++ right.output
+    }
+  }
+}
+```
+
+
+
+### Aggregate 类
+
+```scala
+case class Aggregate(
+    groupingExpressions: Seq[Expression],
+    aggregateExpressions: Seq[NamedExpression],
+    child: LogicalPlan)
+  extends UnaryNode {
+  override def output: Seq[Attribute] = aggregateExpressions.map(_.toAttribute)
+}  
+```
+
+
+
+
+
+### Project 类
+
+```scala
+case class Project(projectList: Seq[NamedExpression], child: LogicalPlan) extends UnaryNode {
+  override def output: Seq[Attribute] = projectList.map(_.toAttribute)
+}
+```
+
+
+
+其余的子类
+
+它的output 是它的字节点的output
+
+```scala
+override def output: Seq[Attribute] = child.output
+```
+
+
+
+
+
+
+
+
+
 ## 解析列名
 
 

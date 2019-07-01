@@ -226,6 +226,34 @@ sql 语句支持多个别名，这些别名会被解析成 MultiAlias。
 
 
 
+## 命名表达式
+
+这类表达式比较特殊，它只对应 SELECT 语句后面的选择表达式。 命名表达式的基类是 NamedExpression，它的子类如下所示：
+
+{% plantuml %}
+
+@startuml
+interface NamedExpression
+abstract class Attribute
+abstract class Star
+
+NamedExpression <|-- Attribute
+Attribute <|-- UnresolvedAttribute
+Attribute <|-- AttributeReference
+NamedExpression <|-- Alias
+NamedExpression <|-- Star
+Star <|-- UnresolvedStar
+Star <|-- ResolvedStar
+@enduml
+
+{% endplantuml %}
+
+
+
+SELECT 语句中的选择表达式，在被解析时，最后会生成 NamedExpression 子类或 UnresolvedAlias实例。
+
+
+
 ## 数值运算
 
 sql 支持常见的数值运算，每种运算对应不同的实例。下面列出了比较常见的类型
@@ -329,6 +357,8 @@ SELECT NAME, PRICE-1 AS DISCOUNT, 'favorite' FROM fruit WHERE PRICE > 2 AND NAME
 
 
 
+### namedExpression 规则
+
 这条语句的 NAME, PRICE-1 AS DISCOUNT, 'favorite' 都会匹配 namedExpression 语法规则，它包含了可选的别名，还有一个 子规则 expression。
 
 visitNamedExpression 方法定义了访问原理，会返回 Expression 的子类。
@@ -350,9 +380,9 @@ override def visitNamedExpression(ctx: NamedExpressionContext): Expression = wit
 }
 ```
 
-而 namedExpression 规则
+而 expression 规则最后会按照 booleanExpression 规则解析，并且 WHERE 后面的过滤表达式，也会匹配为 booleanExpression 规则。booleanExpression 规则主要有两类格式，一种是包含逻辑运算符的，另一种是基础的表达式。
 
-当解析到 WHERE 后面的过滤表达式，会匹配为 booleanExpression 规则。而 booleanExpression 规则主要有两类格式，一种是包含逻辑运算符的，另一种是基础的表达式。
+### booleanExpression 规则
 
 如果是第一种格式，比如包含 AND 或 OR 关键字。这类语句的解析稍微复杂，因为spark sql 会做一部分的优化。我们知道antrl4 是匹配语法规则时，它是用左递归的方式匹配。下面以 booleanExpression 规则为例，
 
@@ -397,41 +427,20 @@ override def visitPredicated(ctx: PredicatedContext): Expression = withOrigin(ct
 
 
 
-继续看子规则 valueExpression 的原理，valueExpression 有多种规则，能够匹配四则运算，大小等于的比较操作，还有异或预算。对于这些运算的规则，访问的原理很简单，只是生成了对应运算符的实例。比如等于操作符生成了 EqualTo 实例，加法运算符生成了 Add 实例。
+### valueExpression 规则
+
+继续看子规则 valueExpression 的原理，valueExpression 有多种规则，能够匹配四则运算，大小等于的比较操作，还有异或预算。对于这些运算的规则，访问的原理很简单，只是生成了对应数值运算表达式。
 
 
+
+### primaryExpression 规则
 
 继续遍历子节点 primaryExpression，它的规则比较多，这里仅仅介绍常见的几种。
 
-columnReference 规则负责匹配列名，会返回 UnresolvedAttribute 类
+1. columnReference 规则负责匹配列名，会返回字段表达式
+2. functionCall 规则负责匹配函数，会返回函数表达式
+3. star 规则负责匹配星号，用来表示选择所有列，会返回星号表达式
+4. constantDefault 规则负责匹配常量，返回 Literal 类
+5. dereference 规则匹配点号，返回带前缀表名的字段或集合取值运算
 
-functionCall 规则负责匹配函数，会返回 UnresolvedFunction 类
-
-star 规则负责匹配 * 号，用来表示选择所有列，会返回 UnresolvedStar 类
-
-constantDefault 规则负责匹配常量，返回 Literal 类
-
-
-
-
-
-
-
-
-
-我们再来现在回顾下之前的 sql 语句，
-
-```sql
-SELECT NAME, PRICE FROM FRUIT WHERE NAME = 'apple'
-```
-
-按照上述的原理，它被解析成了
-
-```shell
-'Project ['NAME, 'PRICE]
-+- 'Filter ('NAME = apple)
-   +- 'UnresolvedRelation `FRUIT`
-```
-
-Project 是根节点，它有一个子节点Filter。Filter也有一个子节点 UnresolvedRelation。
 
