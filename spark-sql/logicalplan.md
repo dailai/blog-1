@@ -79,7 +79,7 @@ Filter 节点包含了布尔表达式，对应了 sql 语句中的 WHERE 条件�
 
 ```scala
 case class Sort(
-    order: Seq[SortOrder],  // 排序的字段或者表达式
+    order: Seq[SortOrder],  // 排序的字段或者表达式，还有排序方向
     global: Boolean,       // 否为全局的排序，还是分区的排序。
     child: LogicalPlan)
 ```
@@ -110,6 +110,16 @@ case class Aggregate(
 ```
 
 Aggregate 节点对应 GROUP BY 语句。
+
+
+
+### Union 节点
+
+```scala
+case class Union(children: Seq[LogicalPlan]) 
+```
+
+Union 节点 对应 UNION 语句。UNION 内部的每个 SELECT 语句必须拥有相同数量的列，列也必须拥有相似的数据类型。
 
 
 
@@ -416,7 +426,8 @@ private def withQuerySpecification(
       val withFilter = withLateralView.optionalMap(where)(filter)
 
       // 注意到这里，会对Expression子类进行处理，将其转换为NamedExpression的子类。
-      // 如果表达式不是NamedExpression的子类，那么生成UnresolvedAlias实例
+      // 如果表达式不是NamedExpression的子类，那么生成UnresolvedAlias实例，
+      // UnresolvedAlias只是起到封装的作用，后面会被analyze
       val namedExpressions = expressions.map {
         case e: NamedExpression => e
         case e: Expression => UnresolvedAlias(e)
@@ -462,6 +473,26 @@ private def withQuerySpecification(
 ```
 
 从上面可以看到如何生成了多个LogicalPlan的种类。
+
+
+
+### from 规则
+
+A  JOIN B  JOIN C JOIN D
+
+```shell
++- 'Join Inner
+   :- 'Join Inner
+   :  :- 'Join Inner
+   :  :  :- 'UnresolvedRelation `A`
+   :  :  +- 'UnresolvedRelation `B`
+   :  +- 'UnresolvedRelation `C`
+   +- 'UnresolvedRelation `D`
+```
+
+因为遍历的顺序，这样整个树的左边节点（不包括叶子节点）都是 JOIN 节点，其余的都是非JOIN节点。
+
+
 
 
 

@@ -228,7 +228,20 @@ sql 语句支持多个别名，这些别名会被解析成 MultiAlias。
 
 ## 命名表达式
 
-这类表达式比较特殊，它只对应 SELECT 语句后面的选择表达式。 命名表达式的基类是 NamedExpression，它的子类如下所示：
+这类表达式比较特殊，它只对应 SELECT 语句后面的选择表达式。 命名表达式的基类是 NamedExpression，它都至少有一个名称，和一个可选的表名。
+
+```scala
+trait NamedExpression extends Expression {
+  // 名称
+  def name: String
+  // 所属表名
+  def qualifier: Option[String]
+}
+```
+
+
+
+它的子类如下所示：
 
 {% plantuml %}
 
@@ -241,16 +254,14 @@ NamedExpression <|-- Attribute
 Attribute <|-- UnresolvedAttribute
 Attribute <|-- AttributeReference
 NamedExpression <|-- Alias
+NamedExpression <|--  UnresolvedAlias
 NamedExpression <|-- Star
 Star <|-- UnresolvedStar
-Star <|-- ResolvedStar
 @enduml
 
 {% endplantuml %}
 
-
-
-SELECT 语句中的选择表达式，在被解析时，最后会生成 NamedExpression 子类或 UnresolvedAlias实例。
+SELECT 语句中的选择表达式，在被解析时，都会生成 NamedExpression 子类。注意到 UnresolvedAlias这个特殊的类，它只是起到封装的作用，将其他类型的表达式封装成 NamedExpression 的子类，在解析LogicalPlan里提到过。
 
 
 
