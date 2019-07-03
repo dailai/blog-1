@@ -1,13 +1,14 @@
-```
-/**
- * Replaces logical [[Distinct]] operator with an [[Aggregate]] operator.
- * {{{
- *   SELECT DISTINCT f1, f2 FROM t  ==>  SELECT f1, f2 FROM t GROUP BY f1, f2
- * }}}
- */
+DISTINCT 转换为 GROUP BY
+
+```sql
+SELECT DISTINCT f1, f2 FROM t  ==>  SELECT f1, f2 FROM t GROUP BY f1, f2
 ```
 
 
+
+SubqueryAliases 消除
+
+SubqueryAliases
 
 
 
@@ -77,5 +78,52 @@ PushPredicateThroughJoin
 
 
 
+PushDownPredicate
 
+Filter 子节点为 Project，这种情况是子查询，这条语句 `SELECT * FROM fruit WHERE fruit.id IN (SELECT fruit_id FROM orders)`，
+
+```shell
+'Project [*]
++- 'Filter 'fruit.id IN (list#2 [])
+   :  +- 'Project ['fruit_id]
+   :     +- 'UnresolvedRelation `orders`
+   +- 'UnresolvedRelation `fruit`
+
+```
+
+
+
+将Filter 下推到 UNION 的子节点。
+
+
+
+
+
+Limit 条件下推 到 Union 节点 或Join 节点
+
+
+
+
+
+列裁剪
+
+
+
+优化 IN 节点
+
+如果 IN 后面的集合都是常数类型，并且大于配置项 spark.sql.optimizer.inSetConversionThreshold，那么就会将集合转换为 HashSet 存储，加快查询速度。
+
+
+
+ConstantFolding
+
+常量值合并
+
+
+
+
+
+
+
+优化的内容比较多，需要对 sql 业务比较熟悉，所以不再深入研究。
 
