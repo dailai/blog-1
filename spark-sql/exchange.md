@@ -61,8 +61,6 @@ private def createPartitioning(
 
 
 
-
-
 如果是全局排序，那么需要子节点的输出格式满足 OrderedDistribution 要求
 
 ```scala
@@ -177,19 +175,7 @@ position
 
 HashPartitioning 对应的分区器，它的分区原理如下
 
-分别计算每个表达式的值，然后按照下面规则，计算出哈希值
-
-```scala
-var i = 0
-val len = children.length
-while (i < len) {
-  hash = computeHash(children(i).eval(input), children(i).dataType, hash)
-  i += 1
-}
-hash
-```
-
-然后将哈希值对分区数量取余
+分别计算每个表达式的值，然后根据这些表达式的值，计算出哈希值，最后对哈希值对分区数量取余。
 
 
 
@@ -220,6 +206,26 @@ new Partitioner {
 这些 shuffle 过程中的数据序列化，都是 UnsafeRowSerializer 类负责。
 
 
+
+SparkPlan 执行顺序
+
+```scala
+prepare()
+waitForSubqueries()
+doExecute()
+```
+
+
+
+
+
+查看ShuffleExchange的执行流程，
+
+prepare 会向ExchangeCoordinator 注册自身
+
+waitForSubqueries 会等待子查询完成
+
+doExecute，如果有ExchangeCoordinator，那么调用ExchangeCoordinator的方法生成ShuffledRowRDD。
 
 
 
