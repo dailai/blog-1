@@ -215,7 +215,9 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
 
 scala 判断相等的使用，涉及到三种 ==，eq，equals。
 
-其中 eq 的原理只是比较两者的引用是否相等， equals 是调用了对象的 equals 方法。== 等价于 equals 方法，只是加上了对 null 的判断。
+* eq 的原理只是比较两者的引用是否相等
+* equals 是调用了对象的 equals 方法
+* == 等价于 equals 方法，只是加上了对 null 的判断
 
 TreeNode 实现了 fastEquals 方法，来判断两个节点是否相等
 

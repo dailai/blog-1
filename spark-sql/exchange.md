@@ -1,26 +1,28 @@
 # Spark Sql Exchange 介绍
 
-Spark Sql 会根据子节点的数据输出
+Exchange 实例在 Spark Sql 中代表着 shuffle 或 broadcast 操作，一般在下列情况下使用：
+
+* broadcast 操作用于 join 操作，当一些 join 实现是采用广播小表的方式，那么就需要broadcast 操作。
+* shuffle 操作用于多种情况，比如 GROUP BY 语句需要对某些字段分区，那么就需要对数据进行shuffle。
+
+
 
 ## 数据分布描述
 
 Distribution 描述的是输入要求，Partitioning 描述的是输出格式。下面是各种类型的格式与要求，以及它们之间满足的条件
-
-
 
 | 输入要求 Distribution | 输出格式 Partitioning | 满足条件             |
 | --------------------- | --------------------- | -------------------- |
 | AllTuples             | SinglePartition       | 满足                 |
 | ClusteredDistribution | HashPartitioning      | 分区的字段相同       |
 | OrderedDistribution   | RangePartitioning     | 排序的字段和方向相同 |
-
-
+| BroadcastDistribution | 无                    | 无                   |
 
 
 
 ## SparkPlan 基类
 
-SparkPlan 作为基类，定义了返回输出格式与输入要求的方法。
+SparkPlan 作为基类，定义了返回输出格式与输入要求的方法。如果子节点的数据输出格式，不满足输入要求，那么就会触发 Exchange。
 
 ```scala
 abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializable {
@@ -42,9 +44,20 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
 
 
 
-
-
 ## 对输入有要求的节点
+
+
+
+### GlobalLimitExec
+
+如果是 Limit 语句，那么要求子节点的输出格式为 AllTuples。
+
+```scala
+case class GlobalLimitExec(limit: Int, child: SparkPlan) extends BaseLimitExec {
+
+  override def requiredChildDistribution: List[Distribution] = AllTuples :: Nil
+}
+```
 
 
 
@@ -64,9 +77,9 @@ case class SortExec() {
 
 ### BroadcastHashJoinExec
 
-BroadcastHashJoinExec 作为 Join 的一种实现，它表示会广播小表，然后按照hash的方式完成。
+BroadcastHashJoinExec 作为 Join 的一种实现，它表示会广播小表，然后按照哈希方式完成。
 
-它需要子节点的输出格式满足 BroadcastDistribution 要求。
+它需要小表的输出格式满足 BroadcastDistribution 要求。
 
 ```scala
 case class BroadcastHashJoinExec() {
@@ -86,7 +99,7 @@ case class BroadcastHashJoinExec() {
 
 ### ShuffledHashJoinExec
 
-如果是基于shuffle 的 join 方式，那么对两个子节点的输出格式满足 ClusteredDistribution 要求。
+如果是基于shuffle 的哈希方式，那么对两个子节点的输出格式满足 ClusteredDistribution 要求。
 
 ```scala
 case class ShuffledHashJoinExec() {
@@ -99,7 +112,7 @@ case class ShuffledHashJoinExec() {
 
 ### SortMergeJoinExec
 
-如果是基于排序 join 方式，那么对两个子节点的输出格式满足 ClusteredDistribution 要求。
+如果是基于排序方式，那么对两个子节点的输出格式满足 ClusteredDistribution 要求。
 
 ```scala
 case class SortMergeJoinExec() {
@@ -112,7 +125,7 @@ case class SortMergeJoinExec() {
 
 ### HashAggregateExec
 
-如果是基于hash方式的聚合，使用 ClusteredDistribution 要求
+如果是基于哈希方式的聚合，使用 ClusteredDistribution 要求
 
 ```scala
 case class HashAggregateExec() {
@@ -128,174 +141,145 @@ case class HashAggregateExec() {
 
 
 
-### GlobalLimitExec
-
-如果是 Limit 语句，那么要求子节点的输出格式为 AllTuples。
-
-```scala
-case class GlobalLimitExec(limit: Int, child: SparkPlan) extends BaseLimitExec {
-
-  override def requiredChildDistribution: List[Distribution] = AllTuples :: Nil
-}
-```
-
-
-
 ## 生成 Exchange
 
-如果子节点的输出格式，不能满足输入要求。就需要生成 Exchange，负责数据的重新分布，也就是 shuffle 过程。
-
-
-
-## BroadcastExchangeExec
-
-BroadcastExchangeExec 仅仅在 join 的时候会使用到，
-
-它的原理是利用了spark core 的广播机制，将小表作为 HashedRelation 类型的变量来广播出去。
-
-小表的数据大小不能超过 8GB，并且行数不能超过 5.12 亿条。
-
-
-
-## ShuffleExchange
-
-ShuffleExchange 首先根据 Partitioning 来创建分区器，然后创建出 ShuffleDependency。ShuffleDependency 是用来描述 shuffle 过程的。
-
-
-
-RoundRobinPartitioning ，随机开始，然后轮询
+如果子节点的输出格式不能满足输入要求，就需要触发 shuffle 过程，生成 Exchange。
 
 ```scala
-var position = new Random(TaskContext.get().partitionId()).nextInt(numPartitions)
-
-position += 1
-position
-```
-
-
-
-HashPartitioning 对应的分区器，它的分区原理如下
-
-分别计算每个表达式的值，然后根据这些表达式的值，计算出哈希值，最后对哈希值对分区数量取余。
-
-
-
-RangePartitioning 对应于 RangePartitioner。先进行采样，生成每个区间的范围
-
-```scala
-val rddForSampling = rdd.mapPartitionsInternal { iter =>
-  val mutablePair = new MutablePair[InternalRow, Null]()
-  iter.map(row => mutablePair.update(row.copy(), null))
-}
-implicit val ordering = new LazilyGeneratedOrdering(sortingExpressions, outputAttributes)
-new RangePartitioner(numPartitions, rddForSampling, ascending = true)
-```
-
-
-
-SinglePartition 对应着不分区，也就是所有的数据都在一个分区里
-
-```scala
-new Partitioner {
-  override def numPartitions: Int = 1
-  override def getPartition(key: Any): Int = 0
+// 遍历子节点
+children = children.zip(requiredChildDistributions).map {
+  // 检查子节点的数据输出格式是否满足输入要求
+  case (child, distribution) if child.outputPartitioning.satisfies(distribution) =>
+    child
+  // 如果是广播要求，那么生成 BroadcastExchangeExec 实例
+  case (child, BroadcastDistribution(mode)) =>
+    BroadcastExchangeExec(mode, child)
+  // 如果是其他要求，那么生成 ShuffleExchange 实例
+  // 并且根据输入要求来生成输出格式
+  case (child, distribution) =>
+    ShuffleExchange(createPartitioning(distribution, defaultNumPreShufflePartitions), child)
 }
 ```
 
-
-
-这些 shuffle 过程中的数据序列化，都是 UnsafeRowSerializer 类负责。
-
-
-
-SparkPlan 执行顺序
+createPartitioning 负责根据输入要求 Distribution，生成满足条件的输出格式 Partitioning。这里的分区数为 spark.sql.shuffle.partitions 配置项的值，默认为200。
 
 ```scala
-prepare()
-waitForSubqueries()
-doExecute()
+private def createPartitioning(
+    requiredDistribution: Distribution,
+    numPartitions: Int): Partitioning = {
+  requiredDistribution match {
+    case AllTuples => SinglePartition
+    case ClusteredDistribution(clustering) => HashPartitioning(clustering, numPartitions)
+    case OrderedDistribution(ordering) => RangePartitioning(ordering, numPartitions)
+    case dist => sys.error(s"Do not know how to satisfy distribution $dist")
+  }
 ```
 
 
 
 
 
-查看ShuffleExchange的执行流程，
+## BroadcastExchangeExec 原理
 
-prepare 会向ExchangeCoordinator 注册自身
+BroadcastExchangeExec 仅仅在 join 的时候会使用到，它要求小表的数据大小不能超过 8GB，并且行数不能超过 5.12 亿条。
 
-waitForSubqueries 会等待子查询完成
-
-doExecute，如果有ExchangeCoordinator，那么调用ExchangeCoordinator的方法生成ShuffledRowRDD。
+原理很简单，只是利用了spark core 的广播机制，将小表作为 HashedRelation 类型的变量来广播出去。
 
 
+
+## ShuffleExchange 生成 Shuffle 信息
+
+ShuffleExchange 的原理比较复杂， 首先根据输出格式 Partitioning 来创建分区器，然后创建 ShuffleDependency。ShuffleDependency 是用来描述 shuffle 过程的。下面依次介绍不同类型的 Partitioning 对应的分区器
+
+
+
+### RoundRobinPartitioning
+
+ 它首先会随机挑选出一个分区，然后将数据轮询的分配到每个分区里。
+
+
+
+### HashPartitioning
+
+ 它对应的分区器原理，是采用了哈希的原理。它会计算每个表达式的值，然后根据这些表达式的值，生成哈希值，最后将哈希值对分区数量取余。
+
+
+
+### RangePartitioning
+
+它会实例化 RangePartitioner 分区器，利用它进行采样，生成每个区间的范围。
+
+
+
+### SinglePartition
+
+ 对应着不分区，也就是所有的数据都在一个分区里
 
 
 
 ## ExchangeCoordinator
 
+ExchangeCoordinator 作为一个协调器，它会优化分区数量。比如当进行 shuffle 操作之后，有时候会因为分布不均，造成有很多的小分区。ExchangeCoordinator 会将这些小分区合并成一个分区，这样就会减少分区的数量，进而减少 reduce   数量。
 
 
-如果开启了 spark.sql.adaptive.enabled，那么 ShuffleExchange 会被实例化为 ExchangeCoordinator。
 
-但它不是所有的 ShuffleExchange 会被生成ExchangeCoordinator，需要满足下列任一条件
+### 生成 ExchangeCoordinator
+
+如果开启了 spark.sql.adaptive.enabled，那么在生成完 ShuffleExchange 后，还会生成 ExchangeCoordinator。
+
+但它不是所有的 ShuffleExchange 会被生成 ExchangeCoordinator，需要满足下列任一条件
 
 1. 子节点是 ShuffleExchange 实例，并且输出格式为 HashPartitioning
 2. 子节点的输出格式为 HashPartitioning
-3. 子节点是 PartitioningCollection 实例，且它的每个子节点的输出都是HashPartitioning
+3. 子节点是 PartitioningCollection 实例（包含了多个Partitioning），且它的每个子节点的输出都是HashPartitioning
 
-会将子节点都转换为ShuffleExchange实例
-
-
+最后会将这些子节点全都转为 ShuffleExchange 类型。
 
 
 
-运行原理
+### 运行原理
+
+ExcExchangeCoordinator 会调用`sparkContext.submitMapStage(shuffleDependency)`方法，来提交每个ShuffleExchange 子节点生成的 shuffle 任务。然后等待所有的 ShuffleExchange 子节点执行完成，就可以获得这些 shuffle 的输出数据信息，然后根据这些信息来合并数据量小的分区。
 
 
 
-首先等待所有的 ShuffleExchange 子节点，完成执行。然后根据这些 shuffle 的输出数据信息，来合并数据量小的分区。
-
-
-
-
-
-target input size 的计算方式
+我们需要先计算分区的大小阈值，所有合并之后的分区大小不能超过它。计算方法如下：
 
 根据 spark.sql.adaptive.minNumPostShufflePartitions 配置项的值， 它指定了最小的分区数。根据所有子节点的数据和，除以最小分区的数，即可得到每个分区的最大长度。然后同默认的分区大小（spark.sql.adaptive.shuffle.targetPostShuffleInputSize 配置项）相比，取最小值。
 
 
 
+### 合并小分区
 
+假设我们有两个 shuffle 的输出信息，里面包含了每个分区的大小。分区的大小阈值为 128MB
 
 ```
-* stage 1: [100 MB, 20 MB, 100 MB, 10MB, 30 MB]
-* stage 2: [10 MB,  10 MB, 70 MB,  5 MB, 5 MB]
-```
-
 target input size is 128 MB
 
-
-
-110MB
-
-分区0， 30MB ，因为 110MB + 30MB > 128MB，所以切片 110MB。
-
-分区1， 170MB，因为 30MB + 170MB > 128MB，所以切片 30MB。
-
-分区2， 15MB，因为 170MB + 15MB > 128MB，所以切片 170MB。
-
-分区3， 35MB，因为 15MB + 35MB < 128MB，所以不切片。
-
-已经遍历完了，所以最后一份切片是 15MB + 35MB  。
+* stage 1: [100 MB, 20 MB, 100 MB, 10MB, 30 MB]
+* stage 2: [10 MB,  10 MB, 70 MB,  5 MB, 5 MB]
+* result : [110MB, 30MB, 170MB, 50MB]
+```
 
 
 
-ShuffledRowRDDPartition 分区信息，包含了父RDD的起始索引和结束索引。
+分区 0 的和为 110MB，因为 110MB < 128MB，所以等待合并。
 
-ShuffledRowRDD 会根据分区信息，从父RDD的多个分区中拉取数据。
+分区 1 的和为 30MB ，因为 110MB + 30MB > 128MB，所以分区 0 不能合并。
+
+分区 2， 170MB，因为 30MB + 170MB > 128MB，所以分区 1 不能合并。
+
+分区 3， 15MB，因为 170MB + 15MB > 128MB，所以分区 2  不能合并。
+
+分区 4， 35MB，因为 15MB + 35MB < 128MB，所以等待合并。·
+
+最后遍历完成，所以将分区3 和 分区 4 合并 。
 
 
+
+### ShuffledRowRDD
+
+ExchangeCoordinator 会根据合并分区信息，生成 ShuffledRowRDD。它的分区由 ShuffledRowRDDPartition 类表示，它包含了父RDD的起始索引和结束索引。
 
 ```scala
 private final class ShuffledRowRDDPartition(
