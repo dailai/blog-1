@@ -267,3 +267,4 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
 
 将那些没有消费记录的分区，重置开始位置。并且调用Fetcher获取对应分区的位置。
+
