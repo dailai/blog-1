@@ -2,23 +2,23 @@
 
 ## 前言
 
-Kafka 作为一个高吞吐量的消息队列，它的很多设计都体现了这一点。比如它的客户端，无论是 Producer 还是 Consumer    ，都会内置一个缓存存储消息。这样类似于我们写文件时，并不会一次只写一个字节，而是写到一个缓存里，然后等缓存满了，才会将缓存里的数据写入到磁盘。这种缓存机制可以有效的提高吞吐量。本篇文章介绍缓存在 Kafka 客户端的实现原理
+Kafka 作为一个高吞吐量的消息队列，它的很多设计都体现了这一点。比如它的客户端，无论是 Producer 还是 Consumer    ，都会内置一个缓存用来存储消息。这样类似于我们写文件时，并不会一次只写一个字节，而是先写到一个缓存里，然后等缓存满了，才会将缓存里的数据写入到磁盘。这种缓存机制可以有效的提高吞吐量，本篇文章介绍缓存在 Kafka 客户端的实现原理。
 
 
 
 ## Producer 缓存
 
-首先介绍 Producer 端的缓存实现，它内部实现了一个内存池。当向缓存添加消息时，会先向内存池申请内存。当消息发送完成后，就会向内存池释放内存。
+我们知道 Producer 发送消息，会先将它存到 RecordAccumulator 的缓存里，等待缓存满了之后，就会发送到服务端。这个缓存的大小，是由内部的内存池控制的。
+
+
 
 ### 内存池使用
-
-我们知道 Producer 发送消息，会先将它存到 RecordAccumulator 的缓存里，存储的格式是将多个消息压缩成一个 batch 存储。
 
 我们通过观察 RecordAccumulator 的 append 接口，可以看到每次缓存消息之前，都会向内存池申请内存。
 
 ```java
 public final class RecordAccumulator {
-    // 消息缓存队列
+    // 消息缓存队列，以batch格式存储
     private final ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches;    
     // 内存池
     private final BufferPool free;
@@ -35,7 +35,7 @@ public final class RecordAccumulator {
 
 
 
-Sender 线程会将缓存的消息batch发送出去。当消息batch发送后，会触发 RecordAccumulator 释放内存。
+当消息发送后，会触发 RecordAccumulator 释放内存。
 
 ```java
 public final class RecordAccumulator {
@@ -58,17 +58,15 @@ public final class RecordAccumulator {
 
 ### 内存池结构
 
-使用内存池有两个优点，一个是能够限制内存的使用量，另一个是减少内存的申请和回收的频率。虽然 java 支持自动 gc ，但是 gc 是有成本的。为了减少 gc 开销，我们可以预先分配一段常驻内存（不会被回收），然后从这里借用内存，使用后又还给它，这样就没有任何的 gc。
+使用内存池有两个优点，一个是能够限制内存的使用量，另一个是减少内存的申请和回收频率。虽然 java 支持自动 gc ，但是 gc 也是有成本的。如果之前申请的内存用完之后，还可以重新复用，那么就不会触发 gc。但是内存池的实现有一个难点，那就是如何高效的重新利用。因为每次申请的内存大小都不相同，这样就没办法直接利用了。一种常见的做法是只缓存那些特定大小的内存，对于其他大小的内存则使用后直接丢弃。
 
-但是内存池的实现有一个难点，那就是如何高效的重新利用。因为每次申请的内存大小都不相同，这样就没办法直接利用了。一种常见的做法是只缓存那些特定大小的内存，这样就很容易实现了复用。我们知道 Kafka 为了提高吞吐量，都是以 batch 格式保存消息。Producer 端实现的内存池，它结合了消息 batch 的特点，试图将每个消息 batch 的大小控制在一定范围内。基于这个原因，Kafka 的内存池分为两部分。一部分是特定大小内存块的缓存池，另一个是非缓存池。
-
-
+我们知道 Kafka 为了提高吞吐量，都是以 batch 格式保存消息。Producer 在实现内存池时，它结合了消息 batch 的特点，试图将每个消息 batch 的大小控制在一定范围内。这样每次申请内存的大小，就可以是相同的。基于这个原因，Kafka 的内存池分为两部分。一部分是特定大小内存块的缓存池，另一个是非缓存池。
 
 
 
 
 
-当申请内存的长度等于特定的数值，则优先从缓存池中获取。如果缓存池没有空闲的，那么需要先向非缓存池部分申请内存。等到这块内存使用完后，才会被存储到缓存池。注意到缓存池的大小是可变的，一开始为零。随着用户申请和释放，才慢慢增长起来的。
+当申请的内存大小等于特定的数值，则优先从缓存池中获取。如果缓存池没有，那么需要向非缓存池部分申请内存。等到这块内存使用完后，才会被放入到缓存池等待复用。注意到缓存池的大小是可变的，一开始为零。随着用户申请和释放，才慢慢增长起来的。
 
 如果申请的内存不等于特定的数值，则向非缓存池申请。如果内存空间不够用，那么就需要释放缓存池的内存。
 
@@ -196,14 +194,16 @@ public class BufferPool {
 
 ## Consumer 缓存
 
-Consumer 从服务端获取消息，都是以消息 batch 的格式获取，一次性会获取到多条，然后存到缓存里。KafkaConsumer 提供了 poll 方法读取消息，原理也是从缓存里直接获取。如果缓存里没有，才会向服务端发出请求。
+Consumer 从服务端获取消息，也是以消息 batch 的格式获取，然后存到缓存里。KafkaConsumer 提供了 poll 方法读取消息。它的原理是从缓存里直接获取，如果缓存里没有，才会向服务端发出请求。
 
-负责消息缓存和发送请求的操作，都是由 Fetcher 类负责。这里主要关注两个接口
+Fetcher 使用了一个队列，来缓存从服务端获取的响应。当用户从缓存中读取消息时，会依次从队列里解析响应，返回消息。但是用户一次不能获取过多数量的消息，这个阈值由配置项 max.poll.records 指定，默认为500。
+
+Fetcher 类还负责与服务端的交互。这里主要关注两个接口
 
 * fetchedRecords，负责读取缓存消息
 * sendFetches，负责发送请求
 
-KafkaConsumer 读取消息的过程
+KafkaConsumer 读取消息的过程如下
 
 ```java
 public class KafkaConsumer<K, V> implements Consumer<K, V> {
@@ -246,11 +246,9 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
 
 
-Fetcher 使用了一个队列，来缓存从服务端获取的响应。当用户从缓存中读取消息时，会依次从队列里解析响应，返回消息。但是用户一次性不能获取过多的消息，这个阈值由配置项 max.poll.records 指定，默认为500。
+我们注意到 Consumer 在每次读取消息之后，都会触发一次发送请求，这样对于提高性能有好处，减少了下一次的请求等待时间。但是这样会存在一个问题，假想我们把  max.poll.records 设置为 1，这样每次从服务端返回的消息数量都比 1 大，那么缓存就会持续的增长，造成 OOM。
 
-我们注意到 Consumer 在每次 poll 之后，都会触发一次发送请求，这样对于提高性能有好处，减少了请求等待时间。但是这样会存在一个问题，假想我们把  max.poll.records 设置为 1，这样每次请求的消息数量都比 1 大，那么缓存就会持续的增长。
-
-Fetcher 每次发送请求，都会拉取每个分区的消息。它的 fetchablePartitions 决定了请求的分区，它会检查这些分区，如果该分区在缓存中有对应的消息，那么就不需要请求。这样就基本保证了缓存里拥有每个分区的消息。
+其实 Fetcher 每次发送请求，并不是拉取所有分区的消息。它的 fetchablePartitions 方法决定了请求的分区，它会检查分区在缓存中是否有对应的消息，如果有那么就不请求。这样就基本保证了缓存里拥有每个分区的消息。
 
 ```java
 public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
@@ -284,7 +282,4 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
 * max_bytes，表示响应数据的最大长度。可以通过配置 fetch.max.bytes 来指定，默认为 50MB
 * min_bytes，表示响应数据的最小长度。可以通过配置 fetch.min.bytes 来指定，默认为 1B
 
-每次请求还包含了每个分区的请求，对于分区返回的数据大小，也有限制。通过配置 max.partition.fetch.bytes 来指定，默认为 1MB。
-
-
-
+每次请求还包含了多个分区，对于每个分区返回的数据大小，也有限制。通过配置 max.partition.fetch.bytes 来指定，默认为 1MB。这样我们能够粗略的计算出缓存的大小，分配的分区数量 * max.partition.fetch.bytes 。
