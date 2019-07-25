@@ -278,3 +278,29 @@ class AMEndpoint(override val rpcEnv: RpcEnv, driver: RpcEndpointRef, isClusterM
 }
 ```
 
+
+
+## Container 启动
+
+每个 Container 申请的内存大小，
+
+```scala
+// Executor memory in MB.
+protected val executorMemory = sparkConf.get(EXECUTOR_MEMORY).toInt  // 从 EXECUTOR_MEMORY 参数获取
+
+// 计算额外的内存大小
+protected val memoryOverhead: Int = sparkConf.get(EXECUTOR_MEMORY_OVERHEAD).getOrElse(
+  math.max((MEMORY_OVERHEAD_FACTOR * executorMemory).toInt, MEMORY_OVERHEAD_MIN)).toInt
+// Number of cores per executor.
+protected val executorCores = sparkConf.get(EXECUTOR_CORES)
+// 每个Container的内存大小是 EXECUTOR_MEMORY 加上 额外的内存大小
+private[yarn] val resource = Resource.newInstance(executorMemory + memoryOverhead, executorCores)
+```
+
+
+
+Container 在启动程序的时候，设置了Jvm 的最大堆为EXECUTOR_MEMORY。而java 程序运行时，分为jvm管理的内存和本地内存。jvm 管理的内存也分为多部分，但是堆占的比重很大。EXECUTOR_MEMORY 仅仅只能限制 jvm 管理内存中的堆区域，但是本地内存却无法管理，它属于进程所有，也就是由操作系统管理，而操作系统一般不对进程使用的内存做限制，无非超过了物理机的容量。当然 yarn 会实时监测 Container 运行的内存，如果发现本机内存超标，就会杀死它。
+
+所以Container申请的两部分内存，对应于两部分。EXECUTOR_MEMORY 用于  jvm 管理的堆，而 额外的内存大小用于本地内存。
+
+如果yarn 的内存分配单元为 1GB，而这时设置spark 的 executorMemory 也为1GB，那么因为spark实际申请的内存还要加上额外的内存，那么就会造成 yarn 会分配两个资源，也就是 2GB 的内存。这种情况造成了资源的浪费，虽然多分配的1GB 内存当作本地内存使用了。
