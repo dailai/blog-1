@@ -1,10 +1,119 @@
-# ShuffleClient #
+## Shuffle 位置获取
 
-ShuffleClient表示shuffle files的客户端，支持远程读取文件。
+当读取Shuffle 的数据之前，需要先MapOutputTracker获取数据所在的位置，然后才会读取数据。
 
-BlockTransferService继承ShuffleClient，增加了写文件。
 
-NettyBlockTransferService继承BlockTransferService， 实现了所有的接口，也同时提供了
+
+
+
+
+
+
+
+
+
+## ShuffleBlockFetcherIterator
+
+首先根据 shuffle 数据所在的位置，分为本地数据和远程数据。本地数据直接从文件中即可读取，而远程数据需要通过网络传输。
+
+
+
+### 生成请求
+
+
+
+maxBytesInFlight 表示最大量
+
+
+
+至于远程的shuffle数据，首先根据所在位置进行分组。然后将组里的数据，根据大小进一步分组。一个请求包含了多份 shuffle 数据，这个请求的数据总和，基本控制在不大于 1 / maxBytesInFlight，但也有例外的情况，
+
+```scala
+val targetRequestSize = math.max(maxBytesInFlight / 5, 1L)
+val remoteRequests = new ArrayBuffer[FetchRequest]
+// blocksByAddress 根据地址分组，存储着shuffle数据列表
+for ((address, blockInfos) <- blocksByAddress) {
+    val iterator = blockInfos.iterator
+    var curRequestSize = 0L
+    var curBlocks = new ArrayBuffer[(BlockId, Long)]
+    while (iterator.hasNext) {
+        // 遍历shuffle数据大小，直到累积和大于targetRequestSize
+        curBlocks += ((blockId, size))
+        curRequestSize += size
+        if (curRequestSize >= targetRequestSize) {
+            // 累积的数据足够大了，那么就生成一个请求
+            // 但是可能发生一种情况，curRequestSize 略小于 targetRequestSize，并且新加的这份数据相当大，那么就会造成此次请求包含的数据会特别大
+            remoteRequests += new FetchRequest(address, curBlocks)
+            curBlocks = new ArrayBuffer[(BlockId, Long)]
+            curRequestSize = 0
+        }
+    
+    if (curBlocks.nonEmpty) {
+        remoteRequests += new FetchRequest(address, curBlocks)
+    }
+```
+
+
+
+### 并发请求
+
+上面已经生成了请求，现在如何将其高效率的发送出去。通常我们都是采用异步的方式，spark 也是基于 Netty 来实现异步传输的。但是同时 spark 在此基础上，还实现了并发的限制，防止占用过大的资源。
+
+正在发送的请求数，不能超过指定数量，由 spark.reducer.maxReqsInFlight 配置表示，默认 Int.MaxValue，可以认为无限制。
+
+正在请求的数据总和，不能超过指定数量，由spark.reducer.maxSizeInFlight 配置表示，默认为 48MB。
+
+对于单次请求的数据过大时，spark 会使用 stream 模式请求，也就是将数据分块下载，存储到文件里，每个文件对应着一份shuffle数据。对于数据较小的情况，spark 会将数据全部存储到内存里。这个阈值由spark.reducer.maxReqSizeShuffleToMem 配置指定，比较奇怪的是默认值为Long.MaxValue，可以认为是无限大。如果发生了shuffle 倾斜，这就很容易造成内存溢出了。
+
+
+
+
+
+## ShuffleClient
+
+ShuffleClient表示shuffle 数据的客户端，支持远程读取数据。
+
+BlockTransferService继承ShuffleClient，增加了上传数据。
+
+NettyBlockTransferService继承BlockTransferService， 实现了所有的接口。
+
+ExternalShuffleClient 实现。。。。
+
+
+
+
+
+## OneForOneBlockFetcher
+
+
+
+
+
+
+
+## Netty TransportClient
+
+netty in pipeline
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -250,7 +250,7 @@ def waitForSparkDriver(): RpcEndpointRef = {
 
 ## AMEndpoint 启动 ##
 
-AMEndpoint是只和YarnSchedulerEndpoint通信，它在启动之后会发送RegisterClusterManager消息给YarnSchedulerEndpoint，消息会携带AMEndpoint客户端。这样YarnSchedulerEndpoint就可以通过它与AMEndpoint通信了。
+因为 ApplicationMaster 进程运行的所在 Container，是由随机分配的，所以 YarnSchedulerEndpoint 并不知道 AMEndpoint 的地址。AMEndpoint 在启动之后会发送 RegisterClusterManager 消息给 YarnSchedulerEndpoint，消息会携带AMEndpoint客户端。这样YarnSchedulerEndpoint就可以通过它与AMEndpoint通信了。
 
 ```scala
 class ApplicationMaster(.... ) {
