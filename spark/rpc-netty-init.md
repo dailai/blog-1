@@ -1,24 +1,10 @@
-# spark rpc 原理 #
+# Spark  Rpc 消息处理 #
 
 
 
-## netty 初始化 ##
+## 前言
 
-spark rpc是基于netty框架的, spark rpc的客户端是TransportClient表示。通过TransportClient的建立，可以看到它是netty的初始化过程。
-
-netty的ChannelHandler调用链如图：
-
-```mermaid
-graph LR
-
-	Request --> TransportFrameDecoder
-	TransportFrameDecoder --> MessageDecoder
-	MessageDecoder --> IdleStateHandler
-	IdleStateHandler --> TransportChannelHandler
-	TransportChannelHandler --> MessageEncoder
-	MessageEncoder --> Response
-	
-```
+Spark Rpc 所有的请求或响应统称为消息，它们都有着共同的格式。本篇文章会先介绍消息格式，然后介绍基于 Netty 框架，如何解析和处理消息，并且还介绍了如何处理数据大的请求。
 
 
 
@@ -32,9 +18,11 @@ frame size |   type   |  header  |     body
 ----------------------------------------------------------
 ```
 
-frame size 表示后面的数据长度，至少包括 type 和 header，有些消息还会包含 message body。netty 在解析消息时，必须至少读取到 frame size 长度的数据，才能消息请求。
+frame size 表示后面的数据长度，至少包括 type 和 header，有些消息还会包含 body。
 
-header 和 body 部分，根据消息种类的不同，格式也不一样。有些消息没有 body 。
+header 根据消息种类的不同，格式也不一样。一般 header 数据都比较小。
+
+body 根据消息种类的不同，格式也不一样。有的消息的 body 比较大，而有些消息甚至没有 body 。
 
 比如 RpcRequest 消息, 它的 frame size 表示 type，header 和 body 三部分的总长度。
 
@@ -44,17 +32,21 @@ StreamResponse 消息，它的 frame size 只表示 type 和 header 两部分的
 
 
 
-## Channel Handler介绍 ##
+## Netty 处理管道
 
-接下来按照顺序，了解这些ChannelHandler的作用
+Netty 的 处理消息，都是依靠 ChannelHandler 链来处理的。它的调用链如图所示：
+
+
+
+## Channel Handler 介绍 ##
 
 ### TransportFrameDecoder ###
 
-TransportFrameDecoder 负责解析消息，它会保证读取完 frame size 大小的数据长度，才会进一步传递给下个 Handler 处理。在读取的数据小于 frame size，它会将数据存到缓存里。所以使用这种方式，必须要能保证 frame size 较小。
+Netty 在解析消息时，必须至少读取到 frame size 长度的数据，才能处理消息。
 
-从上面的消息格式看到，只有 header 和 body 两部分的数据是变长的。header 数据都比较小，而 body 数据长度根据消息的类型不同。比如 RpcRequest 消息表示 rpc 请求消息，它的 body 长度可以认为比较小。而 StreamResponse 消息表示 shuffle 数据传输，一般都比较大，所以它的 framesize 不包括 body。
+TransportFrameDecoder 负责解析消息。它会先解析出 frame size 的值，然后继续等待数据，直到读取的数据长度至少等于 frame size ，才会进一步传递给下个 Handler 处理。它会将这些数据存到缓存里，所以使用这种方式，必须要能保证 frame size 较小。所以对于 body 数据比较大的情况，比如对于 StreamResponse 消息表示 shuffle 数据传输，一般都比较大 它的 frame size 是不包括 body 的。
 
-TransportFrameDecoder 有一个特殊的 Interceptor 实例，当数据特别大时，负责处理 body 数据。
+处理这种大消息，也是和 TransportFrameDecoder 有关。 它有一个特殊的 Interceptor 实例，用来处理这种消息。
 
 1. TransportFrameDecoder 负责读取完 type 和 header 数据，然后传递给下个 Handler 处理
 2. 当最终的 TransportChannelHandler 接收到上一部传来的数据后，它会根据消息类型，实例化出 Interceptor 对象，存放到 TransportFrameDecoder，负责处理 body 数据。
@@ -89,35 +81,23 @@ enum Type implements Encodable {
 
 
 
-## 核心处理 Handler 
+## 核心 ChannelHandler 
 
-TransportChannelHandler 是最为核心的 Handler，它根据请求消息和响应消息，分为两种处理方式。以 rpc 消息为例，服务端会处理请求消息，而客户端会负责处理响应消息。
+TransportChannelHandler 是最为核心的 Handler，前面的 Handler 只是用来解析消息，而它负责最核心的处理程序。根据消息是客户端发送的请求消息，还是服务端发送的响应消息，分为两种处理方式。
+
+
 
 ## 请求消息处理
 
-TransportRequestHandler 类会负责处理请求消息。根据消息类型不同，处理的程序也不一样。
-
-### Rpc 请求消息
-
-这类消息表示由客户端发过来的请求，它会被 RpcHandler 处理。
+服务端会负责处理请求消息，由 TransportRequestHandler 类负责。根据消息类型不同，处理的程序也不一样。
 
 
 
-### Chunk 请求消息
 
-这类消息表示由客户端发过来的请求，它会被 StreamManager 处理。
-
-
-
-### Stream 请求消息
-
-这类消息表示由客户端发过来的请求，它会被 StreamManager 处理。
-
- 
 
 ## 响应消息处理
 
-TransportResponseHandler 类会负责处理响应消息。根据消息类型不同，处理的程序也不一样。
+客户端负责处理响应消息，由 TransportResponseHandler 类负责。根据消息类型不同，处理的程序也不一样。
 
 ### Rpc 响应消息
 
@@ -139,13 +119,5 @@ StreamResponse 消息的 frame size 是不包括 body 数据的，所以它在�
 
 
 
-## 消息种类
 
-
-
-Chunk ------------------- StreamManager
-
-Stream ----------------- StreamManager
-
-Rpc  -------------- Rpchandler
 
