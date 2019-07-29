@@ -69,7 +69,25 @@ for ((address, blockInfos) <- blocksByAddress) {
 
 
 
-## ShuffleClient
+## ShuffleClient 类图
+
+%plantuml%
+
+@startuml
+abstract class ShuffleClient
+class BlockTransferService
+class NettyBlockTransferService
+class ExternalShuffleClient
+class MesosExternalShuffleClient
+
+ShuffleClient <|-- BlockTransferService
+BlockTransferService <|-- NettyBlockTransferService
+ShuffleClient <|-- ExternalShuffleClient
+ExternalShuffleClient <|-- MesosExternalShuffleClient
+
+@enduml
+
+%plantuml%
 
 ShuffleClient表示shuffle 数据的客户端，支持远程读取数据。
 
@@ -85,90 +103,91 @@ ExternalShuffleClient 实现。。。。
 
 ## OneForOneBlockFetcher
 
+NettyBlockTransferService 使用 OneForOneBlockFetcher 远程获取shuffle数据。
 
+首先发送 OpenBlocks rpc 请求，
 
-
-
-
-
-## Netty TransportClient
-
-netty in pipeline
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## 启动服务 ##
-
-NettyBlockTransferService是基于Netty框架的，之前在rpc框架中也有讲到TransportServer。
-
-```scala
-override def init(blockDataManager: BlockDataManager): Unit = {
-  // 初始化NettyBlockRpcServer
-  val rpcHandler = new NettyBlockRpcServer(conf.getAppId, serializer, blockDataManager)
- // 生成TransportServerBootstrap
-  var serverBootstrap: Option[TransportServerBootstrap] = None
-  if (authEnabled) {
-    serverBootstrap = Some(new AuthServerBootstrap(transportConf, securityManager))
-	)
-  }
-  // 实例化transportContext， 注册 rpcHandler
-  transportContext = new TransportContext(transportConf, rpcHandler)
-  server = createServer(serverBootstrap.toList)
-  appId = conf.getAppId
-  logInfo(s"Server created on ${hostName}:${server.getPort}")
+```java
+public class OpenBlocks extends BlockTransferMessage {
+  public final String appId; // 
+  public final String execId;  // executor id
+  public final String[] blockIds; // 获取的block id列表
 }
-
- private def createServer(bootstraps: List[TransportServerBootstrap]): TransportServer = {
-    def startService(port: Int): (TransportServer, Int) = {
-      // 通过transportContext实例化server
-      val server = transportContext实例化server.createServer(bindAddress, port, bootstraps.asJava)
-      (server, server.getPort)
-    }
-
-    Utils.startServiceOnPort(_port, startService, conf, getClass.getName)._1
-  }
 ```
+
+响应 StreamHandle
+
+```java
+public class StreamHandle extends BlockTransferMessage {
+  public final long streamId; // 分配的stream id
+  public final int numChunks; // 多少块 
+}
+```
+
+
+
+如果指定了文件名，那么表示接收的数据需要存储到文件。所以会以 stream 的方式请求数据。
+
+否则就采用fetch的方式请求数据，数据会先存到内存里。如果数据过大，就会造成内存溢出。
+
+```java
+private class DownloadCallback implements StreamCallback {
+    private WritableByteChannel channel = null;
+    
+    // 只要接收到数据，就会立马写入到文件中
+    public void onData(String streamId, ByteBuffer buf) throws IOException {
+        channel.write(buf);
+    }
+    
+    // 获取数据完成后，会通知listener
+    public void onComplete(String streamId) throws IOException {
+        channel.close();
+        // 基于文件封装的buffer
+        ManagedBuffer buffer = new FileSegmentManagedBuffer(transportConf, targetFile, 0, targetFile.length());
+        // 执行listener回调函数
+        listener.onBlockFetchSuccess(blockIds[chunkIndex], buffer);
+    }
+}
+```
+
+
+
+```java
+private class ChunkCallback implements ChunkReceivedCallback {
+    // buffer是netty分配的堆外内存
+    public void onSuccess(int chunkIndex, ManagedBuffer buffer) {
+        listener.onBlockFetchSuccess(blockIds[chunkIndex], buffer);
+    }
+}
+```
+
+
+
+
+
+## NettyBlockTransferService 启动服务 ##
+
+NettyBlockTransferService 类不仅作实现了客户端的接口，同样它还负责创建服务端的实例。服务端是基于 netty 框架实现的，它的核心处理 由 NettyBlockRpcServer 类负责。
+
+
 
 注意到NettyBlockRpcServer，它继承了RpcHandler，实现了处理请求的逻辑。NettyBlockRpcServer只接收OpenBlocks和UploadBlock请求。
 
 ```scala
-class NettyBlockRpcServer(
-    appId: String,
-    serializer: Serializer,
-    blockManager: BlockDataManager)
-  extends RpcHandler with Logging {
+class NettyBlockRpcServer(appId: String, serializer: Serializer, blockManager: BlockDataManager) extends RpcHandler with Logging {
     override def receive(
-      client: TransportClient,
-      rpcMessage: ByteBuffer,
-      responseContext: RpcResponseCallback): Unit = {
+      client: TransportClient, rpcMessage: ByteBuffer, responseContext: RpcResponseCallback): Unit = {
     	val message = BlockTransferMessage.Decoder.fromByteBuffer(rpcMessage)
     	logTrace(s"Received request: $message")
 
     	message match {
             case openBlocks: OpenBlocks =>
-            	// 生成streamId
+                val blocksNum = openBlocks.blockIds.length
+                // 针对每个blockId，生成FileSegmentManagedBuffer
+                val blocks = for (i <- (0 until blocksNum).view)
+                  yield blockManager.getBlockData(BlockId.apply(openBlocks.blockIds(i)))
+            	// 生成streamId，并且在StreamManager注册
             	val streamId = streamManager.registerStream(appId, blocks.iterator.asJava)
-           		.......
             	// 响应StreamHandle结果
             	responseContext.onSuccess(new StreamHandle(streamId, blocksNum).toByteBuffer)
             
@@ -185,54 +204,55 @@ class NettyBlockRpcServer(
 
 
 
+
+
+## StreamManager
+
+StreamManager 有两个子类，NettyStreamManager 和 OneForOneStreamManager。
+
+NettyStreamManager 用于传输配置文件或 jar 包。
+
+目前 NettyBlockRpcServer 使用的是 OneForOneStreamManager，负责shuffle 数据的服务端。
+
+```java
+public class OneForOneStreamManager extends StreamManager {
+  // 用来生成递增唯一的streamId
+  private final AtomicLong nextStreamId;
+  // 根据streamId 找到对应的数据，数据由StreamState表示
+  private final ConcurrentHashMap<Long, StreamState> streams;
+  
+  // 注册stream数据
+  public long registerStream(String appId, Iterator<ManagedBuffer> buffers) {
+    long myStreamId = nextStreamId.getAndIncrement();
+    streams.put(myStreamId, new StreamState(appId, buffers));
+    return myStreamId;
+  }
+}
+```
+
+
+
+
+
+回到TransportRequestHandler，它处理ChunkFetchRequest请求时，调用了StreamManager 的 getChunk 方法。在处理 StreamRequest请求时，调用了StreamManager 的 openStream 方法。
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## 客户请求 ##
 
 ### 读取请求 ###
 
 NettyBlockTransferService也实现了客户端的接口。fetchBlocks负责读取远端 Block。这里请求支持失败重试，这里涉及到了RetryingBlockFetcher。RetryingBlockFetcher的原理是当请求失败后，会将请求丢到后台的线程继续尝试。
-
-```java
-public class RetryingBlockFetcher {
-    // 实际获取Block的客户端
-    private final BlockFetchStarter fetchStarter;
-    // 后台重试的线程
-    private static final ExecutorService executorService = Executors.newCachedThreadPool(
-    NettyUtils.createThreadFactory("Block Fetch Retry"));
-    
-    public void start() {
-    	fetchAllOutstanding();
-  	}
-    
-    private void fetchAllOutstanding() {
-        
-        try {
-            // 请求Block数据
-      		fetchStarter.createAndStart(blockIdsToFetch, myListener);
-    	} catch (Exception e) {
-            // 判断是否能够重试
-            if (shouldRetry(e)) {
-                // 失败重试
-        		initiateRetry();
-      		} else {
-                // 调用失败函数
-        		for (String bid : blockIdsToFetch) {
-          			listener.onBlockFetchFailure(bid, e);
-        		}
-      		}
-        }
-    }
-    
-    private synchronized void initiateRetry() {
-    	retryCount += 1;
-    	currentListener = new RetryingBlockFetchListener();
-        // 向后台线程，提交fetchAllOutstanding的任务
-        executorService.submit(() -> {
-        	Uninterruptibles.sleepUninterruptibly(retryWaitTime, TimeUnit.MILLISECONDS);
-        	fetchAllOutstanding();
-    	});
-    }
-        
-```
 
 
 
@@ -251,51 +271,9 @@ val blockFetchStarter = new RetryingBlockFetcher.BlockFetchStarter {
 
 OneForOneBlockFetcher，首先根据BlockIds生成请求OpenBlocks，调用client的sendRpc发送请求。收到的响应消息是StreamHandle，它包含了streamId，和ChunkId列表。然后客户端会再去请求Chunk的数据。如果shuffleFiles不为空，表示这些数据都要存到文件里，这里client调用stream方法。否则，这些数据会存到内存里，这里client调用fetchChunk方法。
 
-```java
-public class OneForOneBlockFetcher {
-    
-    private final OpenBlocks openMessage;
-    
-    public void start() {
-        client.sendRpc(openMessage.toByteBuffer(), new RpcResponseCallback() {
-            @Override
-      		public void onSuccess(ByteBuffer response) {
-                streamHandle = (StreamHandle) BlockTransferMessage.Decoder.fromByteBuffer(response);
-                for (int i = 0; i < streamHandle.numChunks; i++) {
-                    if (shuffleFiles != null) {
-                        client.stream(OneForOneStreamManager.genStreamChunkId(streamHandle.streamId, i),
-                                       new DownloadCallback(shuffleFiles[i], i));
-                    }	else {
-                        	client.fetchChunk(streamHandle.streamId, i, chunkCallback);
-                    }
-                   ...............
-                }
-            }
-        }
-                       
-                    
-                                      
-```
+
 
 ### 写请求 ###
 
 uploadBlock方法实现了请求写Block，它简单的调用了client.sendRpc，发送UploadBlock请求消息。
-
-```scala
-override def uploadBlock(....) {
-    val result = Promise[Unit]()
-    client.sendRpc(new UploadBlock(appId, execId, blockId.toString, metadata, array).toByteBuffer,
-      new RpcResponseCallback {
-        override def onSuccess(response: ByteBuffer): Unit = {
-          logTrace(s"Successfully uploaded block $blockId")
-          result.success((): Unit)
-        }
-        override def onFailure(e: Throwable): Unit = {
-          logError(s"Error while uploading block $blockId", e)
-          result.failure(e)
-        }
-      })
-    result.future
-}
-```
 
