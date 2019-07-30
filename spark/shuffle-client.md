@@ -1,14 +1,45 @@
-## Shuffle 位置获取
+```mermaid
+sequenceDiagram
+    participant ShuffleReader
+    participant MapOutputTracker
+    participant ShuffleBlockFetcherIterator
+    participant OneForOneBlockFetcher
+    participant TransportChannelHandler
+    participant NettyBlockRpcServer
+	participant TransportRequestHandler
+    
+    ShuffleReader->>+MapOutputTracker: 发送ShuffleID，获取数据位置
+    MapOutputTracker-->>-ShuffleReader: 返回位置信息
+    ShuffleReader->>+ShuffleBlockFetcherIterator: 根据数据位置和大小，构建请求
+    ShuffleBlockFetcherIterator->>+OneForOneBlockFetcher: 发送请求
+    OneForOneBlockFetcher->>+TransportChannelHandler: 发送OpenBlocks请求
+    TransportChannelHandler->>+NettyBlockRpcServer: 处理OpenBlocks请求
+    NettyBlockRpcServer-->>-TransportChannelHandler: 返回streamId
+    TransportChannelHandler-->>-OneForOneBlockFetcher: 返回StreamHandle响应
+    
+    OneForOneBlockFetcher->>+TransportChannelHandler: 发送Stream或Chunk请求
+    TransportChannelHandler->>+TransportRequestHandler: 处理Stream或Chunk请求
+    TransportRequestHandler-->>-TransportChannelHandler: 返回数据
+    TransportChannelHandler-->>-OneForOneBlockFetcher: 返回数据
+    
+    OneForOneBlockFetcher-->>-ShuffleBlockFetcherIterator: 返回数据
+    ShuffleBlockFetcherIterator-->>-ShuffleReader: 返回数据
 
-当读取Shuffle 的数据之前，需要先MapOutputTracker获取数据所在的位置，然后才会读取数据。
+```
 
 
 
+shuffle 位置获取，从MapOutputTracker获取数据所在的位置。
 
+ShuffleBlockFetcherIterator 构建请求
 
+OneForOneBlockFetcher 负责发送请求，它需要向请求OpenBlocks，会收到StreamHandler响应。
 
+NettyBlockRpcServer 负责处理OpenBlocks请求，会根据blockId 列表，找到对应的文件。并且生成streamId，这样客户端通过 streamId 就可以获取数据了。
 
+OneForOneBlockFetcher 接收到StreamHandler相应后。如果指定了要将数据存储到文件，那么就发送Stream请求。否则发送Chunk请求，数据会保存在内存中。
 
+TransportRequestHandler 处理 Stream 或Chunk 请求，会通过 StreamManager 返回数据。
 
 
 
@@ -19,8 +50,6 @@
 
 
 ### 生成请求
-
-
 
 maxBytesInFlight 表示最大量
 
@@ -223,6 +252,7 @@ public class OneForOneStreamManager extends StreamManager {
   
   // 注册stream数据
   public long registerStream(String appId, Iterator<ManagedBuffer> buffers) {
+    // 生成streamId
     long myStreamId = nextStreamId.getAndIncrement();
     streams.put(myStreamId, new StreamState(appId, buffers));
     return myStreamId;
@@ -232,19 +262,9 @@ public class OneForOneStreamManager extends StreamManager {
 
 
 
+对于Chunk 请求或 Stream 请求，都会指明streamId 和 chunk_index。OneForOneStreamManager 会根据 streamId，找到对应的数据列表，根据 chunk_index 找到列表中的元素。之后使用零拷贝的技术，实现文件到socket的传输。
 
-
-回到TransportRequestHandler，它处理ChunkFetchRequest请求时，调用了StreamManager 的 getChunk 方法。在处理 StreamRequest请求时，调用了StreamManager 的 openStream 方法。
-
-
-
-
-
-
-
-
-
-
+NettyBlockRpcServer 接收到OpenBlocks请求时，就会根据 blockId 列表，找到对应的数据，生成FileSegmentManagedBuffer 列表。这些ManagedBuffer会存储到StreamManager里。
 
 
 
@@ -255,19 +275,6 @@ public class OneForOneStreamManager extends StreamManager {
 NettyBlockTransferService也实现了客户端的接口。fetchBlocks负责读取远端 Block。这里请求支持失败重试，这里涉及到了RetryingBlockFetcher。RetryingBlockFetcher的原理是当请求失败后，会将请求丢到后台的线程继续尝试。
 
 
-
-再回到NettyBlockTransferService的fetchBlocks方法, 里面定了BlockFetchStarter类，它表示实际请求的程序。
-
-blockFetchStarter实例化了TransportClient, 然后调用通过OneForOneBlockFetcher来请求数据。
-
-```
-val blockFetchStarter = new RetryingBlockFetcher.BlockFetchStarter {
-  override def createAndStart(blockIds: Array[String], listener: BlockFetchingListener) {
-    val client = clientFactory.createClient(host, port)
-    new OneForOneBlockFetcher(client, appId, execId, blockIds.toArray, listener,
-      transportConf, shuffleFiles).start()
-  }
-```
 
 OneForOneBlockFetcher，首先根据BlockIds生成请求OpenBlocks，调用client的sendRpc发送请求。收到的响应消息是StreamHandle，它包含了streamId，和ChunkId列表。然后客户端会再去请求Chunk的数据。如果shuffleFiles不为空，表示这些数据都要存到文件里，这里client调用stream方法。否则，这些数据会存到内存里，这里client调用fetchChunk方法。
 
