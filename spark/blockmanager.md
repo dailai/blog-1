@@ -214,3 +214,38 @@ if (level.useDisk && diskStore.contains(blockId)) {
 
 
 
+
+
+​			
+
+## DiskBlockManager 原理
+
+DiskBlockManager 负责将数据文件分散到不同的目录下。它的目录分为多级，第一级称为 localdir 列表，每个 localDirs 有多个二级目录，称为 subDirs。
+
+第一级目录列表，需要根据 spark 运行的运行模式（比如运行在 Yarn，Mesos 上），是否开启了 spark.shuffle.service.enabled ，才能确定。如果 spark 运行在 Yarn 上，首先找到 Yarn 的配置项 yarn.nodemanager.local-dirs ，然后在这些目录下创建一个特殊的目录，这些目录名有 blockmgr 前缀名加上 uuid 号组成。 
+
+然后在每个 localDir 目录下，生成数量固定的子目录，子目录的名称格式为十六进制，不足两位则补零。如下所示，
+
+```bash
+blockmgr-417dc935-ee3e-4a70-831c-fcadd7ee9a7c/
+├── 00
+├── 01
+├── 02
+└── 03
+```
+
+
+
+```scala
+val hash = Utils.nonNegativeHash(filename)  // 计算文件名的hash值
+val dirId = hash % localDirs.length  // 取模计算出localDir的位置
+// 取模计算出subDir的位置，subDirsPerLocalDir表示每个localDir的子目录数
+val subDirId = (hash / localDirs.length) % subDirsPerLocalDir  
+```
+
+
+
+
+
+
+
